@@ -15,7 +15,7 @@ except Exception:
 
 
 _PARAGRAPH_RE = re.compile(r"§+")
-_DIGIT_TOKEN_RE = re.compile(r"\d+")
+_DIGIT_TOKEN_RE = re.compile(r"\b\d+\b")
 _MULTI_SPACE_RE = re.compile(r"\s+")
 
 
@@ -72,7 +72,6 @@ class PreprocessTransformer(BaseEstimator, TransformerMixin):
         ]
 
 
-
 class AdaptiveTruncatedSVD(BaseEstimator, TransformerMixin):
     """
     TruncatedSVD wrapper that clips n_components at fit-time based on X shape.
@@ -83,6 +82,7 @@ class AdaptiveTruncatedSVD(BaseEstimator, TransformerMixin):
       - explained_variance_ratio_
       - components_ (from underlying TruncatedSVD)
     """
+
     def __init__(
         self,
         n_components: int = 768,
