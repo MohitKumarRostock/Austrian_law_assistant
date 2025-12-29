@@ -248,7 +248,8 @@ def build_embedding_index_npz(
         embeddings=embeddings,
         # minimal metadata
         model=np.array(model_name),
-        truncate_dim=np.array(int(truncate_dim), dtype=np.int32),
+        truncate_dim=np.array(0 if truncate_dim is None else truncate_dim, dtype=np.int32),
+        truncate_dim_is_none=np.array(truncate_dim is None),
         normalize=np.array(bool(normalize_embeddings)),
         n_rows=np.array(int(N), dtype=np.int64),
         dim=np.array(int(d), dtype=np.int32),
@@ -293,15 +294,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv or sys.argv[1:])
 
     device = choose_device(args.device)
-    truncate_dim = int(args.truncate_dim) if int(args.truncate_dim) > 0 else None
+    truncate_dim = args.truncate_dim if args.truncate_dim > 0 else None
 
     build_embedding_index_npz(
         corpus_path=args.corpus,
         out_npz=args.out,
         model_name=args.model,
         device=device,
-        batch_size=int(args.batch_size),
-        max_length=int(args.max_length),
+        batch_size=args.batch_size,
+        max_length=args.max_length,
         normalize_embeddings=bool(args.normalize),
         truncate_dim=truncate_dim,
         id_col=args.id_col,
