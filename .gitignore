@@ -1,0 +1,11 @@
+# Python caches
+__pycache__/
+
+# Virtual environments
+venv/
+
+# Generated artifacts
+*.npz
+*.parquet
+*.joblib
+
