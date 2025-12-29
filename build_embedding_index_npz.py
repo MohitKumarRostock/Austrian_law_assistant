@@ -198,7 +198,7 @@ def build_embedding_index_npz(
     normalize_embeddings: bool,
     truncate_dim: Optional[int],
     id_col: str = "sentence_id",
-    text_col: str = "content",
+    text_col: str = "sentence",
 ) -> Path:
     total_start = time.perf_counter()
 
@@ -285,7 +285,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--normalize", action="store_true", help="L2-normalize embeddings.")
     p.add_argument("--truncate-dim", type=int, default=0, help="If >0, truncate embedding dimension to this value.")
     p.add_argument("--id-col", type=str, default="sentence_id", help="ID column name.")
-    p.add_argument("--text-col", type=str, default="content", help="Text column name.")
+    p.add_argument("--text-col", type=str, default="sentence", help="Text column name.")
     return p.parse_args(list(argv))
 
 
