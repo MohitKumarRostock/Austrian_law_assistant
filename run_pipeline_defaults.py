@@ -3,9 +3,6 @@
 run_pipeline_defaults.py
 
 Runs the full pipeline with default arguments:
-  1) train_kahm_embedding_regressor.py
-  2) precompute_kahm_corpus_npz.py
-  3) evaluate_three_embeddings.py
 """
 
 from __future__ import annotations
