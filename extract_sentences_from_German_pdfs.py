@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract (meaningful) sentences from RIS law PDFs, label with law type + page number,
+Extract (meaningful) sentences from RIS law PDFs, label with law type + page number (v2: keep §/Art anchors),
 and write to a Parquet file. Also prints ONE example sentence per PDF.
 
 Folder layout:
@@ -37,6 +37,24 @@ _ABBREVIATIONS = [
     "zB.", "bzw.", "ua.", "u.a.", "vgl.", "mwN.", "d.h.", "Dr.", "Prof.", "S.", "§§",
 ]
 
+_RIS_INLINE_FOOTER_RE = re.compile(
+    r"^\s*www\.ris\.bka\.gv\.at\s+Seite\s+\d+\s+von\s+\d+\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_RIS_URL_ONLY_RE = re.compile(r"^\s*www\.ris\.bka\.gv\.at\s*$", flags=re.IGNORECASE | re.MULTILINE)
+
+# Headings in many RIS PDFs are formatted as lines like:
+#   "§ 871." or "§. 871." or "Art. 10."
+# If we keep the trailing dot, the sentence splitter will often create
+# a standalone sentence ("§ 871.") which is then dropped as non-meaningful,
+# causing the following paragraph to lose its section anchor.
+_SECTION_HEADING_LINE_RE = re.compile(r"^\s*§\s*\.?\s*(\d+[A-Za-z]?)\s*\.\s*", flags=re.MULTILINE)
+_ARTICLE_HEADING_LINE_RE = re.compile(r"^\s*Art\.\s*(\d+[A-Za-z]?)\s*\.\s*", flags=re.MULTILINE)
+
+# Enumerations frequently appear at line start as "1." / "2." etc.
+# If left unchanged, splitting on '.' can drop the numeric marker.
+_ENUM_LINE_RE = re.compile(r"^\s*(\d+)\.\s+", flags=re.MULTILINE)
+
 _DEFAULT_DROP_PATTERNS = [
     # Common RIS-ish headers/footers/noise. Extend as you discover recurring lines.
     r"^\s*Seite\s+\d+(\s+von\s+\d+)?\s*$",
@@ -49,15 +67,34 @@ _DEFAULT_DROP_PATTERNS = [
 
 
 def _normalize_whitespace(s: str) -> str:
-    s = s.replace("\u00ad", "")  # soft hyphen
-    # de-hyphenate across line breaks: "Verant-\nwortung" -> "Verantwortung"
+    # Remove soft hyphen
+    s = s.replace("\u00ad", "")
+
+    # Drop RIS inline footers that sometimes appear mid-text extraction
+    # (and can leak into sentences).
+    s = _RIS_INLINE_FOOTER_RE.sub("", s)
+    s = _RIS_URL_ONLY_RE.sub("", s)
+
+    # De-hyphenate across line breaks: "Verant-\nwortung" -> "Verantwortung"
     s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
-    # remaining newlines -> spaces
+
+    # Normalize common heading lines so §/Art numbers are kept with the following text.
+    # Examples:
+    #   "§ 871."   -> "§871 "
+    #   "§. 871."  -> "§871 "
+    #   "Art. 10." -> "Art. 10 "
+    s = _SECTION_HEADING_LINE_RE.sub(r"§\1 ", s)
+    s = _ARTICLE_HEADING_LINE_RE.sub(r"Art. \1 ", s)
+
+    # Preserve list numbering at the start of a line (avoid splitting on "1.")
+    s = _ENUM_LINE_RE.sub(r"\1) ", s)
+
+    # Remaining newlines -> spaces
     s = re.sub(r"\s*\n\s*", " ", s)
-    # collapse whitespace
+
+    # Collapse whitespace
     s = re.sub(r"[ \t\r\f\v]+", " ", s).strip()
     return s
-
 
 def _protect_abbreviations(text: str) -> Tuple[str, Dict[str, str]]:
     """
