@@ -109,7 +109,7 @@ class KahmBestEngine:
         ef_search = int(cls._env_path("HNSW_EF_SEARCH", "128"))
         faiss_threads = int(cls._env_path("FAISS_THREADS", "0"))
         if faiss_threads > 0:
-            e3.set_faiss_threads(faiss_threads)
+            e3.set_faiss_threads(faiss_threads) # type: ignore[attr-defined]
 
         # KAHM runtime knobs
         kahm_mode = cls._env_path("KAHM_MODE", e3.DEFAULT_KAHM_MODE)

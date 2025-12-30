@@ -258,6 +258,24 @@ _BOILERPLATE_PATTERNS = [
     re.compile(r"§\.\s*$"),
 ]
 
+def _to_int(value: Any) -> int:
+    """
+    Coerce pandas/NumPy scalar values (e.g., numpy.int64) into a Python int.
+
+    This exists mainly to satisfy static type checkers (pyright/mypy) that model
+    DataFrame.itertuples() fields as numpy.typing.Scalar (which includes complex).
+    """
+    # NumPy scalars expose .item() -> Python scalar
+    if hasattr(value, "item"):
+        try:
+            value = value.item()  # type: ignore[assignment]
+        except Exception:
+            # Fall back to int() below if .item() is not available/working.
+            pass
+    if isinstance(value, complex):
+        raise TypeError(f"Expected integer-like value, got complex: {value!r}")
+    return int(value)
+
 def is_boilerplate(text: str) -> bool:
     s = strip_inline_noise(text)
     if len(s) < 25:
@@ -436,8 +454,8 @@ class LawBm25Index:
         df_counts: Dict[str, int] = {}
 
         for row in df.itertuples(index=False):
-            sid = int(row.sentence_id)
-            page = int(row.page)
+            sid = _to_int(row.sentence_id)
+            page = _to_int(row.page)
             sent = strip_inline_noise(str(row.sentence))
             if is_boilerplate(sent):
                 continue
