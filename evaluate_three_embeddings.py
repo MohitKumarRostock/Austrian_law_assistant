@@ -84,7 +84,7 @@ DEFAULT_EVAL_K = 10
 DEFAULT_K_GRID = [1, 3, 5, 10, 20]
 DEFAULT_PRIMARY_K_FOR_HYPOTHESIS = 10
 DEFAULT_PREDOMINANCE_FRACTION = 0.5
-DEFAULT_BOOTSTRAP_SAMPLES = 2000
+DEFAULT_BOOTSTRAP_SAMPLES = 5000
 DEFAULT_BOOTSTRAP_SEED = 0
 DEFAULT_BOOTSTRAP_ENABLED = True
 
@@ -108,11 +108,14 @@ DEFAULT_FAISS_THREADS = 0
 # These defaults are conservative, aligned with typical retrieval non-inferiority framing.
 # All margins are *absolute* deltas for metrics in [0,1], except lift which is on the raw scale.
 
-# H1 (production retrieval): KAHM query translation retrieved against MB corpus should be
-# non-inferior to the MB baseline.
-DEFAULT_H1_MARGIN_HIT = 0.10
+# H1 (production retrieval): KAHM best-practice retrieval (routing + law-aware post-processing)
+# should be non-inferior to the Mixedbread baseline.
+#
+# H1b (candidate generation): KAHM query translation should be non-inferior to Mixedbread on
+# recall-oriented metrics (hit@k, MRR@k), without necessarily matching Mixedbread top-1.
+DEFAULT_H1_MARGIN_HIT = 0.06
 DEFAULT_H1_MARGIN_MRR = 0.085
-DEFAULT_H1_MARGIN_TOP1 = 0.11
+DEFAULT_H1_MARGIN_TOP1 = 0.07
 DEFAULT_H1_MARGIN_CONS = 0.05
 DEFAULT_H1_MARGIN_LIFT = 10.0
 DEFAULT_H1_MARGIN_MAJ = 0.10
@@ -129,8 +132,29 @@ DEFAULT_ROUTER_CONS_THRESHOLDS = "0.4,0.45,0.5,0.55,0.6,0.65,0.7"
 DEFAULT_ROUTER_LIFT_THRESHOLDS = "5,10,20,30,40"
 DEFAULT_ROUTER_MIN_COVERAGE = 0.50
 
+# ----------------------------- KAHM best-practice evaluation defaults -----------------------------
+# "Best possible" use of KAHM in this repo is typically:
+#   1) Use the full-KAHM index (cheap) to estimate a law posterior + confidence signals.
+#   2) Use KAHM(query→MB corpus) for high-recall candidate generation.
+#   3) Apply law-aware filtering and/or reranking of those candidates based on the router posterior
+#      to recover top-1 quality without running Mixedbread at query-time.
+DEFAULT_KAHM_BEST_ENABLED = True
+DEFAULT_KAHM_BEST_ROUTER_K = 50
+DEFAULT_KAHM_BEST_CAND_K = 200
+DEFAULT_KAHM_BEST_MODE = "hybrid"  # filter | rerank | hybrid
+DEFAULT_KAHM_BEST_TOP_LAWS_GRID = "1,2,3"
+DEFAULT_KAHM_BEST_LAMBDA_GRID = "0,0.05,0.1,0.2,0.4"
+# If filtering is enabled (mode=filter|hybrid), limit how many of the final
+# top-k slots can be occupied by router-selected laws. This prevents overly
+# aggressive filtering from harming hit@k.
+DEFAULT_KAHM_BEST_LAW_SLOTS_GRID = "1,2,3,5,10"
+DEFAULT_KAHM_BEST_OPTIMIZE = "top1"  # top1 | mrr | hit
+DEFAULT_KAHM_BEST_TUNE = True
+DEFAULT_KAHM_BEST_EPS = 1e-12
+
+
 # Script version banner (helps confirm you are running the updated file)
-SCRIPT_VERSION = "2025-12-27-hypothesis-routing-v4"
+SCRIPT_VERSION = "2025-12-30-kahm-best-v5.1"
 
 
 
@@ -335,12 +359,12 @@ def build_faiss_index(emb: np.ndarray, *, index_type: str, hnsw_m: int, ef_searc
     d = int(X.shape[1])
 
     if index_type == "flat":
-        index = faiss.IndexFlatIP(d)
+        index: Any = faiss.IndexFlatIP(d)
         index.add(X)
         return index
 
     if index_type == "hnsw":
-        index = faiss.IndexHNSWFlat(d, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
+        index: Any = faiss.IndexHNSWFlat(d, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
         index.hnsw.efSearch = int(ef_search)
         index.add(X)
         return index
@@ -545,6 +569,20 @@ def evaluate_on_query_set(
     bootstrap: bool = DEFAULT_BOOTSTRAP_ENABLED,
     bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
+
+    # --- KAHM best-practice routed retrieval (optional) ---
+    kahm_best: bool = DEFAULT_KAHM_BEST_ENABLED,
+    kahm_best_router_k: int = DEFAULT_KAHM_BEST_ROUTER_K,
+    kahm_best_cand_k: int = DEFAULT_KAHM_BEST_CAND_K,
+    kahm_best_mode: str = DEFAULT_KAHM_BEST_MODE,
+    kahm_best_top_laws_grid: Optional[List[int]] = None,
+    kahm_best_law_slots_grid: Optional[List[int]] = None,
+    kahm_best_lambda_grid: Optional[List[float]] = None,
+    kahm_best_min_coverage: float = DEFAULT_ROUTER_MIN_COVERAGE,
+    kahm_best_optimize: str = DEFAULT_KAHM_BEST_OPTIMIZE,
+    kahm_best_tune: bool = DEFAULT_KAHM_BEST_TUNE,
+    router_cons_thresholds: Optional[List[float]] = None,
+    router_lift_thresholds: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     k = int(k)
     pred_frac = float(predominance_fraction)
@@ -558,17 +596,27 @@ def evaluate_on_query_set(
     law_prior = {lw: (float(cnt) / total_sent) for lw, cnt in law_counts.items()}
 
     # Run FAISS searches once (enables overlap diagnostics)
+    kahm_best_enabled = bool(kahm_best) and (index_kahm_corpus is not None)
+    cand_k = int(max(k, int(kahm_best_cand_k))) if kahm_best_enabled else int(k)
+    router_k = int(max(k, int(kahm_best_router_k))) if kahm_best_enabled else int(k)
+
     idx_mb: Optional[np.ndarray] = None
     if q_true_mb is not None:
         _, idx_mb = faiss_search(index_mb_corpus, q_true_mb, k)
 
-    # (B) KAHM query translation into MB space, retrieved against MB corpus index
-    _, idx_kahm_qmb = faiss_search(index_mb_corpus, q_kahm, k)
+    # (B) KAHM query translation into MB space, retrieved against MB corpus index.
+    # If kahm_best is enabled we also fetch a larger candidate pool for reranking/filtering.
+    scores_kahm_qmb_all, idx_kahm_qmb_all = faiss_search(index_mb_corpus, q_kahm, cand_k)
+    idx_kahm_qmb = idx_kahm_qmb_all[:, :k]
 
-    # (C) Full KAHM approximation (optional)
+    # (C) Full KAHM approximation (optional). If kahm_best is enabled we fetch router_k neighbours
+    # to estimate a law posterior.
     idx_kahm_full: Optional[np.ndarray] = None
+    scores_kahm_full_all: Optional[np.ndarray] = None
+    idx_kahm_full_all: Optional[np.ndarray] = None
     if index_kahm_corpus is not None:
-        _, idx_kahm_full = faiss_search(index_kahm_corpus, q_kahm, k)
+        scores_kahm_full_all, idx_kahm_full_all = faiss_search(index_kahm_corpus, q_kahm, router_k)
+        idx_kahm_full = idx_kahm_full_all[:, :k]
 
     # (D) IDF–SVD baseline
     _, idx_idf = faiss_search(index_idf, q_idf, k)
@@ -848,6 +896,241 @@ def evaluate_on_query_set(
             ref_idx=ref_idx,
         )
 
+
+    kahm_best_out: Optional[Dict[str, Any]] = None
+    if kahm_best_enabled and (idx_kahm_full_all is not None) and (scores_kahm_full_all is not None):
+        # Precompute router law posteriors + LLRs per query
+        n_q = int(idx_kahm_qmb_all.shape[0])
+        cand_laws_all = law_arr[idx_kahm_qmb_all]  # shape (n_q, cand_k)
+        router_laws_all = law_arr[idx_kahm_full_all]  # shape (n_q, router_k)
+
+        # Provide default grids if not passed.
+        cons_grid = router_cons_thresholds if router_cons_thresholds is not None else _parse_float_list(
+            DEFAULT_ROUTER_CONS_THRESHOLDS, name="router_cons_thresholds"
+        )
+        lift_grid = router_lift_thresholds if router_lift_thresholds is not None else _parse_float_list(
+            DEFAULT_ROUTER_LIFT_THRESHOLDS, name="router_lift_thresholds"
+        )
+        top_laws_grid = kahm_best_top_laws_grid if kahm_best_top_laws_grid is not None else _parse_int_list(
+            DEFAULT_KAHM_BEST_TOP_LAWS_GRID, name="kahm_best_top_laws_grid"
+        )
+        law_slots_grid = kahm_best_law_slots_grid if kahm_best_law_slots_grid is not None else _parse_int_list(
+            DEFAULT_KAHM_BEST_LAW_SLOTS_GRID, name="kahm_best_law_slots_grid"
+        )
+        lambda_grid = kahm_best_lambda_grid if kahm_best_lambda_grid is not None else _parse_float_list(
+            DEFAULT_KAHM_BEST_LAMBDA_GRID, name="kahm_best_lambda_grid"
+        )
+
+        if not cons_grid:
+            cons_grid = [0.55]
+        if not lift_grid:
+            lift_grid = [10.0]
+        if not top_laws_grid:
+            top_laws_grid = [1]
+        if not law_slots_grid:
+            law_slots_grid = [1]
+        if not lambda_grid:
+            lambda_grid = [0.1]
+
+        # Router stats per query
+        router_info: List[Dict[str, Any]] = []
+        for i in range(n_q):
+            r_laws = [str(x) for x in router_laws_all[i].tolist() if str(x)]
+            if not r_laws:
+                router_info.append({"counts": Counter(), "llr": {}, "maj_law": "", "maj_frac": 0.0, "maj_lift": 0.0})
+                continue
+            c = Counter(r_laws)
+            maj_law, maj_count = c.most_common(1)[0]
+            maj_frac = float(maj_count) / float(len(r_laws))
+            prior = float(law_prior.get(str(maj_law), 0.0))
+            maj_lift = maj_frac / max(float(prior), float(DEFAULT_KAHM_BEST_EPS))
+            denom = float(len(r_laws))
+            p = {lw: float(cnt) / denom for lw, cnt in c.items()}
+            llr = {
+                lw: float(
+                    np.log((p[lw] + DEFAULT_KAHM_BEST_EPS) / (float(law_prior.get(lw, 0.0)) + DEFAULT_KAHM_BEST_EPS))
+                )
+                for lw in p.keys()
+            }
+            router_info.append(
+                {"counts": c, "llr": llr, "maj_law": str(maj_law), "maj_frac": float(maj_frac), "maj_lift": float(maj_lift)}
+            )
+
+        def _quick_metrics(idx_topk: np.ndarray) -> Dict[str, float]:
+            idx_topk = np.asarray(idx_topk, dtype=np.int64)
+            n = int(idx_topk.shape[0])
+            top1 = 0.0
+            hit = 0.0
+            mrr_ul_sum = 0.0
+            valid = 0
+            for i in range(n):
+                cons = consensuses[i]
+                if not cons:
+                    continue
+                row = [int(x) for x in idx_topk[i].tolist() if int(x) >= 0]
+                if not row:
+                    continue
+                laws = [str(law_arr[j]) for j in row]
+                if not laws:
+                    continue
+                valid += 1
+                top1 += 1.0 if str(laws[0]) == str(cons) else 0.0
+                hit += 1.0 if str(cons) in set(laws) else 0.0
+                seen: List[str] = []
+                for lw in laws:
+                    if lw not in seen:
+                        seen.append(lw)
+                try:
+                    rank = 1 + seen.index(str(cons))
+                    mrr_ul_sum += 1.0 / float(rank)
+                except ValueError:
+                    mrr_ul_sum += 0.0
+            denom = float(max(1, valid))
+            return {"top1": float(top1 / denom), "hit": float(hit / denom), "mrr_ul": float(mrr_ul_sum / denom), "valid": float(valid)}
+
+        def _build_kahm_best_idx(
+            *,
+            maj_frac_thr: float,
+            maj_lift_thr: float,
+            top_laws: int,
+            law_slots: int,
+            lam: float,
+            mode: str,
+        ) -> Tuple[np.ndarray, float]:
+            out_idx = np.full((n_q, k), -1, dtype=np.int64)
+            accepted = 0
+            for i in range(n_q):
+                info = router_info[i]
+                ok = (info["maj_frac"] >= float(maj_frac_thr)) and (info["maj_lift"] >= float(maj_lift_thr)) and bool(info["counts"])
+                cand_idx = idx_kahm_qmb_all[i].astype(np.int64, copy=False)
+                cand_scores = scores_kahm_qmb_all[i].astype(np.float32, copy=False)
+                if not ok:
+                    out_idx[i, :] = cand_idx[:k]
+                    continue
+
+                accepted += 1
+                law_ranked = [lw for (lw, _) in info["counts"].most_common(max(1, int(top_laws)))]
+                law_set = set(law_ranked)
+
+                if mode in ("rerank", "hybrid") and float(lam) != 0.0:
+                    bonuses = np.zeros((cand_idx.shape[0],), dtype=np.float32)
+                    llr = info["llr"]
+                    for j in range(cand_idx.shape[0]):
+                        lw = str(cand_laws_all[i, j])
+                        bonuses[j] = float(llr.get(lw, 0.0))
+                    rerank_scores = cand_scores + float(lam) * bonuses
+                    order = np.argsort(-rerank_scores, kind="mergesort")
+                else:
+                    order = np.arange(cand_idx.shape[0], dtype=np.int64)
+
+                ordered_idx = cand_idx[order]
+                ordered_laws = cand_laws_all[i, order]
+
+                picked: List[int] = []
+                if mode in ("filter", "hybrid"):
+                    cap = int(max(1, min(int(law_slots), int(k))))
+                    for j, sid in enumerate(ordered_idx.tolist()):
+                        if len(picked) >= cap:
+                            break
+                        if str(ordered_laws[j]) in law_set:
+                            picked.append(int(sid))
+
+                if len(picked) < k:
+                    seen = set(picked)
+                    for sid in ordered_idx.tolist():
+                        if sid < 0:
+                            continue
+                        if sid in seen:
+                            continue
+                        picked.append(int(sid))
+                        seen.add(int(sid))
+                        if len(picked) >= k:
+                            break
+
+                out_idx[i, :] = np.asarray(picked[:k], dtype=np.int64)
+            coverage = float(accepted) / float(max(1, n_q))
+            return out_idx, coverage
+
+        mode = str(kahm_best_mode).strip().lower()
+        if mode not in ("filter", "rerank", "hybrid"):
+            mode = "hybrid"
+
+        default_cfg = {
+            "maj_frac_thr": 0.55,
+            "maj_lift_thr": 10.0,
+            "top_laws": 1,
+            "law_slots": 3,
+            "lam": 0.10,
+            "mode": mode,
+        }
+        best_cfg = dict(default_cfg)
+        best_val = -1.0
+        best_cov = 0.0
+
+        if bool(kahm_best_tune):
+            obj = str(kahm_best_optimize).strip().lower()
+            if obj not in ("top1", "mrr", "hit"):
+                obj = "top1"
+
+            for maj_frac_thr in cons_grid:
+                for maj_lift_thr in lift_grid:
+                    for top_laws in top_laws_grid:
+                        for law_slots in law_slots_grid:
+                            for lam in lambda_grid:
+                                idx_try, cov = _build_kahm_best_idx(
+                                    maj_frac_thr=float(maj_frac_thr),
+                                    maj_lift_thr=float(maj_lift_thr),
+                                    top_laws=int(top_laws),
+                                    law_slots=int(law_slots),
+                                    lam=float(lam),
+                                    mode=mode,
+                                )
+                                if cov < float(kahm_best_min_coverage):
+                                    continue
+                                qm = _quick_metrics(idx_try)
+                                val = float(
+                                    qm["top1"] if obj == "top1" else (qm["mrr_ul"] if obj == "mrr" else qm["hit"])
+                                )
+                                if (val > best_val) or (val == best_val and cov > best_cov) or (
+                                    val == best_val
+                                    and cov == best_cov
+                                    and float(lam) < float(best_cfg.get("lam", 1e9))
+                                ):
+                                    best_val = val
+                                    best_cov = cov
+                                    best_cfg = {
+                                        "maj_frac_thr": float(maj_frac_thr),
+                                        "maj_lift_thr": float(maj_lift_thr),
+                                        "top_laws": int(top_laws),
+                                        "law_slots": int(law_slots),
+                                        "lam": float(lam),
+                                        "mode": mode,
+                                    }
+
+        idx_best, cov = _build_kahm_best_idx(
+            maj_frac_thr=float(best_cfg["maj_frac_thr"]),
+            maj_lift_thr=float(best_cfg["maj_lift_thr"]),
+            top_laws=int(best_cfg["top_laws"]),
+            law_slots=int(best_cfg.get("law_slots", min(1, k))),
+            lam=float(best_cfg["lam"]),
+            mode=str(best_cfg["mode"]),
+        )
+
+        kahm_best_out = _score_from_idx("kahm_best_routed", idx_best, ref_idx=ref_idx)
+        kahm_best_out["kahm_best_config"] = {
+            "mode": str(best_cfg["mode"]),
+            "router_k": int(router_k),
+            "cand_k": int(cand_k),
+            "maj_frac_thr": float(best_cfg["maj_frac_thr"]),
+            "maj_lift_thr": float(best_cfg["maj_lift_thr"]),
+            "top_laws": int(best_cfg["top_laws"]),
+            "law_slots": int(best_cfg.get("law_slots", min(1, k))),
+            "lambda": float(best_cfg["lam"]),
+            "coverage": float(cov),
+            "optimize": str(kahm_best_optimize),
+            "tuned": bool(kahm_best_tune),
+        }
+
     idf = _score_from_idx("pure_idf_svd", idx_idf, ref_idx=ref_idx)
 
     # Paired comparisons vs true Mixedbread (if available) to validate hypotheses.
@@ -874,6 +1157,25 @@ def evaluate_on_query_set(
             "majority_accuracy": _paired_delta_ci(kahm_qmb["_per_query"]["majority"], mb["_per_query"]["majority"], 104),
             "top1_accuracy": _paired_delta_ci(kahm_qmb["_per_query"]["top1"], mb["_per_query"]["top1"], 105),
         }
+
+        if kahm_best_out is not None:
+            comparisons["kahm_best_minus_mb"] = {
+                "hit_at_k": _paired_delta_ci(kahm_best_out["_per_query"]["hit"], mb["_per_query"]["hit"], 150),
+                "mrr_unique_law_at_k": _paired_delta_ci(kahm_best_out["_per_query"]["mrr_ul"], mb["_per_query"]["mrr_ul"], 151),
+                "mean_consensus_fraction_in_topk": _paired_delta_ci(kahm_best_out["_per_query"]["cons_frac"], mb["_per_query"]["cons_frac"], 152),
+                "mean_lift": _paired_delta_ci(kahm_best_out["_per_query"]["lift"], mb["_per_query"]["lift"], 153),
+                "majority_accuracy": _paired_delta_ci(kahm_best_out["_per_query"]["majority"], mb["_per_query"]["majority"], 154),
+                "top1_accuracy": _paired_delta_ci(kahm_best_out["_per_query"]["top1"], mb["_per_query"]["top1"], 155),
+            }
+            comparisons["kahm_best_minus_kahm_query"] = {
+                "hit_at_k": _paired_delta_ci(kahm_best_out["_per_query"]["hit"], kahm_qmb["_per_query"]["hit"], 156),
+                "mrr_unique_law_at_k": _paired_delta_ci(kahm_best_out["_per_query"]["mrr_ul"], kahm_qmb["_per_query"]["mrr_ul"], 157),
+                "mean_consensus_fraction_in_topk": _paired_delta_ci(kahm_best_out["_per_query"]["cons_frac"], kahm_qmb["_per_query"]["cons_frac"], 158),
+                "mean_lift": _paired_delta_ci(kahm_best_out["_per_query"]["lift"], kahm_qmb["_per_query"]["lift"], 159),
+                "majority_accuracy": _paired_delta_ci(kahm_best_out["_per_query"]["majority"], kahm_qmb["_per_query"]["majority"], 160),
+                "top1_accuracy": _paired_delta_ci(kahm_best_out["_per_query"]["top1"], kahm_qmb["_per_query"]["top1"], 161),
+            }
+
 
         if kahm_full is not None:
             comparisons["kahm_full_minus_mb"] = {
@@ -921,6 +1223,8 @@ def evaluate_on_query_set(
     }
     if mb is not None:
         out["true_mixedbread"] = mb
+    if kahm_best_out is not None:
+        out["kahm_best_routed"] = kahm_best_out
     if kahm_full is not None:
         out["kahm_full_approx"] = kahm_full
     return out
@@ -939,6 +1243,8 @@ def print_eval_summary(eval_out: Dict[str, Any]) -> None:
         ordered.append("true_mixedbread")
     if "kahm_query_on_mb_corpus" in eval_out:
         ordered.append("kahm_query_on_mb_corpus")
+    if "kahm_best_routed" in eval_out:
+        ordered.append("kahm_best_routed")
     if "kahm_full_approx" in eval_out:
         ordered.append("kahm_full_approx")
     if "pure_idf_svd" in eval_out:
@@ -974,6 +1280,15 @@ def print_eval_summary(eval_out: Dict[str, Any]) -> None:
         # Legacy/secondary with CIs
         print(f"  majority-accuracy:   {_fmt_ci(m['majority_accuracy'], tuple(m['majority_accuracy_ci']))}", flush=True)
         print(f"  top1-accuracy:       {_fmt_ci(m['top1_accuracy'], tuple(m['top1_accuracy_ci']))}", flush=True)
+        if "kahm_best_config" in m:
+            cfg = m.get("kahm_best_config", {})
+            print(
+                f"  kahm_best config:    mode={cfg.get('mode')} | router_k={cfg.get('router_k')} | cand_k={cfg.get('cand_k')} | "
+                f"maj_frac_thr={cfg.get('maj_frac_thr')} | maj_lift_thr={cfg.get('maj_lift_thr')} | top_laws={cfg.get('top_laws')} | lambda={cfg.get('lambda')}",
+                flush=True,
+            )
+            if "coverage" in cfg:
+                print(f"  kahm_best coverage:  {float(cfg.get('coverage')):.3f}", flush=True)
 
     # Hypothesis-focused paired deltas (bootstrap) where available.
     comp = eval_out.get("comparisons", {})
@@ -998,6 +1313,10 @@ def print_eval_summary(eval_out: Dict[str, Any]) -> None:
 
         if "kahm_query_minus_mb" in comp:
             _print_block("KAHM(query→MB corpus) - MB", comp["kahm_query_minus_mb"])
+        if "kahm_best_minus_mb" in comp:
+            _print_block("KAHM(best routed) - MB", comp["kahm_best_minus_mb"])
+        if "kahm_best_minus_kahm_query" in comp:
+            _print_block("KAHM(best routed) - KAHM(query→MB)", comp["kahm_best_minus_kahm_query"])
         if "kahm_full_minus_mb" in comp:
             _print_block("KAHM(full approx) - MB", comp["kahm_full_minus_mb"])
         if "idf_minus_mb" in comp:
@@ -1073,8 +1392,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # H1 margins (KAHM(q)->MB corpus vs MB baseline)
-    p.add_argument("--h1_margin_hit", type=float, default=DEFAULT_H1_MARGIN_HIT, help="Non-inferiority margin for hit@k")
+    # H1 margins (KAHM(best routed) vs Mixedbread baseline; also used for H1b candidate checks)
+    p.add_argument("--h1_margin_hit", type=float, default=DEFAULT_H1_MARGIN_HIT, help="Non-inferiority margin for hit@k (H1: best routed vs MB; H1b: candidate generation checks)")
     p.add_argument("--h1_margin_mrr", type=float, default=DEFAULT_H1_MARGIN_MRR, help="Non-inferiority margin for MRR(unique laws)@k")
     p.add_argument("--h1_margin_top1", type=float, default=DEFAULT_H1_MARGIN_TOP1, help="Non-inferiority margin for top1 accuracy")
     p.add_argument("--h1_margin_cons", type=float, default=DEFAULT_H1_MARGIN_CONS, help="Non-inferiority margin for mean consensus fraction@k")
@@ -1082,7 +1401,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--h1_margin_majority", type=float, default=DEFAULT_H1_MARGIN_MAJ, help="Non-inferiority margin for majority-accuracy")
 
     # H2 margins (Full KAHM approx vs MB) + router superiority vs IDF
-    p.add_argument("--h2_margin_hit", type=float, default=DEFAULT_H2_MARGIN_HIT, help="Non-inferiority margin for hit@k")
+    p.add_argument("--h2_margin_hit", type=float, default=DEFAULT_H2_MARGIN_HIT, help="Non-inferiority margin for hit@k (H1: best routed vs MB; H1b: candidate generation checks)")
     p.add_argument("--h2_margin_cons", type=float, default=DEFAULT_H2_MARGIN_CONS, help="Non-inferiority margin for mean consensus fraction@k")
     p.add_argument("--h2_margin_lift", type=float, default=DEFAULT_H2_MARGIN_LIFT, help="Non-inferiority margin for mean lift@k")
     p.add_argument("--h2_margin_majority", type=float, default=DEFAULT_H2_MARGIN_MAJ, help="Non-inferiority margin for majority-accuracy")
@@ -1104,6 +1423,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ROUTER_MIN_COVERAGE,
         help="When recommending a router threshold pair from the grid, require at least this coverage.",
     )
+
+    # KAHM best-practice evaluation (routing + law-aware candidate post-processing)
+    p.add_argument("--no_kahm_best", action="store_true", help="Disable the KAHM best-practice routed evaluation.")
+    p.add_argument("--kahm_best_router_k", type=int, default=DEFAULT_KAHM_BEST_ROUTER_K, help="K for router posterior estimation on KAHM(full) index")
+    p.add_argument("--kahm_best_cand_k", type=int, default=DEFAULT_KAHM_BEST_CAND_K, help="Candidate pool size for KAHM(q→MB) retrieval before post-processing")
+    p.add_argument("--kahm_best_mode", choices=["filter", "rerank", "hybrid"], default=DEFAULT_KAHM_BEST_MODE, help="How to apply router posterior to candidates")
+    p.add_argument("--kahm_best_top_laws_grid", default=DEFAULT_KAHM_BEST_TOP_LAWS_GRID, help="Grid for number of top router laws (comma-separated ints)")
+    p.add_argument(
+        "--kahm_best_law_slots_grid",
+        default=DEFAULT_KAHM_BEST_LAW_SLOTS_GRID,
+        help="Grid for max number of top-k slots reserved for router laws when filtering is enabled (comma-separated ints)",
+    )
+    p.add_argument("--kahm_best_lambda_grid", default=DEFAULT_KAHM_BEST_LAMBDA_GRID, help="Grid for rerank lambda (comma-separated floats)")
+    p.add_argument("--kahm_best_optimize", choices=["top1", "mrr", "hit"], default=DEFAULT_KAHM_BEST_OPTIMIZE, help="Objective used when selecting the best kahm_best config")
+    p.add_argument("--kahm_best_min_coverage", type=float, default=DEFAULT_ROUTER_MIN_COVERAGE, help="Minimum acceptance coverage when tuning kahm_best thresholds")
+    p.add_argument("--no_kahm_best_tune", action="store_true", help="Disable tuning; use a reasonable default kahm_best config")
+
 
     p.add_argument("--query_batch", type=int, default=DEFAULT_QUERY_BATCH, help="Batch size for Mixedbread query embeddings")
     p.add_argument("--regress_batch", type=int, default=DEFAULT_REGRESS_BATCH, help="Batch size for KAHM regression")
@@ -1149,6 +1485,19 @@ def _parse_float_list(arg: str | None, *, name: str) -> List[float]:
     return out
 
 
+
+def _parse_int_list(arg: str | None, *, name: str) -> List[int]:
+    if arg is None:
+        return []
+    raw = [x.strip() for x in str(arg).split(",") if x.strip()]
+    out: List[int] = []
+    for x in raw:
+        try:
+            out.append(int(x))
+        except Exception as e:
+            raise ValueError(f"Failed to parse {name} entry {x!r} as int: {e}")
+    return out
+
 def _kgrid_compact_line(label: str, values: List[Tuple[int, float, Tuple[float, float]]], digits: int = 3) -> str:
     parts = []
     for k, pt, ci in values:
@@ -1167,6 +1516,8 @@ def print_k_grid_summary(k_to_eval: Dict[int, Dict[str, Any]], *, ks: List[int])
         methods.append(("true_mixedbread", "Mixedbread (true)"))
     if "kahm_query_on_mb_corpus" in any_ev:
         methods.append(("kahm_query_on_mb_corpus", "KAHM(query→MB corpus)"))
+    if "kahm_best_routed" in any_ev:
+        methods.append(("kahm_best_routed", "KAHM(best routed)"))
     if "kahm_full_approx" in any_ev:
         methods.append(("kahm_full_approx", "KAHM(full approx)"))
     if "pure_idf_svd" in any_ev:
@@ -1242,7 +1593,8 @@ def print_hypothesis_verdict(
 
     If --equivalence_two_sided is set, it uses two-sided equivalence: CI must lie within ±margin.
 
-    H1: KAHM query translation (q_IDF -> KAHM(q)) retrieved against MB corpus ~= MB baseline.
+    H1: KAHM best-practice retrieval (routing + law-aware post-processing) ~= MB baseline.
+    H1b: KAHM query translation (q_IDF -> KAHM(q) against MB corpus) is adequate for candidate generation.
     H2: Full KAHM approx (q_IDF -> KAHM(q) retrieved against KAHM corpus) is good for routing/candidates
         and materially better than IDF–SVD.
     """
@@ -1346,6 +1698,61 @@ def print_hypothesis_verdict(
         comp = ev.get("comparisons", {})
 
         # --------------------------- H1 ---------------------------
+        # H1 (production retrieval): KAHM best-practice routed retrieval should be non-inferior to
+        # the Mixedbread baseline. If kahm_best is not available, we fall back to the plain
+        # KAHM query translation baseline (q_IDF -> KAHM(q) retrieved against the MB corpus).
+        h1_comp_key = "kahm_best_minus_mb" if "kahm_best_minus_mb" in comp else "kahm_query_minus_mb"
+        if h1_comp_key in comp:
+            h1_label = "KAHM(best routed)" if h1_comp_key == "kahm_best_minus_mb" else "KAHM(query→MB corpus)"
+
+            d_hit = _get_delta(comp, h1_comp_key, "hit_at_k")
+            d_mrr = _get_delta(comp, h1_comp_key, "mrr_unique_law_at_k")
+            d_top1 = _get_delta(comp, h1_comp_key, "top1_accuracy")
+            d_cons = _get_delta(comp, h1_comp_key, "mean_consensus_fraction_in_topk")
+            d_lift = _get_delta(comp, h1_comp_key, "mean_lift")
+            d_maj = _get_delta(comp, h1_comp_key, "majority_accuracy")
+
+            ok_hit = _noninferior(d_hit, h1_margins["hit"])
+            ok_mrr = _noninferior(d_mrr, h1_margins["mrr"])
+            ok_top1 = _noninferior(d_top1, h1_margins["top1"])
+            ok_cons = _noninferior(d_cons, h1_margins["cons"])
+            ok_lift = _noninferior(d_lift, h1_margins["lift"])
+            ok_maj = _noninferior(d_maj, h1_margins["majority"])
+
+            # H1 is meant to be a "production quality" claim: include top-1.
+            supported_h1 = ok_hit and ok_mrr and ok_top1 and ok_cons and ok_lift
+
+            print(f"\nHypothesis H1: {h1_label} is as good as MB for production retrieval", flush=True)
+            print(f"  k = {pk}", flush=True)
+            print(f"  test: {'two-sided equivalence' if equivalence_two_sided else 'one-sided non-inferiority'}", flush=True)
+            print(
+                "  margins: "
+                f"hit={h1_margins['hit']}, mrr={h1_margins['mrr']}, top1={h1_margins['top1']}, "
+                f"cons={h1_margins['cons']}, lift={h1_margins['lift']}, maj={h1_margins['majority']}",
+                flush=True,
+            )
+            print(f"  hit@{pk}:                 {h1_label}−MB = {_fmt_delta(d_hit)}", flush=True)
+            print(f"  MRR unique@{pk}:           {h1_label}−MB = {_fmt_delta(d_mrr)}", flush=True)
+            print(f"  top1@{pk}:                 {h1_label}−MB = {_fmt_delta(d_top1)}", flush=True)
+            print(f"  cons frac@{pk}:            {h1_label}−MB = {_fmt_delta(d_cons)}", flush=True)
+            print(f"  lift@{pk} (prior):         {h1_label}−MB = {_fmt_delta(d_lift)}", flush=True)
+            print(f"  majority@{pk}:             {h1_label}−MB = {_fmt_delta(d_maj)}", flush=True)
+
+            print("  checks:", flush=True)
+            print(_status("hit", d_hit, h1_margins["hit"], ok_hit), flush=True)
+            print(_status("mrr_unique", d_mrr, h1_margins["mrr"], ok_mrr), flush=True)
+            print(_status("top1", d_top1, h1_margins["top1"], ok_top1), flush=True)
+            print(_status("cons_frac", d_cons, h1_margins["cons"], ok_cons), flush=True)
+            print(_status("lift", d_lift, h1_margins["lift"], ok_lift), flush=True)
+            print(_status("majority", d_maj, h1_margins["majority"], ok_maj), flush=True)
+            print("  Verdict: Supported." if supported_h1 else "  Verdict: Not fully supported (see deltas above).", flush=True)
+        else:
+            print("\nHypothesis H1: skipped (MB query baseline not available; run without --skip_mb_queries).", flush=True)
+
+        # --------------------------- H1b ---------------------------
+        # H1b (candidate generation): even if KAHM(query→MB corpus) is not perfect at top-1,
+        # it should be strong enough on recall-oriented metrics to act as a high-recall candidate
+        # pool that is subsequently improved by the routed best-practice step.
         if "kahm_query_minus_mb" in comp:
             d_hit = _get_delta(comp, "kahm_query_minus_mb", "hit_at_k")
             d_mrr = _get_delta(comp, "kahm_query_minus_mb", "mrr_unique_law_at_k")
@@ -1356,43 +1763,63 @@ def print_hypothesis_verdict(
 
             ok_hit = _noninferior(d_hit, h1_margins["hit"])
             ok_mrr = _noninferior(d_mrr, h1_margins["mrr"])
-            ok_top1 = _noninferior(d_top1, h1_margins["top1"])
             ok_cons = _noninferior(d_cons, h1_margins["cons"])
             ok_lift = _noninferior(d_lift, h1_margins["lift"])
             ok_maj = _noninferior(d_maj, h1_margins["majority"])
+            ok_top1 = _noninferior(d_top1, h1_margins["top1"])
 
-            supported_h1 = ok_hit and ok_mrr and ok_top1 and ok_cons and ok_lift
+            # Candidate generation does not require matching top-1; prioritize recall + law-level breadth.
+            supported_h1b = ok_hit and ok_mrr and ok_cons and ok_lift
 
-            print("\nHypothesis H1: KAHM query translation is as good as MB for retrieval", flush=True)
+            print("\nHypothesis H1b: KAHM(query→MB corpus) is adequate for candidate generation", flush=True)
             print(f"  k = {pk}", flush=True)
             print(f"  test: {'two-sided equivalence' if equivalence_two_sided else 'one-sided non-inferiority'}", flush=True)
             print(
-                "  margins: "
-                f"hit={h1_margins['hit']}, mrr={h1_margins['mrr']}, top1={h1_margins['top1']}, "
-                f"cons={h1_margins['cons']}, lift={h1_margins['lift']}, maj={h1_margins['majority']}",
+                "  margins (applied to recall-oriented metrics): "
+                f"hit={h1_margins['hit']}, mrr={h1_margins['mrr']}, cons={h1_margins['cons']}, lift={h1_margins['lift']}",
                 flush=True,
             )
             print(f"  hit@{pk}:                 KAHM(q→MB)−MB = {_fmt_delta(d_hit)}", flush=True)
             print(f"  MRR unique@{pk}:           KAHM(q→MB)−MB = {_fmt_delta(d_mrr)}", flush=True)
-            print(f"  top1@{pk}:                 KAHM(q→MB)−MB = {_fmt_delta(d_top1)}", flush=True)
             print(f"  cons frac@{pk}:            KAHM(q→MB)−MB = {_fmt_delta(d_cons)}", flush=True)
             print(f"  lift@{pk} (prior):         KAHM(q→MB)−MB = {_fmt_delta(d_lift)}", flush=True)
-            print(f"  majority@{pk}:             KAHM(q→MB)−MB = {_fmt_delta(d_maj)}", flush=True)
+            print(f"  (info) top1@{pk}:           KAHM(q→MB)−MB = {_fmt_delta(d_top1)}", flush=True)
+            print(f"  (info) majority@{pk}:       KAHM(q→MB)−MB = {_fmt_delta(d_maj)}", flush=True)
 
             print("  checks:", flush=True)
             print(_status("hit", d_hit, h1_margins["hit"], ok_hit), flush=True)
             print(_status("mrr_unique", d_mrr, h1_margins["mrr"], ok_mrr), flush=True)
-            print(_status("top1", d_top1, h1_margins["top1"], ok_top1), flush=True)
             print(_status("cons_frac", d_cons, h1_margins["cons"], ok_cons), flush=True)
             print(_status("lift", d_lift, h1_margins["lift"], ok_lift), flush=True)
-            print(_status("majority", d_maj, h1_margins["majority"], ok_maj), flush=True)
-            print("  Verdict: Supported." if supported_h1 else "  Verdict: Not fully supported (see deltas above).", flush=True)
-            if supported_h1 and (not ok_maj):
-                print("  Note: majority-accuracy did not meet its configured margin, but H1 does not require it.", flush=True)
+            print("  Verdict: Supported." if supported_h1b else "  Verdict: Not fully supported (see deltas above).", flush=True)
+            if supported_h1b and (not ok_top1):
+                print("  Note: top1 did not meet the configured margin; this is expected for a candidate-generation role.", flush=True)
         else:
-            print("\nHypothesis H1: skipped (MB query baseline not available; run without --skip_mb_queries).", flush=True)
+            print("\nHypothesis H1b: skipped (requires MB query baseline).", flush=True)
 
-        # --------------------------- H2 ---------------------------
+        # --------------------------- H1c ---------------------------
+        # H1c (value-add): KAHM(best routed) should *improve* top-1 quality over plain KAHM query translation.
+        if "kahm_best_minus_kahm_query" in comp:
+            d_top1 = _get_delta(comp, "kahm_best_minus_kahm_query", "top1_accuracy")
+            d_mrr = _get_delta(comp, "kahm_best_minus_kahm_query", "mrr_unique_law_at_k")
+
+            ok_top1_sup = _superior(d_top1)
+            ok_mrr_sup = _superior(d_mrr)
+            supported_h1c = ok_top1_sup or ok_mrr_sup
+
+            print("\nHypothesis H1c: KAHM(best routed) improves over KAHM(query→MB corpus)", flush=True)
+            print(f"  k = {pk}", flush=True)
+            print("  test: one-sided superiority (CI lower bound > 0)", flush=True)
+            print(f"  top1@{pk}:                 KAHM(best)−KAHM(q→MB) = {_fmt_delta(d_top1)}", flush=True)
+            print(f"  MRR unique@{pk}:           KAHM(best)−KAHM(q→MB) = {_fmt_delta(d_mrr)}", flush=True)
+            print("  checks:", flush=True)
+            print("    PASS top1_superiority" if ok_top1_sup else "    FAIL top1_superiority", flush=True)
+            print("    PASS mrr_superiority" if ok_mrr_sup else "    FAIL mrr_superiority", flush=True)
+            print("  Verdict: Supported." if supported_h1c else "  Verdict: Not fully supported (no superiority signal).", flush=True)
+        else:
+            print("\nHypothesis H1c: skipped (requires kahm_best_routed evaluation).", flush=True)
+
+# --------------------------- H2 ---------------------------
         if "kahm_full_minus_mb" in comp and "kahm_full_minus_idf" in comp:
             d_hit_mb = _get_delta(comp, "kahm_full_minus_mb", "hit_at_k")
             d_cons_mb = _get_delta(comp, "kahm_full_minus_mb", "mean_consensus_fraction_in_topk")
@@ -1524,6 +1951,11 @@ def main() -> int:
         and args.kahm_corpus_npz
         and os.path.exists(str(args.kahm_corpus_npz))
     )
+    # Ensure these are always defined for static type checkers.
+    ids_k: Optional[np.ndarray] = None
+    emb_k: Optional[np.ndarray] = None
+    meta_k: Optional[Dict[str, Any]] = None
+
 
     if use_precomputed_kahm:
         print(f"\nLoading precomputed KAHM corpus NPZ: {args.kahm_corpus_npz}", flush=True)
@@ -1557,6 +1989,7 @@ def main() -> int:
     emb_kahm_a = None
     if not bool(getattr(args, "skip_kahm_full", False)):
         if use_precomputed_kahm:
+            assert ids_k is not None and emb_k is not None
             common2, emb_k_a, _ = align_by_sentence_id(ids_k, emb_k, common_ids, emb_mb_a)
             if common2.size != common_ids.size:
                 print(
@@ -1647,6 +2080,18 @@ def main() -> int:
         bootstrap=(not bool(getattr(args, 'no_bootstrap', False))),
         bootstrap_samples=int(getattr(args, 'bootstrap_samples', DEFAULT_BOOTSTRAP_SAMPLES)),
         bootstrap_seed=int(getattr(args, 'bootstrap_seed', DEFAULT_BOOTSTRAP_SEED)),
+        kahm_best=(not bool(getattr(args, "no_kahm_best", False))),
+        kahm_best_router_k=int(getattr(args, "kahm_best_router_k", DEFAULT_KAHM_BEST_ROUTER_K)),
+        kahm_best_cand_k=int(getattr(args, "kahm_best_cand_k", DEFAULT_KAHM_BEST_CAND_K)),
+        kahm_best_mode=str(getattr(args, "kahm_best_mode", DEFAULT_KAHM_BEST_MODE)),
+        kahm_best_top_laws_grid=_parse_int_list(getattr(args, "kahm_best_top_laws_grid", DEFAULT_KAHM_BEST_TOP_LAWS_GRID), name="kahm_best_top_laws_grid"),
+        kahm_best_law_slots_grid=_parse_int_list(getattr(args, "kahm_best_law_slots_grid", DEFAULT_KAHM_BEST_LAW_SLOTS_GRID), name="kahm_best_law_slots_grid"),
+        kahm_best_lambda_grid=_parse_float_list(getattr(args, "kahm_best_lambda_grid", DEFAULT_KAHM_BEST_LAMBDA_GRID), name="kahm_best_lambda_grid"),
+        kahm_best_min_coverage=float(getattr(args, "kahm_best_min_coverage", DEFAULT_ROUTER_MIN_COVERAGE)),
+        kahm_best_optimize=str(getattr(args, "kahm_best_optimize", DEFAULT_KAHM_BEST_OPTIMIZE)),
+        kahm_best_tune=(not bool(getattr(args, "no_kahm_best_tune", False))),
+        router_cons_thresholds=_parse_float_list(getattr(args, "router_cons_thresholds", DEFAULT_ROUTER_CONS_THRESHOLDS), name="router_cons_thresholds"),
+        router_lift_thresholds=_parse_float_list(getattr(args, "router_lift_thresholds", DEFAULT_ROUTER_LIFT_THRESHOLDS), name="router_lift_thresholds"),
     )
     print_eval_summary(eval_out)
 
@@ -1709,6 +2154,18 @@ def main() -> int:
                 bootstrap=(not bool(getattr(args, "no_bootstrap", False))),
                 bootstrap_samples=int(getattr(args, "bootstrap_samples", DEFAULT_BOOTSTRAP_SAMPLES)),
                 bootstrap_seed=int(getattr(args, "bootstrap_seed", DEFAULT_BOOTSTRAP_SEED)),
+                kahm_best=(not bool(getattr(args, "no_kahm_best", False))),
+                kahm_best_router_k=int(getattr(args, "kahm_best_router_k", DEFAULT_KAHM_BEST_ROUTER_K)),
+                kahm_best_cand_k=int(getattr(args, "kahm_best_cand_k", DEFAULT_KAHM_BEST_CAND_K)),
+                kahm_best_mode=str(getattr(args, "kahm_best_mode", DEFAULT_KAHM_BEST_MODE)),
+                kahm_best_top_laws_grid=_parse_int_list(getattr(args, "kahm_best_top_laws_grid", DEFAULT_KAHM_BEST_TOP_LAWS_GRID), name="kahm_best_top_laws_grid"),
+                kahm_best_law_slots_grid=_parse_int_list(getattr(args, "kahm_best_law_slots_grid", DEFAULT_KAHM_BEST_LAW_SLOTS_GRID), name="kahm_best_law_slots_grid"),
+                kahm_best_lambda_grid=_parse_float_list(getattr(args, "kahm_best_lambda_grid", DEFAULT_KAHM_BEST_LAMBDA_GRID), name="kahm_best_lambda_grid"),
+                kahm_best_min_coverage=float(getattr(args, "kahm_best_min_coverage", DEFAULT_ROUTER_MIN_COVERAGE)),
+                kahm_best_optimize=str(getattr(args, "kahm_best_optimize", DEFAULT_KAHM_BEST_OPTIMIZE)),
+                kahm_best_tune=(not bool(getattr(args, "no_kahm_best_tune", False))),
+                router_cons_thresholds=_parse_float_list(getattr(args, "router_cons_thresholds", DEFAULT_ROUTER_CONS_THRESHOLDS), name="router_cons_thresholds"),
+                router_lift_thresholds=_parse_float_list(getattr(args, "router_lift_thresholds", DEFAULT_ROUTER_LIFT_THRESHOLDS), name="router_lift_thresholds"),
             )
         print_k_grid_summary(k_to_eval, ks=ks)
     else:

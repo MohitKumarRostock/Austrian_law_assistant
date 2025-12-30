@@ -39,7 +39,7 @@ Run:
   --max_features_word 600000 --max_features_char 300000 \
   --transformer_weight_word 1.0 --transformer_weight_char 1.0 \
   --dim 768 --svd_n_iter 20 \
-  --tfidf_dtype auto --embeddings_dtype float32 \
+  --tfidf_dtype float32 --embeddings_dtype float32 \
   --union_n_jobs 1 \
   --no_l2_n_jobs 1 \
   --no_l2
@@ -554,7 +554,7 @@ def build_embedding_index_idf_svd_npz_and_model(
     config: IDFSVDConfig = IDFSVDConfig(),
 
     # Dtypes / parallelism
-    tfidf_dtype: str = "auto",
+    tfidf_dtype: str = "float32",
     embeddings_dtype: str = "float32",
     union_n_jobs: int = 1,
 ) -> Dict[str, Any]:
@@ -812,7 +812,7 @@ def parse_args(argv) -> argparse.Namespace:
     p.add_argument(
         "--tfidf_dtype",
         type=str,
-        default="auto",
+        default="float32",
         choices=["auto", "float16", "float32", "float64"],
         help="TF-IDF dtype. Default 'auto' preserves scikit-learn default (typically float64).",
     )

@@ -32,9 +32,10 @@ Requires:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Sequence, Tuple
+from typing import Any, Iterable, Optional, Sequence, Tuple, Literal, overload
 
 import numpy as np
+from numpy.typing import DTypeLike
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from joblib import dump, load
 
@@ -46,7 +47,7 @@ from otfl.prediction_classifier_extended_v2 import prediction_classifier_extende
 # Precision helpers
 # ----------------------------
 
-def _as_float_ndarray(x: Any, *, min_dtype: np.dtype = np.float32) -> np.ndarray:
+def _as_float_ndarray(x: Any, *, min_dtype: DTypeLike = np.float32) -> np.ndarray:
     """Convert input to a floating ndarray without downcasting precision.
 
     - Integer/bool inputs are promoted to float64.
@@ -492,6 +493,36 @@ def _get_soft_params_from_model(
 # Prediction
 # ----------------------------
 
+@overload
+def kahm_regress(
+    model: dict,
+    X_new: np.ndarray,
+    n_jobs: int = -1,
+    *,
+    mode: str = "hard",
+    return_probabilities: Literal[False] = False,
+    # Soft-mode parameters (None => use model['soft_*'] if set)
+    alpha: Optional[float] = None,
+    topk: Optional[int | None] = None,
+    # For large N_new, compute in batches to control memory usage
+    batch_size: Optional[int] = None,
+) -> np.ndarray: ...
+
+@overload
+def kahm_regress(
+    model: dict,
+    X_new: np.ndarray,
+    n_jobs: int = -1,
+    *,
+    mode: str = "hard",
+    return_probabilities: Literal[True],
+    # Soft-mode parameters (None => use model['soft_*'] if set)
+    alpha: Optional[float] = None,
+    topk: Optional[int | None] = None,
+    # For large N_new, compute in batches to control memory usage
+    batch_size: Optional[int] = None,
+) -> tuple[np.ndarray, np.ndarray]: ...
+
 def kahm_regress(
     model: dict,
     X_new: np.ndarray,
@@ -542,7 +573,15 @@ def kahm_regress(
     if mode == "hard":
         _, labels_pred = prediction_classifier_extended(X_new, clf, "folding", n_jobs=n_jobs)
         idx = labels_pred.astype(int) - 1
-        return cluster_centers[:, idx]
+        Y_pred = cluster_centers[:, idx]
+
+        if return_probabilities:
+            # One-hot probabilities for hard assignments.
+            P_hard = np.zeros((C_eff, N_new), dtype=out_dtype)
+            P_hard[idx, np.arange(N_new)] = 1.0
+            return Y_pred, P_hard
+
+        return Y_pred
 
     if mode != "soft":
         raise ValueError("mode must be either 'hard' or 'soft'.")
@@ -656,9 +695,17 @@ def tune_soft_params(
 
     D_val = _ensure_distance_matrix_shape(_as_float_ndarray(D_val), C_eff, N_val, labels=labels_val)
 
+    # Materialize sequences to allow validation and stable repr in verbose output
+    alphas = tuple(alphas)
+    topks = tuple(topks)
+    if len(alphas) == 0:
+        raise ValueError("alphas must contain at least one value.")
+    if len(topks) == 0:
+        raise ValueError("topks must contain at least one value.")
+
     best_mse = float("inf")
-    best_alpha = None
-    best_topk = None
+    best_alpha: float = float(alphas[0])
+    best_topk: int | None = topks[0]
 
     if verbose:
         print("Tuning soft parameters on validation set...")

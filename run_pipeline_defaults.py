@@ -27,6 +27,10 @@ def main() -> int:
     py = sys.executable  # ensures we use the current venv python
 
     scripts = [
+        "extract_sentences_from_German_pdfs.py",
+        "build_embedding_index_npz.py",
+        "build_query_embedding_index_npz.py",
+        "build_embedding_index_idf_svd_npz.py",
         "train_kahm_embedding_regressor.py",
         "precompute_kahm_corpus_npz.py",
         "evaluate_three_embeddings.py",
@@ -36,11 +40,13 @@ def main() -> int:
         p = project_dir / s
         if not p.exists():
             raise FileNotFoundError(f"Missing script: {p}")
-
-    run([py, str(project_dir / scripts[0]), "--n_clusters", "20000"], cwd=project_dir)
-    run([py, str(project_dir / scripts[1]), "--overwrite"], cwd=project_dir)
+    run([py, str(project_dir / scripts[0])], cwd=project_dir)
+    run([py, str(project_dir / scripts[1])], cwd=project_dir)
     run([py, str(project_dir / scripts[2])], cwd=project_dir)
-
+    run([py, str(project_dir / scripts[3])], cwd=project_dir)
+    run([py, str(project_dir / scripts[4])], cwd=project_dir)
+    run([py, str(project_dir / scripts[5])], cwd=project_dir)
+    run([py, str(project_dir / scripts[6])], cwd=project_dir)
     print("\nPipeline finished successfully.", flush=True)
     return 0
 

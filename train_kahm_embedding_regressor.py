@@ -126,7 +126,7 @@ DEFAULT_NO_DEGENERACY_CHECK = False
 
 # ----------------------------- Utilities -----------------------------
 
-def as_float_ndarray(x: Any, *, min_dtype: np.dtype = np.float32) -> np.ndarray:
+def as_float_ndarray(x: Any, *, min_dtype: np.dtype = np.dtype(np.float32)) -> np.ndarray:
     """Convert input to a floating ndarray without downcasting precision.
 
     - Converts scipy sparse matrices to dense via .toarray() when available.
@@ -242,7 +242,13 @@ def split_train_val_indices(train_idx: np.ndarray, val_fraction: float, random_s
     return train_idx[train_pos], train_idx[val_pos]
 
 
-def compute_embedding_metrics(Y_pred: np.ndarray, Y_true: np.ndarray) -> Dict[str, float]:
+def compute_embedding_metrics(
+    Y_pred: np.ndarray | Tuple[np.ndarray, np.ndarray],
+    Y_true: np.ndarray,
+) -> Dict[str, float]:
+    if isinstance(Y_pred, tuple):
+        Y_pred = Y_pred[0]
+
     Y_pred = as_float_ndarray(Y_pred)
     Y_true = as_float_ndarray(Y_true)
 
@@ -579,10 +585,10 @@ def main() -> int:
     except Exception:
         pass
 
-    # Validation tensors for soft tuning (sentences only)
-    X_val = None
-    Y_val = None
-    if args.tune_soft and val_idx_sent.size > 0:
+    # Validation tensors (sentences only). Used for soft tuning when available and as evaluation split when present.
+    X_val: Optional[np.ndarray] = None
+    Y_val: Optional[np.ndarray] = None
+    if val_idx_sent.size > 0:
         X_val = Xn[val_idx_sent].T
         Y_val = Yn[val_idx_sent].T
 
@@ -592,7 +598,16 @@ def main() -> int:
             sel = rng.choice(X_val.shape[1], size=val_max, replace=False)
             X_val = X_val[:, sel]
             Y_val = Y_val[:, sel]
-            print(f"Subsampled validation set to {val_max} samples for soft tuning.")
+            print(f"Subsampled validation set to {val_max} samples for validation/evaluation.")
+
+    # Choose evaluation split: validation if present, else the held-out test set.
+    X_eval = X_test
+    Y_eval = Y_test
+    eval_name = "test"
+    if X_val is not None and Y_val is not None and X_val.shape[1] > 0:
+        X_eval = X_val
+        Y_eval = Y_val
+        eval_name = "validation"
 
     # Xn/Yn can be very large; once we have train/test/val views, drop them to reduce peak RAM.
     try:
@@ -663,6 +678,7 @@ def main() -> int:
             alphas = tuple(parse_float_list(args.soft_alphas))
             topks = tuple(parse_topk_list(args.soft_topks))
             print("\nTuning soft parameters on validation set (sentences only) ...")
+            assert X_val is not None and Y_val is not None
             tuning_result = tune_soft_params(
                 model,
                 X_val,
@@ -673,10 +689,10 @@ def main() -> int:
                 verbose=True
             )
 
-    # Evaluate on test set
-    print("\nEvaluating on validation set (sentences only) ...")
-    Y_pred_hard = kahm_regress(model, X_val, mode="hard")
-    metrics_hard = compute_embedding_metrics(Y_pred_hard, Y_val)
+    # Evaluate on validation (if present) or test (fallback)
+    print(f"\nEvaluating on {eval_name} set (sentences only) ...")
+    Y_pred_hard = kahm_regress(model, X_eval, mode="hard")
+    metrics_hard = compute_embedding_metrics(Y_pred_hard, Y_eval)
 
     print("Hard-mode metrics:")
     print(f"  Test MSE:           {metrics_hard['mse']:.6f}")
@@ -688,8 +704,8 @@ def main() -> int:
     if args.eval_soft or args.tune_soft:
         try:
             bs = int(args.soft_batch_size)
-            Y_pred_soft = kahm_regress(model, X_val, mode="soft", batch_size=(bs if bs > 0 else None))
-            metrics_soft = compute_embedding_metrics(Y_pred_soft, Y_val)
+            Y_pred_soft = kahm_regress(model, X_eval, mode="soft", batch_size=(bs if bs > 0 else None))
+            metrics_soft = compute_embedding_metrics(Y_pred_soft, Y_eval)
             print("Soft-mode metrics:")
             print(f"  Test MSE:           {metrics_soft['mse']:.6f}")
             print(f"  Overall R^2:        {metrics_soft['r2_overall']:.4f}")

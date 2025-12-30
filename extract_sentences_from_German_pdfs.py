@@ -12,7 +12,7 @@ Folder layout:
 
 Dependencies:
   - pandas
-  - PyMuPDF (pip install PyMuPDF)  -> provides module "fitz"
+  - PyMuPDF (pip install pymupdf) -> preferred import "pymupdf" (legacy: "fitz")
   - (optional fallback) pdfplumber (pip install pdfplumber)
   - parquet engine: pyarrow (recommended) or fastparquet
 """
@@ -20,8 +20,9 @@ Dependencies:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple, Dict, Any
+from typing import Iterable, List, Optional, Tuple, Dict, Any, Callable, cast
 import argparse
+import importlib
 import re
 import sys
 
@@ -152,16 +153,48 @@ def is_semantically_meaningful(
 
 def _extract_pages_with_pymupdf(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     """
-    Primary extractor: PyMuPDF (module name: fitz).
-    """
-    try:
-        import fitz  # PyMuPDF
-        if not hasattr(fitz, "open"):
-            raise ImportError("Imported 'fitz' does not look like PyMuPDF (missing fitz.open).")
-    except Exception as e:
-        raise RuntimeError(f"PyMuPDF import failed: {e}") from e
+    Primary extractor: PyMuPDF.
 
-    doc = fitz.open(str(pdf_path))
+    Implementation notes:
+      - Prefer `import pymupdf` (the current import name).
+      - Fall back to `import fitz` (legacy import name for PyMuPDF).
+      - Avoid direct attribute access like `fitz.open(...)` so that static type checkers
+        (Pylance/Pyright) do not flag missing attributes when stubs are incomplete.
+    """
+    pymupdf_mod: Any = None
+    errors: List[str] = []
+
+    for module_name in ("pymupdf", "fitz"):
+        try:
+            candidate = importlib.import_module(module_name)
+            # Basic sanity check: PyMuPDF exposes Document and/or open.
+            has_document = callable(getattr(candidate, "Document", None))
+            has_open = callable(getattr(candidate, "open", None))
+            if not (has_document or has_open):
+                raise ImportError(
+                    f"Imported '{module_name}' does not look like PyMuPDF (missing Document/open). "
+                    "You may have installed the unrelated 'fitz' package from PyPI."
+                )
+            pymupdf_mod = candidate
+            break
+        except Exception as e:
+            errors.append(f"{module_name}: {e}")
+
+    if pymupdf_mod is None:
+        raise RuntimeError("PyMuPDF import failed. Tried pymupdf, fitz. " + " | ".join(errors))
+
+    # Open the PDF. Prefer Document(...) because it is typically present in stubs.
+    Document = cast(Optional[Callable[..., Any]], getattr(pymupdf_mod, "Document", None))
+    open_fn = cast(Optional[Callable[..., Any]], getattr(pymupdf_mod, "open", None))
+
+    if callable(Document):
+        doc = Document(str(pdf_path))
+    elif callable(open_fn):
+        doc = open_fn(str(pdf_path))
+    else:
+        # Should be unreachable due to sanity check above.
+        raise RuntimeError("PyMuPDF module loaded but provides neither Document nor open().")
+
     try:
         if getattr(doc, "needs_pass", False):
             raise RuntimeError(f"Encrypted PDF (password needed): {pdf_path.name}")
