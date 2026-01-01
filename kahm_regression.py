@@ -140,8 +140,19 @@ def train_kahm_regressor(
     X = _as_float_ndarray(X)
     Y = _as_float_ndarray(Y)
 
-    # Use a shared working dtype (do not downcast precision).
-    work_dtype = np.result_type(X.dtype, Y.dtype)
+    # Choose a shared working dtype.
+    # - If model_dtype is "auto"/"none": preserve input precision (up to float32 minimum from _as_float_ndarray).
+    # - If model_dtype is "float32"/"float64": use that dtype during training to reduce peak RAM.
+    md0 = str(model_dtype).lower().strip()
+    if md0 in ("auto", "none", ""):
+        work_dtype = np.result_type(X.dtype, Y.dtype)
+    elif md0 in ("float32", "f32"):
+        work_dtype = np.float32
+    elif md0 in ("float64", "f64"):
+        work_dtype = np.float64
+    else:
+        raise ValueError("model_dtype must be one of {'auto','float32','float64'}")
+
     X = X.astype(work_dtype, copy=False)
     Y = Y.astype(work_dtype, copy=False)
 
@@ -212,6 +223,9 @@ def train_kahm_regressor(
         print(f"Merging {singletons.size} singleton cluster(s)...")
 
     if singletons.size > 0:
+        centers = kmeans.cluster_centers_
+        # Precompute squared norms of centers once (avoids large temporaries during singleton merging).
+        c2 = np.einsum("ij,ij->i", centers, centers)
         for cl in singletons:
             sample_indices = np.where(labels_zero_based == cl)[0]
             if sample_indices.size != 1:
@@ -219,7 +233,9 @@ def train_kahm_regressor(
             s_idx = sample_indices[0]
             y_sample = Y_T[s_idx]
 
-            dists = np.linalg.norm(kmeans.cluster_centers_ - y_sample[None, :], axis=1)
+            # Squared distance: ||c - y||^2 = ||c||^2 + ||y||^2 - 2 c·y
+            y2 = float(np.dot(y_sample, y_sample))
+            d2 = c2 + y2 - 2.0 * centers.dot(y_sample)
 
             candidates = np.where(counts >= 2)[0]
             if candidates.size == 0:
@@ -229,7 +245,7 @@ def train_kahm_regressor(
             if candidates.size == 0:
                 continue
 
-            target = candidates[np.argmin(dists[candidates])]
+            target = candidates[np.argmin(d2[candidates])]
             labels_zero_based[s_idx] = target
             counts[target] += 1
             counts[cl] -= 1
