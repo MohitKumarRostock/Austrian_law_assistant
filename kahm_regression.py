@@ -62,6 +62,24 @@ def _as_float_ndarray(x: Any, *, min_dtype: DTypeLike = np.float32) -> np.ndarra
     dtype = np.result_type(arr.dtype, min_dtype)
     return arr.astype(dtype, copy=False)
 
+def _scale_like(X: np.ndarray, scale: float, *, inplace: bool = False) -> np.ndarray:
+    """Scale X by `scale` without unintentionally upcasting dtype.
+
+    - If X is float32 and scale is a Python float, `X * scale` would upcast to float64.
+      This helper ensures the scale is cast to X.dtype first.
+    - If `inplace=True` and X is writeable, scaling is performed in-place to avoid a full copy.
+    """
+    if scale == 1.0:
+        return X
+    if X.dtype.kind not in 'fc':
+        X = X.astype(np.float32, copy=False)
+    s = np.asarray(scale, dtype=X.dtype)
+    if inplace and X.flags.writeable:
+        np.multiply(X, s, out=X, casting='unsafe')
+        return X
+    # out-of-place but dtype-stable
+    return (X * s).astype(X.dtype, copy=False)
+
 
 def l2_normalize_columns(M: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """L2-normalize columns of a 2D matrix (D, N). Safe for non-directional data when not used."""
@@ -153,7 +171,7 @@ def train_kahm_regressor(
 
     # Apply input scaling (for KAHM classifier training)
     if input_scale != 1.0:
-        X = X * input_scale
+        X = _scale_like(X, float(input_scale), inplace=False)
 
     # 1) K-means on outputs
     if verbose:
@@ -293,6 +311,10 @@ def train_kahm_regressor(
     if verbose:
         print("Training KAHM classifier (otfl.classifier)...")
 
+    # Ensure OTFL sees float32 (avoid implicit float64 copies inside OTFL)
+    if X_clf.dtype != np.float32:
+        X_clf = X_clf.astype(np.float32, copy=False)
+    labels_one_based_clf = labels_one_based_clf.astype(np.int32, copy=False)
     clf = classifier(
         X_clf,
         labels_one_based_clf,
@@ -558,7 +580,7 @@ def kahm_regress(
 
     input_scale = float(model.get("input_scale", 1.0))
     if input_scale != 1.0:
-        X_new = X_new * input_scale
+        X_new = _scale_like(X_new, float(input_scale), inplace=False)
 
     clf = model["classifier"]
     cluster_centers = _as_float_ndarray(model["cluster_centers"])  # (D_out, C_eff)
@@ -676,7 +698,7 @@ def tune_soft_params(
 
     # Apply same scaling used during training
     input_scale = float(model.get("input_scale", 1.0))
-    Xv = X_val * input_scale if input_scale != 1.0 else X_val
+    Xv = _scale_like(X_val, float(input_scale), inplace=False) if input_scale != 1.0 else X_val
 
     clf = model["classifier"]
     cluster_centers = _as_float_ndarray(model["cluster_centers"])
