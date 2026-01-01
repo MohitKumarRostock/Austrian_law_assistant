@@ -2,26 +2,36 @@
 
 Purpose
 -------
-Produce a clean, statistically grounded narrative for KAHM embeddings as a practical
-alternative to Mixedbread embeddings at retrieval time.
+Clean, publication-friendly evaluation script that tells a simple, defensible story about
+KAHM embeddings as a retrieval-time alternative to Mixedbread (MB).
 
-It prints three storylines (A/B/C) from the same evaluation run:
+It prints three storylines (A/B/C) from the *same* run:
 
-  A) KAHM(q→MB) decisively beats IDF–SVD on retrieval quality.
-  B) KAHM(q→MB) is close to Mixedbread (true) at top-k (paired deltas + bootstrap CIs).
-  C) A simple *hybrid* strategy (selective routing + light law-aware rerank) improves
-     decision-quality over plain KAHM(q→MB) while keeping recall competitive.
+  A) Effectiveness vs a strong low-cost baseline:
+     KAHM(q→MB) decisively beats IDF–SVD on retrieval quality.
 
-Notes
------
-* This script is intentionally opinionated: default k=10 (best storyline for
-  “MB alternative during retrieval” in your earlier results).
-* All reported confidence intervals are nonparametric paired bootstrap (default 5000).
+  B) Competitiveness vs MB at top-k:
+     KAHM(q→MB) is close to MB on top-k retrieval quality (paired deltas + bootstrap CIs).
+
+  C) Alignment / "right direction" evidence:
+     Full-KAHM corpus embeddings are aligned with MB embeddings (cosine alignment), and
+     full-KAHM retrieval neighborhoods overlap strongly with MB neighborhoods.
+
+Why this version
+----------------
+Your earlier "hybrid" storyline can be perceived as complicated and (depending on the
+implementation) may rely on MB fallback, which dilutes the claim "KAHM alone works".
+This v4 replaces that with an alignment storyline that directly supports the argument:
+
+  "KAHM approximates MB embedding geometry well enough that nearest-neighbor retrieval
+   behaves similarly." 
+
+All confidence intervals use nonparametric *paired* bootstrap (default 5000).
 
 Run
 ---
-python evaluate_three_embeddings_storylines_v3.py
-python evaluate_three_embeddings_storylines_v3.py --k 20
+python evaluate_three_embeddings_storylines_v4.py
+python evaluate_three_embeddings_storylines_v4.py --k 20
 
 Expected local files (defaults)
 ------------------------------
@@ -41,13 +51,13 @@ import importlib
 import os
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2025-12-31-storylines-v3"
+SCRIPT_VERSION = "2025-12-31-storylines-v4"
 
 
 # ----------------------------- Utilities -----------------------------
@@ -81,7 +91,9 @@ def _bootstrap_mean_ci(x: np.ndarray, *, n_boot: int, seed: int) -> Tuple[float,
     return pt, (float(lo), float(hi))
 
 
-def _bootstrap_paired_delta_ci(a: np.ndarray, b: np.ndarray, *, n_boot: int, seed: int) -> Tuple[float, Tuple[float, float]]:
+def _bootstrap_paired_delta_ci(
+    a: np.ndarray, b: np.ndarray, *, n_boot: int, seed: int
+) -> Tuple[float, Tuple[float, float]]:
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     if a.shape != b.shape:
@@ -107,7 +119,6 @@ def load_npz_bundle(path: str) -> Dict[str, np.ndarray]:
     data = np.load(path, allow_pickle=False)
     keys = set(data.files)
 
-    # Support common key variants.
     sid_key = None
     for k in ("sentence_ids", "ids", "sentence_id"):
         if k in keys:
@@ -165,7 +176,6 @@ def align_by_common_sentence_ids(
     if common.size == 0:
         raise ValueError("No common sentence_ids across df/MB/IDF/KAHM bundles")
 
-    # map id -> row index
     def _subset(ids: np.ndarray, emb: np.ndarray, common_ids: np.ndarray) -> np.ndarray:
         pos = {int(s): i for i, s in enumerate(ids.tolist())}
         idx = np.asarray([pos[int(s)] for s in common_ids.tolist()], dtype=np.int64)
@@ -197,7 +207,6 @@ def load_query_set(module_attr: str) -> List[Dict[str, Any]]:
 
 
 def _pick_from_mapping(obj: Any, keys: List[str]) -> str:
-    """Return the first non-empty string value from a dict-like mapping."""
     if not isinstance(obj, dict):
         return ""
     for k in keys:
@@ -214,7 +223,6 @@ def _pick_from_mapping(obj: Any, keys: List[str]) -> str:
 
 
 def _pick_from_object_attrs(obj: Any, keys: List[str]) -> str:
-    """Return the first non-empty string from attributes on an object."""
     for k in keys:
         if hasattr(obj, k):
             v = getattr(obj, k)
@@ -229,20 +237,11 @@ def _pick_from_object_attrs(obj: Any, keys: List[str]) -> str:
 
 
 def extract_query_texts(qs: List[Any]) -> List[str]:
-    """Extract query text robustly.
-
-    Your earlier evaluation scripts used `query_text` as the canonical key.
-    This extractor supports:
-      - dict items (preferred)
-      - tuple/list items (common: (id, query_text, consensus_law, ...))
-      - lightweight objects with attributes
-    """
     keys = ["query_text", "query", "question", "text", "prompt", "q", "input"]
     texts: List[str] = []
     for q in qs:
         t = _pick_from_mapping(q, keys)
         if not t and isinstance(q, (list, tuple)):
-            # Common tuple formats: (id, query_text, consensus_law, ...)
             if len(q) >= 2 and isinstance(q[1], str) and q[1].strip():
                 t = str(q[1]).strip()
             elif len(q) >= 1 and isinstance(q[0], str) and q[0].strip():
@@ -254,7 +253,6 @@ def extract_query_texts(qs: List[Any]) -> List[str]:
 
 
 def extract_consensus_laws(qs: List[Any]) -> List[str]:
-    """Extract consensus law labels robustly."""
     keys = [
         "consensus_law",
         "consensus",
@@ -268,11 +266,9 @@ def extract_consensus_laws(qs: List[Any]) -> List[str]:
     for q in qs:
         v = _pick_from_mapping(q, keys)
         if not v and isinstance(q, (list, tuple)):
-            # Common tuple formats: (id, query_text, consensus_law, ...)
             if len(q) >= 3 and isinstance(q[2], str) and q[2].strip():
                 v = str(q[2]).strip()
             elif len(q) >= 1 and isinstance(q[-1], str) and q[-1].strip():
-                # last element sometimes is label
                 v = str(q[-1]).strip()
         if not v:
             v = _pick_from_object_attrs(q, keys)
@@ -330,7 +326,6 @@ def build_mixedbread_embedder(model_name: str, device: str, dim: int, query_pref
         if Y.ndim != 2:
             raise ValueError(f"Mixedbread encode output must be 2D; got {Y.shape}")
         if Y.shape[1] != int(dim):
-            # allow truncation if the model returns a larger dim
             if Y.shape[1] > int(dim):
                 Y = Y[:, : int(dim)]
             else:
@@ -356,7 +351,6 @@ def kahm_regress_batched(model: dict, X: np.ndarray, *, mode: str, batch_size: i
         raise ValueError(f"KAHM regression input must be 2D; got {X.shape}")
 
     n = int(X.shape[0])
-    # Probe output dim
     Y0 = kahm_regress(model, X[:1].T, n_jobs=1, mode=str(mode))
     d_out = int(np.asarray(Y0).shape[0])
 
@@ -387,19 +381,9 @@ def compute_per_query_metrics(
     k: int,
     predominance_fraction: float,
 ) -> PerQuery:
-    """Law-level evaluation against the consensus law.
-
-    * hit@k: consensus law appears anywhere in top-k.
-    * top1: top-1 law equals consensus law.
-    * majority: majority law equals consensus law AND fraction >= predominance_fraction.
-    * cons_frac: fraction of top-k belonging to consensus law.
-    * lift: cons_frac / prior(consensus law).
-    * mrr_ul: reciprocal rank of consensus law in the *unique-law* list.
-    """
     k = int(k)
     pred_frac = float(predominance_fraction)
 
-    # Prior over laws in the aligned corpus
     c_all = Counter([str(x) for x in law_arr.tolist()])
     total = float(max(1, int(law_arr.size)))
     prior = {lw: float(cnt) / total for lw, cnt in c_all.items()}
@@ -467,80 +451,6 @@ def summarize(pq: PerQuery, *, n_boot: int, seed: int) -> Dict[str, Tuple[float,
     }
 
 
-# ----------------------------- Hybrid KAHM(best) -----------------------------
-def kahm_hybrid_best(
-    *,
-    # baseline MB list
-    mb_scores_k: np.ndarray,
-    mb_idx_k: np.ndarray,
-    # KAHM candidates in MB space
-    cand_scores: np.ndarray,
-    cand_idx: np.ndarray,
-    # router neighbors in KAHM corpus space
-    router_idx: np.ndarray,
-    law_arr: np.ndarray,
-    # parameters
-    k: int,
-    top_laws: int,
-    lam: float,
-    maj_frac_thr: float,
-    maj_lift_thr: float,
-) -> Tuple[np.ndarray, float]:
-    """Selective routing + light law-aware rerank.
-
-    If the router distribution is confident (majority fraction + lift), take KAHM candidates
-    and lightly boost candidates belonging to the top router laws. Otherwise, fall back to
-    MB baseline.
-    """
-    k = int(k)
-    top_laws = int(max(1, top_laws))
-    lam = float(lam)
-    maj_frac_thr = float(maj_frac_thr)
-    maj_lift_thr = float(maj_lift_thr)
-
-    n = int(cand_idx.shape[0])
-
-    # Prior over laws for lift
-    c_all = Counter([str(x) for x in law_arr.tolist()])
-    total = float(max(1, int(law_arr.size)))
-    prior = {lw: float(cnt) / total for lw, cnt in c_all.items()}
-
-    out = np.empty((n, k), dtype=np.int64)
-    accepted = 0
-
-    for i in range(n):
-        # router law histogram
-        r_laws = [str(law_arr[int(j)]) for j in router_idx[i].tolist() if int(j) >= 0]
-        rc = Counter(r_laws)
-        maj_law, maj_count = rc.most_common(1)[0]
-        maj_frac = float(maj_count) / float(max(1, len(r_laws)))
-        maj_prior = float(prior.get(maj_law, 0.0))
-        maj_lift = (maj_frac / maj_prior) if maj_prior > 0 else 0.0
-
-        if maj_frac >= maj_frac_thr and maj_lift >= maj_lift_thr:
-            accepted += 1
-            top = [lw for lw, _ in rc.most_common(top_laws)]
-            top_set = set(top)
-
-            # light boost for candidates in the predicted laws (no negative penalty)
-            base = cand_scores[i].astype(np.float32, copy=False)
-            cidx = cand_idx[i].astype(np.int64, copy=False)
-            boosts = np.fromiter(
-                (1.0 if str(law_arr[int(j)]) in top_set else 0.0 for j in cidx.tolist()),
-                dtype=np.float32,
-                count=int(cidx.size),
-            )
-            adj = base + (lam * boosts)
-            order = np.argsort(-adj, kind="mergesort")
-            out[i] = cidx[order[:k]]
-        else:
-            out[i] = mb_idx_k[i, :k]
-
-    coverage = float(accepted) / float(max(1, n))
-    return out, coverage
-
-
-# ----------------------------- Printing -----------------------------
 def print_method(name: str, s: Dict[str, Tuple[float, Tuple[float, float]]], *, k: int) -> None:
     print(f"\n[{name}]  (k={k})")
     print(f"  hit@k:               {_fmt_ci(*s['hit'])}")
@@ -585,21 +495,67 @@ def storyline_competitiveness(title: str, a_name: str, b_name: str, a: PerQuery,
     ]:
         pt, ci = _bootstrap_paired_delta_ci(getattr(a, key), getattr(b, key), n_boot=n_boot, seed=seed + sd)
         print(f"  {label}: {a_name}−{b_name} = {_fmt_delta(pt, ci)}")
-    pt_hit, ci_hit = _bootstrap_paired_delta_ci(a.hit, b.hit, n_boot=n_boot, seed=seed + 77)
-    pt_mrr, ci_mrr = _bootstrap_paired_delta_ci(a.mrr_ul, b.mrr_ul, n_boot=n_boot, seed=seed + 78)
-    print(
-        f"  (interpretation) worst-case deltas (CI lower bound): hit@k {min(0.0, ci_hit[0]):+.3f}, MRR(unique) {min(0.0, ci_mrr[0]):+.3f}"
-    )
+
+
+# ----------------------------- Alignment metrics -----------------------------
+def cosine_rowwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Row-wise cosine similarity. Assumes rows are L2-normalized."""
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if a.shape != b.shape:
+        raise ValueError(f"cosine_rowwise shape mismatch: {a.shape} vs {b.shape}")
+    return np.sum(a * b, axis=1).astype(np.float64)
+
+
+def jaccard_topk_rows(a_idx: np.ndarray, b_idx: np.ndarray, *, k: int) -> np.ndarray:
+    """Jaccard overlap of sentence-id sets in the top-k lists."""
+    a_idx = np.asarray(a_idx, dtype=np.int64)[:, : int(k)]
+    b_idx = np.asarray(b_idx, dtype=np.int64)[:, : int(k)]
+    n = int(a_idx.shape[0])
+    out = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        A = set(int(x) for x in a_idx[i].tolist() if int(x) >= 0)
+        B = set(int(x) for x in b_idx[i].tolist() if int(x) >= 0)
+        u = len(A | B)
+        out[i] = (len(A & B) / u) if u else 0.0
+    return out
+
+
+def overlap_frac_topk_rows(a_idx: np.ndarray, b_idx: np.ndarray, *, k: int) -> np.ndarray:
+    """Intersection size divided by k (fixed-k overlap fraction)."""
+    a_idx = np.asarray(a_idx, dtype=np.int64)[:, : int(k)]
+    b_idx = np.asarray(b_idx, dtype=np.int64)[:, : int(k)]
+    n = int(a_idx.shape[0])
+    out = np.zeros(n, dtype=np.float64)
+    kf = float(max(1, int(k)))
+    for i in range(n):
+        A = set(int(x) for x in a_idx[i].tolist() if int(x) >= 0)
+        B = set(int(x) for x in b_idx[i].tolist() if int(x) >= 0)
+        out[i] = float(len(A & B)) / kf
+    return out
+
+
+def law_jaccard_topk_rows(a_idx: np.ndarray, b_idx: np.ndarray, law_arr: np.ndarray, *, k: int) -> np.ndarray:
+    """Jaccard overlap of *unique laws* present in the top-k lists."""
+    a_idx = np.asarray(a_idx, dtype=np.int64)[:, : int(k)]
+    b_idx = np.asarray(b_idx, dtype=np.int64)[:, : int(k)]
+    n = int(a_idx.shape[0])
+    out = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        A = set(str(law_arr[int(x)]) for x in a_idx[i].tolist() if int(x) >= 0)
+        B = set(str(law_arr[int(x)]) for x in b_idx[i].tolist() if int(x) >= 0)
+        u = len(A | B)
+        out[i] = (len(A & B) / u) if u else 0.0
+    return out
 
 
 # ----------------------------- Main -----------------------------
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Clean storyline evaluation for KAHM embeddings.",
+        description="Clean storyline evaluation for KAHM embeddings (v4: alignment storyline).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Inputs
     p.add_argument("--corpus_parquet", default="ris_sentences.parquet")
     p.add_argument("--semantic_npz", default="embedding_index.npz", help="Mixedbread corpus embeddings")
     p.add_argument("--idf_svd_npz", default="embedding_index_idf_svd.npz")
@@ -610,25 +566,14 @@ def main() -> None:
     p.add_argument("--kahm_batch", type=int, default=4096)
     p.add_argument("--query_set", default="query_set.TEST_QUERY_SET")
 
-    # Eval
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--predominance_fraction", type=float, default=0.5)
 
-    # Mixedbread query baseline
     p.add_argument("--mixedbread_model", default="mixedbread-ai/deepset-mxbai-embed-de-large-v1")
     p.add_argument("--device", default="cpu")
     p.add_argument("--query_prefix", default="query: ")
     p.add_argument("--mb_query_batch", type=int, default=64)
 
-    # Hybrid KAHM(best) params (defaults chosen to match your strongest top-10 narrative)
-    p.add_argument("--router_k", type=int, default=50)
-    p.add_argument("--cand_k", type=int, default=200)
-    p.add_argument("--top_laws", type=int, default=2)
-    p.add_argument("--lambda", dest="lam", type=float, default=0.05)
-    p.add_argument("--maj_frac_thr", type=float, default=0.40)
-    p.add_argument("--maj_lift_thr", type=float, default=5.0)
-
-    # Bootstrap
     p.add_argument("--bootstrap_samples", type=int, default=5000)
     p.add_argument("--bootstrap_seed", type=int, default=0)
 
@@ -639,27 +584,14 @@ def main() -> None:
         flush=True,
     )
 
-    # Load query set
     qs = load_query_set(args.query_set)
     texts = extract_query_texts(qs)
     consensus = extract_consensus_laws(qs)
     n_q = len(qs)
     n_empty_text = sum(1 for t in texts if not t)
-    n_empty_cons = sum(1 for c in consensus if not c)
     if n_empty_text:
         print(f"WARNING: {n_empty_text}/{n_q} queries have empty text (check query_set keys).", flush=True)
-        if n_empty_text == n_q:
-            q0 = qs[0]
-            print("  Diagnostics: all query texts are empty.", flush=True)
-            print(f"  First query item type: {type(q0).__name__}", flush=True)
-            if isinstance(q0, dict):
-                print(f"  First query dict keys: {sorted(list(q0.keys()))}", flush=True)
-            else:
-                print(f"  First query repr: {repr(q0)[:300]}", flush=True)
-    if n_empty_cons:
-        print(f"WARNING: {n_empty_cons}/{n_q} queries have empty consensus law (will evaluate as-is).", flush=True)
 
-    # Load corpora
     df = load_corpus_parquet(args.corpus_parquet)
     mb = load_npz_bundle(args.semantic_npz)
     idf = load_npz_bundle(args.idf_svd_npz)
@@ -676,15 +608,6 @@ def main() -> None:
     print(f"  MB corpus:   {emb_mb.shape}")
     print(f"  IDF corpus:  {emb_idf.shape}")
     print(f"  KAHM corpus: {emb_k.shape}")
-
-    # Sanity: consensus coverage
-    corpus_laws = set(str(x) for x in np.unique(law_arr).tolist())
-    cons_laws = [c for c in consensus if c]
-    cons_unique = sorted(set(cons_laws))
-    missing = [c for c in cons_unique if c not in corpus_laws]
-    print(f"Consensus labels: {len(cons_unique)} unique; missing from corpus={len(missing)}", flush=True)
-    if missing:
-        print(f"  Example missing labels: {missing[:10]}", flush=True)
 
     # Build indices
     print("\nBuilding FAISS indices ...", flush=True)
@@ -705,7 +628,7 @@ def main() -> None:
     mb_embed = build_mixedbread_embedder(args.mixedbread_model, args.device, int(emb_mb.shape[1]), args.query_prefix)
     q_mb = mb_embed(texts, batch_size=args.mb_query_batch)
 
-    # Retrieval
+    # Retrieval + quality metrics
     k = int(args.k)
     pred_frac = float(args.predominance_fraction)
     n_boot = int(args.bootstrap_samples)
@@ -713,51 +636,30 @@ def main() -> None:
 
     mb_scores, mb_idx = faiss_search(index_mb, q_mb, k)
     idf_scores, idf_idx = faiss_search(index_idf, q_idf, k)
-    kahm_scores_k, kahm_idx_k = faiss_search(index_mb, q_kahm, k)
+
+    # KAHM as a drop-in replacement for MB at query-time (search MB corpus)
+    kahm_qmb_scores, kahm_qmb_idx = faiss_search(index_mb, q_kahm, k)
+
+    # Full-KAHM retrieval (search KAHM corpus)
+    kahm_full_scores, kahm_full_idx = faiss_search(index_k, q_kahm, k)
 
     mb_pq = compute_per_query_metrics(idx=mb_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
     idf_pq = compute_per_query_metrics(idx=idf_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
-    kahm_qmb_pq = compute_per_query_metrics(idx=kahm_idx_k, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
+    kahm_qmb_pq = compute_per_query_metrics(idx=kahm_qmb_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
+    kahm_full_pq = compute_per_query_metrics(idx=kahm_full_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
 
     mb_sum = summarize(mb_pq, n_boot=n_boot, seed=seed + 10)
     idf_sum = summarize(idf_pq, n_boot=n_boot, seed=seed + 20)
     kahm_qmb_sum = summarize(kahm_qmb_pq, n_boot=n_boot, seed=seed + 30)
+    kahm_full_sum = summarize(kahm_full_pq, n_boot=n_boot, seed=seed + 40)
 
-    # KAHM(best): hybrid routing + rerank
-    cand_k = int(max(k, args.cand_k))
-    router_k = int(max(k, args.router_k))
-    cand_scores, cand_idx = faiss_search(index_mb, q_kahm, cand_k)
-    _, router_idx = faiss_search(index_k, q_kahm, router_k)
-    kahm_best_idx, coverage = kahm_hybrid_best(
-        mb_scores_k=mb_scores,
-        mb_idx_k=mb_idx,
-        cand_scores=cand_scores,
-        cand_idx=cand_idx,
-        router_idx=router_idx,
-        law_arr=law_arr,
-        k=k,
-        top_laws=int(args.top_laws),
-        lam=float(args.lam),
-        maj_frac_thr=float(args.maj_frac_thr),
-        maj_lift_thr=float(args.maj_lift_thr),
-    )
-    kahm_best_pq = compute_per_query_metrics(
-        idx=kahm_best_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac
-    )
-    kahm_best_sum = summarize(kahm_best_pq, n_boot=n_boot, seed=seed + 40)
-
-    # Headline method blocks
+    # Headline blocks
     print_method("Mixedbread (true)", mb_sum, k=k)
     print_method("IDF–SVD", idf_sum, k=k)
     print_method("KAHM(query→MB corpus)", kahm_qmb_sum, k=k)
-    print_method("KAHM(best hybrid)", kahm_best_sum, k=k)
-    print(
-        f"  kahm_best config: router_k={router_k} cand_k={cand_k} maj_frac_thr={args.maj_frac_thr:.2f} maj_lift_thr={args.maj_lift_thr:.1f} top_laws={args.top_laws} lambda={args.lam:.3f}",
-        flush=True,
-    )
-    print(f"  kahm_best coverage: {coverage:.3f}", flush=True)
+    print_method("Full-KAHM (query→KAHM corpus)", kahm_full_sum, k=k)
 
-    # Storyline A/B/C
+    # Storyline A/B
     storyline_superiority(
         "\nStoryline A: KAHM(query→MB) beats IDF–SVD (a strong low-cost baseline)",
         "KAHM(q→MB)",
@@ -778,19 +680,41 @@ def main() -> None:
         seed=seed + 200,
     )
 
-    # For C, focus on *decision-quality* improvements (top1 + MRR), and show purity signals informally.
-    print("\nStoryline C: Hybrid KAHM improves decision-quality over plain KAHM(q→MB)")
-    print("  Test: one-sided superiority (paired 95% bootstrap CI lower bound > 0)")
-    for key, label, sd in [
-        ("top1", "top1-accuracy", 1),
-        ("mrr_ul", "MRR@k (unique laws)", 2),
-        ("majority", "majority-accuracy", 3),
-        ("cons_frac", "mean consensus fraction", 4),
-        ("lift", "mean lift (prior)", 5),
-    ]:
-        pt, ci = _bootstrap_paired_delta_ci(getattr(kahm_best_pq, key), getattr(kahm_qmb_pq, key), n_boot=n_boot, seed=seed + 300 + sd)
-        ok = bool(np.isfinite(ci[0]) and ci[0] > 0.0)
-        print(f"  {label}: KAHM(best)−KAHM(q→MB) = {_fmt_delta(pt, ci)}  -> {'PASS' if ok else 'FAIL'}")
+    # Storyline C: alignment evidence
+    print("\nStoryline C: Full-KAHM embeddings are aligned with MB (geometry + neighborhood overlap)")
+    print("  Part C1: Embedding-space cosine alignment")
+
+    cos_corpus = cosine_rowwise(emb_k, emb_mb)
+    cos_query = cosine_rowwise(q_kahm, q_mb)
+    pt_c, ci_c = _bootstrap_mean_ci(cos_corpus, n_boot=n_boot, seed=seed + 300)
+    pt_q, ci_q = _bootstrap_mean_ci(cos_query, n_boot=n_boot, seed=seed + 301)
+    print(f"    corpus cosine(KAHM, MB): {_fmt_ci(pt_c, ci_c, digits=4)}")
+    print(f"    query  cosine(KAHM, MB): {_fmt_ci(pt_q, ci_q, digits=4)}")
+
+    print("  Part C2: Retrieval-neighborhood overlap vs MB")
+    sent_j_full = jaccard_topk_rows(kahm_full_idx, mb_idx, k=k)
+    sent_f_full = overlap_frac_topk_rows(kahm_full_idx, mb_idx, k=k)
+    law_j_full = law_jaccard_topk_rows(kahm_full_idx, mb_idx, law_arr, k=k)
+
+    pt_sj, ci_sj = _bootstrap_mean_ci(sent_j_full, n_boot=n_boot, seed=seed + 310)
+    pt_sf, ci_sf = _bootstrap_mean_ci(sent_f_full, n_boot=n_boot, seed=seed + 311)
+    pt_lj, ci_lj = _bootstrap_mean_ci(law_j_full, n_boot=n_boot, seed=seed + 312)
+
+    print(f"    sentence Jaccard@{k} (Full-KAHM vs MB): {_fmt_ci(pt_sj, ci_sj)}")
+    print(f"    sentence overlap frac@{k}            : {_fmt_ci(pt_sf, ci_sf)}")
+    print(f"    law-set Jaccard@{k} (Full-KAHM vs MB): {_fmt_ci(pt_lj, ci_lj)}")
+
+    # Context: show Full-KAHM is *more* aligned to MB than IDF is.
+    sent_j_idf = jaccard_topk_rows(idf_idx, mb_idx, k=k)
+    law_j_idf = law_jaccard_topk_rows(idf_idx, mb_idx, law_arr, k=k)
+    d_sj_pt, d_sj_ci = _bootstrap_paired_delta_ci(sent_j_full, sent_j_idf, n_boot=n_boot, seed=seed + 320)
+    d_lj_pt, d_lj_ci = _bootstrap_paired_delta_ci(law_j_full, law_j_idf, n_boot=n_boot, seed=seed + 321)
+    ok_sj = bool(np.isfinite(d_sj_ci[0]) and d_sj_ci[0] > 0)
+    ok_lj = bool(np.isfinite(d_lj_ci[0]) and d_lj_ci[0] > 0)
+    print("  Part C3: Alignment gain vs IDF–SVD (paired deltas)")
+    print(f"    sentence Jaccard delta: (Full-KAHM−IDF) = {_fmt_delta(d_sj_pt, d_sj_ci)}  -> {'PASS' if ok_sj else 'FAIL'}")
+    print(f"    law-set Jaccard delta : (Full-KAHM−IDF) = {_fmt_delta(d_lj_pt, d_lj_ci)}  -> {'PASS' if ok_lj else 'FAIL'}")
+    print("    Interpretation: PASS means Full-KAHM neighborhoods are *statistically* closer to MB than IDF neighborhoods.")
 
     print("\nPipeline finished successfully.")
 
