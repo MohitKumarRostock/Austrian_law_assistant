@@ -31,10 +31,56 @@ import pandas as pd
 
 # ----------------------------- Sentence splitting & filtering -----------------------------
 
-_ABBREVIATIONS = [
-    # Common German / legal abbreviations that should not trigger sentence splits
-    "Abs.", "Art.", "Z.", "Zl.", "lit.", "Nr.", "Ziff.", "idF", "iVm.", "iSd.", "iSv.",
-    "zB.", "bzw.", "ua.", "u.a.", "vgl.", "mwN.", "d.h.", "Dr.", "Prof.", "S.", "§§",
+_ABBREV_PLACEHOLDER = "∯"  # unlikely to appear in RIS law texts
+
+# Regex-based abbreviation protection (RIS / Austrian statutory texts)
+#
+# Goal: prevent sentence splitting on dots that are part of legal/common abbreviations.
+#
+# Notes:
+#   - Patterns are intentionally conservative (anchored with \b where sensible).
+#   - Some patterns allow optional internal whitespace (e.g., "z. B." / "d. h.").
+_ABBREVIATION_REGEXES: List[re.Pattern[str]] = [
+    # Multi-dot abbreviations first (avoid partial matches like "z." before "z.B.")
+    re.compile(r"\bz\.\s*B\.", flags=re.IGNORECASE),
+    re.compile(r"\bu\.\s*a\.", flags=re.IGNORECASE),
+    re.compile(r"\bd\.\s*h\.", flags=re.IGNORECASE),
+    re.compile(r"\bi\.\s*d\.\s*R\.", flags=re.IGNORECASE),
+    re.compile(r"\bu\.\s*U\.", flags=re.IGNORECASE),
+
+    # Common single-token abbreviations
+    re.compile(r"\bAbs\.", flags=re.IGNORECASE),
+    re.compile(r"\bArt\.", flags=re.IGNORECASE),
+    re.compile(r"\bZl\.", flags=re.IGNORECASE),
+    # Protect "Z." but not when it is the first fragment of a multi-dot abbreviation (e.g. "z.B.")
+    re.compile(r"\bZ\.(?!\s*[A-Za-z]\.)", flags=re.IGNORECASE),
+    re.compile(r"\blit\.", flags=re.IGNORECASE),
+    re.compile(r"\bNr\.", flags=re.IGNORECASE),
+    re.compile(r"\bZiff\.", flags=re.IGNORECASE),
+    re.compile(r"\biVm\.", flags=re.IGNORECASE),
+    re.compile(r"\biSd\.", flags=re.IGNORECASE),
+    re.compile(r"\biSv\.", flags=re.IGNORECASE),
+    re.compile(r"\bzB\.", flags=re.IGNORECASE),
+    re.compile(r"\bbzw\.", flags=re.IGNORECASE),
+    re.compile(r"\bua\.", flags=re.IGNORECASE),
+    re.compile(r"\bvgl\.", flags=re.IGNORECASE),
+    re.compile(r"\bmwN\.", flags=re.IGNORECASE),
+    re.compile(r"\buU\.", flags=re.IGNORECASE),
+    re.compile(r"\bDr\.", flags=re.IGNORECASE),
+    re.compile(r"\bProf\.", flags=re.IGNORECASE),
+    re.compile(r"\bS\.", flags=re.IGNORECASE),  # often "S." = Satz/Seite
+    re.compile(r"\bff\.", flags=re.IGNORECASE),
+    re.compile(r"\bf\.", flags=re.IGNORECASE),
+    re.compile(r"\bgem\.", flags=re.IGNORECASE),
+    re.compile(r"\bggf\.", flags=re.IGNORECASE),
+    re.compile(r"\binsb\.", flags=re.IGNORECASE),
+    re.compile(r"\binsbes\.", flags=re.IGNORECASE),
+    re.compile(r"\bsog\.", flags=re.IGNORECASE),
+    re.compile(r"\bBGBl\.", flags=re.IGNORECASE),
+    re.compile(r"\bRGBl\.", flags=re.IGNORECASE),
+    re.compile(r"\bStGBl\.", flags=re.IGNORECASE),
+    re.compile(r"\bdRGBl\.", flags=re.IGNORECASE),
+    re.compile(r"\bJGS\.", flags=re.IGNORECASE),
 ]
 
 _RIS_INLINE_FOOTER_RE = re.compile(
@@ -48,21 +94,78 @@ _RIS_URL_ONLY_RE = re.compile(r"^\s*www\.ris\.bka\.gv\.at\s*$", flags=re.IGNOREC
 # If we keep the trailing dot, the sentence splitter will often create
 # a standalone sentence ("§ 871.") which is then dropped as non-meaningful,
 # causing the following paragraph to lose its section anchor.
-_SECTION_HEADING_LINE_RE = re.compile(r"^\s*§\s*\.?\s*(\d+[A-Za-z]?)\s*\.\s*", flags=re.MULTILINE)
-_ARTICLE_HEADING_LINE_RE = re.compile(r"^\s*Art\.\s*(\d+[A-Za-z]?)\s*\.\s*", flags=re.MULTILINE)
+_SECTION_HEADING_LINE_RE = re.compile(
+    # Examples:
+    #   "§ 871."  / "§. 871." / "§ 1" / "§ 1. Geltungsbereich"
+    r"^\s*§\s*\.?\s*(\d+[A-Za-z]?)\s*(?:\.\s*|\s+)",
+    flags=re.MULTILINE,
+)
+
+_ARTICLE_HEADING_LINE_RE = re.compile(
+    # Examples:
+    #   "Art. 10." / "Art 10" / "Artikel 10" / "Art. I" (amendment acts)
+    r"^\s*(?:Art\.?|Artikel)\s*(\d+[A-Za-z]?|[IVXLCDM]+)\s*(?:\.\s*|\s+|:\s*)",
+    flags=re.MULTILINE,
+)
 
 # Enumerations frequently appear at line start as "1." / "2." etc.
 # If left unchanged, splitting on '.' can drop the numeric marker.
 _ENUM_LINE_RE = re.compile(r"^\s*(\d+)\.\s+", flags=re.MULTILINE)
 
+# Sometimes PDF extraction flattens enumerations onto one line, e.g. "gilt: 1. ... 2. ...".
+# Restrict to list markers that follow ':' or ';' to avoid corrupting legal references like "§ 1.".
+_ENUM_AFTER_COLON_SEMI_RE = re.compile(r"(?:(?<=:)|(?<=;))\s*(\d+)\.\s+")
+
+# Letter / roman numeral enumerations at line start: "a." / "I." etc.
+_ENUM_ALPHA_LINE_RE = re.compile(r"^\s*([A-Za-z])\.\s+", flags=re.MULTILINE)
+_ENUM_ROMAN_LINE_RE = re.compile(r"^\s*([IVXLCDM]{1,8})\.\s+", flags=re.MULTILINE)
+
 _DEFAULT_DROP_PATTERNS = [
     # Common RIS-ish headers/footers/noise. Extend as you discover recurring lines.
     r"^\s*Seite\s+\d+(\s+von\s+\d+)?\s*$",
     r"^\s*RIS\s*$",
+    r"^\s*RIS\s*-\s*Rechtsinformationssystem.*$",
+    r"^\s*Rechtsinformationssystem.*$",
     r"^\s*Bundesrecht\s+konsolidiert\s*$",
+    r"^\s*Bundesrecht\s+konsolidiert\s*:\s*$",
+    # Consolidated-law compilation headers often appear as a single long line after PDF extraction.
+    r"^\s*Bundesrecht\s+konsolidiert\b.*$",
+    r"^\s*Gesamte\s+Rechtsvorschrift\b.*$",
+    r"^\s*Gesamte\s+Rechtsvorschrift\s+für\b.*$",
+    r"^\s*Umsetzungshinweis\b.*$",
+    r"^\s*Beachte\b.*$",
+    r"^\s*CELEX-?Nr\.?\s*:?.*$",
+    # CELEX identifiers may be preceded by brackets/roman numerals in extracted text.
+    r"\bCELEX\b",
+    r"\bEWR\/Anh\.",
+    r"^\s*StF\s*:?.*$",
+    r"^\s*Änderung\s+(?:BGBl|RGBl|dRGBl|StGBl|JGS)\..*$",
+    r"^\s*(?:BGBl|RGBl|dRGBl|StGBl|JGS)\.?\s*(?:I\s+)?Nr\.?\s*\d+\/\d{2,4}.*$",
+    # Citation-only lines often contain additional parenthetical references before the gazette token.
+    r"^\s*Nr\.?\s*\d+\/\d{2,4}.*\b(?:BGBl|RGBl|dRGBl|StGBl|JGS)\..*$",
+    r"^\s*BR\s*:\s*.*$",
+    r"^\s*BT\s*:\s*.*$",
+    r"^\s*NR\s*:\s*.*$",
+    r"^\s*Bundeskanzleramt.*$",
+    r"^\s*Kundmachungsorgan\s*:?.*$",
+    r"^\s*Gesetzesnummer\s*:?.*$",
+    r"^\s*Dokumenttyp\s*:?.*$",
+    r"^\s*Kurztitel\s*:?.*$",
+    r"^\s*Langtitel\s*:?.*$",
+    r"^\s*Abkürzung\s*:?.*$",
+    r"^\s*Fassung\s+vom\s+.*$",
+    r"^\s*Inkrafttretensdatum\s*:?.*$",
+    r"^\s*Zuletzt\s+geändert\s+durch\s*:?.*$",
+    r"^\s*Text\s*:?.*$",
+    r"^\s*Norm\s*:?.*$",
+    r"^\s*Anmerkung\s*:?.*$",
+    r"^\s*Schlagworte\s*:?.*$",
     r"^\s*Zuletzt\s+aktualisiert.*$",
     r"^\s*Stand\s+\d{1,2}\.\d{1,2}\.\d{2,4}\s*$",
     r"^\s*Dokumentnummer.*$",
+    r"\bPNV\s*:\b",
+    r"\(NR:\s*GP\b",
+    r"\bGP\s+[IVXLCDM]+\b\s+RV\b",
 ]
 
 
@@ -86,8 +189,12 @@ def _normalize_whitespace(s: str) -> str:
     s = _SECTION_HEADING_LINE_RE.sub(r"§\1 ", s)
     s = _ARTICLE_HEADING_LINE_RE.sub(r"Art. \1 ", s)
 
-    # Preserve list numbering at the start of a line (avoid splitting on "1.")
+    # Preserve list markers (avoid splitting on "1." / "a." / "I.").
+    # Apply *before* newlines are collapsed so MULTILINE anchors still work.
+    s = _ENUM_ROMAN_LINE_RE.sub(r"\1) ", s)
+    s = _ENUM_ALPHA_LINE_RE.sub(r"\1) ", s)
     s = _ENUM_LINE_RE.sub(r"\1) ", s)
+    s = _ENUM_AFTER_COLON_SEMI_RE.sub(r" \1) ", s)
 
     # Remaining newlines -> spaces
     s = re.sub(r"\s*\n\s*", " ", s)
@@ -100,14 +207,22 @@ def _protect_abbreviations(text: str) -> Tuple[str, Dict[str, str]]:
     """
     Replace dots in known abbreviations with a placeholder so sentence splitting
     doesn't break on them.
+
+    Uses regex patterns (instead of naive substring replace) to reduce false matches
+    and to support spacing variants such as "z. B." and "d. h.".
     """
     placeholder_map: Dict[str, str] = {}
     out = text
-    for abbr in _ABBREVIATIONS:
-        safe = abbr.replace(".", "∯")  # unlikely char
-        if abbr in out:
-            placeholder_map[safe] = abbr
-            out = out.replace(abbr, safe)
+
+    def _repl(m: re.Match[str]) -> str:
+        abbr = m.group(0)
+        safe = abbr.replace(".", _ABBREV_PLACEHOLDER)
+        placeholder_map[safe] = abbr
+        return safe
+
+    for rx in _ABBREVIATION_REGEXES:
+        out = rx.sub(_repl, out)
+
     return out, placeholder_map
 
 
@@ -157,7 +272,7 @@ def is_semantically_meaningful(
 
     if drop_patterns:
         for pat in drop_patterns:
-            if re.match(pat, s, flags=re.IGNORECASE):
+            if re.search(pat, s, flags=re.IGNORECASE):
                 return False
 
     # Must contain at least one letter (incl. umlauts/ß)

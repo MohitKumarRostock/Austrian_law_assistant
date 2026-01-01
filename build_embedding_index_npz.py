@@ -281,7 +281,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--out", type=Path, default=DEFAULT_OUT_NPZ, help="Output NPZ bundle path.")
     p.add_argument("--model", type=str, default=DEFAULT_MODEL, help="HF model name for embeddings.")
     p.add_argument("--device", type=str, default="auto", help="Device: auto|cpu|cuda|mps")
-    p.add_argument("--batch-size", type=int, default=16, help="Batch size for encoding.")
+    p.add_argument("--batch-size", type=int, default=4, help="Batch size for encoding.")
     p.add_argument("--max-length", type=int, default=512, help="Max token length for encoder.")
     p.add_argument("--normalize", action="store_true", help="L2-normalize embeddings.")
     p.add_argument("--truncate-dim", type=int, default=0, help="If >0, truncate embedding dimension to this value.")
