@@ -50,7 +50,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from kahm_regression import kahm_regress, save_kahm_regressor, train_kahm_regressor, tune_soft_params
+try:
+    # Prefer the memory-optimized implementation if present.
+    from kahm_regression import (
+        kahm_regress,
+        save_kahm_regressor,
+        train_kahm_regressor,
+        tune_soft_params,
+    )
+except ImportError:  # pragma: no cover
+    # Fallback to the baseline implementation.
+    from kahm_regression import kahm_regress, save_kahm_regressor, train_kahm_regressor, tune_soft_params
+
 
 
 # ----------------------------- QUERY_SET import -----------------------------
@@ -142,14 +153,28 @@ def as_float_ndarray(x: Any, *, min_dtype: np.dtype = np.dtype(np.float32)) -> n
     dtype = np.result_type(arr.dtype, min_dtype)
     return arr.astype(dtype, copy=False)
 
-def l2_normalize_rows(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def l2_normalize_rows(mat: np.ndarray, eps: float = 1e-12, *, inplace: bool = False) -> np.ndarray:
+    """L2-normalize rows of a 2D array.
+
+    Memory behavior:
+      - inplace=False (default): returns a new normalized array (does not mutate the input).
+      - inplace=True: normalizes the provided array in-place (or a writable copy).
+    """
     mat = as_float_ndarray(mat)
     dtype = mat.dtype
     eps_t = dtype.type(eps)
 
+    if inplace:
+        out = mat if mat.flags.writeable else mat.copy()
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        np.maximum(norms, eps_t, out=norms)
+        out /= norms
+        return out
+
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     norms = np.maximum(norms, eps_t).astype(dtype, copy=False)
     return mat / norms
+
 
 
 def _npz_scalar_to_str(x: Any) -> Optional[str]:
@@ -221,9 +246,38 @@ def align_by_sentence_id(
 
 
 def train_test_split_indices(N: int, train_fraction: float, random_state: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (train_idx, test_idx) for N samples.
+
+    Memory notes:
+      - Special-cases train_fraction >= 1.0 to avoid allocating a full permutation.
+      - Preserves the original behavior of always returning at least one training sample.
+    """
+    N = int(N)
+    if N <= 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+
+    tf = float(train_fraction)
+
+    # Fast path: all-train, no-test.
+    if tf >= 1.0:
+        return np.arange(N, dtype=np.int64), np.array([], dtype=np.int64)
+
     rng = np.random.RandomState(int(random_state))
+
+    # Fast path: effectively 0% train still returns 1 sample, without a full permutation.
+    if tf <= 0.0:
+        i = int(rng.randint(0, N))
+        train_idx = np.array([i], dtype=np.int64)
+        if N == 1:
+            return train_idx, np.array([], dtype=np.int64)
+        test_idx = np.concatenate(
+            [np.arange(0, i, dtype=np.int64), np.arange(i + 1, N, dtype=np.int64)],
+            axis=0,
+        )
+        return train_idx, test_idx
+
     perm = rng.permutation(N)
-    n_train = int(float(train_fraction) * N)
+    n_train = int(tf * N)
     n_train = max(1, min(N, n_train))
     return perm[:n_train], perm[n_train:]
 
@@ -246,6 +300,13 @@ def compute_embedding_metrics(
     Y_pred: np.ndarray | Tuple[np.ndarray, np.ndarray],
     Y_true: np.ndarray,
 ) -> Dict[str, float]:
+    """Compute MSE, overall R^2, and cosine similarity stats for (D, N) embeddings.
+
+    Memory notes:
+      - avoids computing (Y_pred - Y_true) twice
+      - avoids forming full centered matrices for R^2 (uses sum-of-squares identity)
+      - avoids allocating a full (D, N) product for dot-products (uses einsum)
+    """
     if isinstance(Y_pred, tuple):
         Y_pred = Y_pred[0]
 
@@ -257,12 +318,22 @@ def compute_embedding_metrics(
     Y_pred = Y_pred.astype(work_dtype, copy=False)
     Y_true = Y_true.astype(work_dtype, copy=False)
 
-    mse = float(np.mean((Y_pred - Y_true) ** 2))
-    residual_ss = float(np.sum((Y_pred - Y_true) ** 2))
-    total_ss = float(np.sum((Y_true - Y_true.mean(axis=1, keepdims=True)) ** 2))
+    # Squared error (allocate once; reuse for both mse and residual_ss)
+    diff = Y_pred - Y_true
+    np.square(diff, out=diff)
+    residual_ss = float(np.sum(diff))
+    mse = float(np.mean(diff))
+
+    # Total sum of squares without forming a centered (D, N) matrix:
+    #   sum_j (y_ij - mean_i)^2 = sum_j y_ij^2 - N * mean_i^2
+    N = int(Y_true.shape[1])
+    mean_true = Y_true.mean(axis=1)
+    sum_sq_true = float(np.einsum("ij,ij->", Y_true, Y_true))
+    total_ss = float(sum_sq_true - N * float(np.sum(mean_true * mean_true)))
     r2_overall = float(1.0 - residual_ss / total_ss) if total_ss > 0 else float("nan")
 
-    dot = np.sum(Y_pred * Y_true, axis=0)
+    # Cosine similarity: dot(Y_pred, Y_true) / ||Y_pred||, assuming Y_true approx unit-norm
+    dot = np.einsum("ij,ij->j", Y_pred, Y_true)
     pred_norm = np.maximum(np.linalg.norm(Y_pred, axis=0), 1e-12)
     cos = dot / pred_norm
 
@@ -274,7 +345,6 @@ def compute_embedding_metrics(
         "cos_p50": float(np.percentile(cos, 50)),
         "cos_p90": float(np.percentile(cos, 90)),
     }
-
 
 def parse_float_list(arg: str) -> List[float]:
     return [float(x.strip()) for x in arg.split(",") if x.strip()]
@@ -507,6 +577,12 @@ def main() -> int:
 
     # Align by sentence_id
     common_ids, X, Y = align_by_sentence_id(ids_x, X_all, ids_y, Y_all)
+    # Drop large unaligned arrays early to reduce peak RAM.
+    try:
+        del X_all, Y_all, ids_x, ids_y
+    except Exception:
+        pass
+
     N, D_in = X.shape
     _, D_out = Y.shape
     print(f"Aligned by sentence_id: N_common={N}, D_in={D_in}, D_out={D_out}")
@@ -516,11 +592,7 @@ def main() -> int:
     if fp_x and fp_y:
         print("Dataset fingerprint:", "MATCH" if fp_x == fp_y else "MISMATCH (continuing).")
 
-    # L2-normalize (row-wise)
-    Xn = l2_normalize_rows(X)
-    Yn = l2_normalize_rows(Y)
-
-    # Train/test split
+        # Train/test split
     train_idx_sent, test_idx_sent = train_test_split_indices(N, args.train_fraction, args.random_state)
     print(f"Train sentence samples: {train_idx_sent.size}")
     print(f"Test  sentence samples: {test_idx_sent.size}")
@@ -533,10 +605,25 @@ def main() -> int:
         print(f"Validation sentence samples (for soft tuning): {val_idx_sent.size}")
         print(f"Core train sentence samples (after val split): {train_core_idx_sent.size}")
 
-    X_train_sent = Xn[train_core_idx_sent]
-    Y_train_sent = Yn[train_core_idx_sent]
-    X_test_sent = Xn[test_idx_sent]
-    Y_test_sent = Yn[test_idx_sent]
+    # L2-normalize only the required splits (avoids keeping full normalized copies)
+    X_train_sent = l2_normalize_rows(X[train_core_idx_sent], inplace=True)
+    Y_train_sent = l2_normalize_rows(Y[train_core_idx_sent], inplace=True)
+    X_test_sent = l2_normalize_rows(X[test_idx_sent], inplace=True)
+    Y_test_sent = l2_normalize_rows(Y[test_idx_sent], inplace=True)
+
+    # Validation splits (sentences only). Keep as (N_val, D) until transpose later.
+    X_val_sent: Optional[np.ndarray] = None
+    Y_val_sent: Optional[np.ndarray] = None
+    if val_idx_sent.size > 0:
+        X_val_sent = l2_normalize_rows(X[val_idx_sent], inplace=True)
+        Y_val_sent = l2_normalize_rows(Y[val_idx_sent], inplace=True)
+
+    # Free large aligned matrices early (helps peak RAM for large corpora)
+    try:
+        del X, Y, common_ids
+    except Exception:
+        pass
+
 
     # Optional query augmentation
     if args.include_queries:
@@ -579,18 +666,13 @@ def main() -> int:
     X_test = X_test_sent.T
     Y_test = Y_test_sent.T
 
-    # Free large intermediates early (helps peak RAM for large corpora)
-    try:
-        del X_all, Y_all, X, Y
-    except Exception:
-        pass
 
-    # Validation tensors (sentences only). Used for soft tuning when available and as evaluation split when present.
+        # Validation tensors (sentences only). Used for soft tuning when available and as evaluation split when present.
     X_val: Optional[np.ndarray] = None
     Y_val: Optional[np.ndarray] = None
-    if val_idx_sent.size > 0:
-        X_val = Xn[val_idx_sent].T
-        Y_val = Yn[val_idx_sent].T
+    if X_val_sent is not None and Y_val_sent is not None and X_val_sent.shape[0] > 0:
+        X_val = X_val_sent.T
+        Y_val = Y_val_sent.T
 
         val_max = int(args.val_max_samples)
         if val_max > 0 and X_val.shape[1] > val_max:
@@ -600,7 +682,13 @@ def main() -> int:
             Y_val = Y_val[:, sel]
             print(f"Subsampled validation set to {val_max} samples for validation/evaluation.")
 
-    # Choose evaluation split: validation if present, else the held-out test set.
+        # Free the (N_val, D) copies once transposed.
+        try:
+            del X_val_sent, Y_val_sent
+        except Exception:
+            pass
+
+# Choose evaluation split: validation if present, else the held-out test set.
     X_eval = X_test
     Y_eval = Y_test
     eval_name = "test"
@@ -608,12 +696,6 @@ def main() -> int:
         X_eval = X_val
         Y_eval = Y_val
         eval_name = "validation"
-
-    # Xn/Yn can be very large; once we have train/test/val views, drop them to reduce peak RAM.
-    try:
-        del Xn, Yn
-    except Exception:
-        pass
     
     # Enable BlockSafe and force threading backend
     ctx = nullcontext()

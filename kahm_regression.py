@@ -81,6 +81,24 @@ def _scale_like(X: np.ndarray, scale: float, *, inplace: bool = False) -> np.nda
     return (X * s).astype(X.dtype, copy=False)
 
 
+
+def _ae_as_list(ae: Any) -> list:
+    """Ensure an autoencoder spec is passed as a flat list.
+
+    The OTFL helper `combine_multiple_autoencoders_extended` expects a sequence of
+    autoencoder components. In some training pipelines each cluster stores:
+      - a list/tuple of components, or
+      - a single component (dict/ndarray-like).
+
+    This normalizes both cases and also flattens a common accidental nesting
+    pattern: [ [component, ...] ].
+    """
+    if isinstance(ae, (list, tuple)):
+        if len(ae) == 1 and isinstance(ae[0], (list, tuple)):
+            return list(ae[0])
+        return list(ae)
+    return [ae]
+
 def l2_normalize_columns(M: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """L2-normalize columns of a 2D matrix (D, N). Safe for non-directional data when not used."""
     M = _as_float_ndarray(M)
@@ -263,9 +281,14 @@ def train_kahm_regressor(
     if verbose:
         print(f"Effective number of clusters after preprocessing: {n_clusters_eff}")
 
-    label_map = {int(old): new for new, old in enumerate(used_clusters)}
-    labels_mapped_zero = np.array([label_map[int(c)] for c in labels_zero_based], dtype=int)
+        # Vectorized remap (avoids Python-object overhead for large N)
+    map_arr = np.full(int(n_clusters), -1, dtype=np.int32)
+    map_arr[used_clusters.astype(np.int64)] = np.arange(n_clusters_eff, dtype=np.int32)
+    labels_mapped_zero = map_arr[labels_zero_based.astype(np.int64)]
+    if np.any(labels_mapped_zero < 0):
+        raise RuntimeError("Internal error while remapping cluster labels (found unmapped label).")
     labels_one_based = labels_mapped_zero + 1  # OTFL expects labels 1..C_eff
+  # OTFL expects labels 1..C_eff
 
     cluster_centers = np.zeros((D_out, n_clusters_eff), dtype=work_dtype)
     for new_c in range(n_clusters_eff):
@@ -346,15 +369,13 @@ def train_kahm_regressor(
 
         X_c = X_clf[:, idx_c]
         # Ensure subspace_dim is feasible for this cluster.
-        sd_c = int(min(subspace_dim, X_c.shape[0], X_c.shape[1] - 1))
-        sd_c = max(1, sd_c)
-
+        print(f" Cluster {c + 1}/{n_clusters_eff}: training autoencoder on {X_c.shape[1]} samples ...")
         AE_c_list = parallel_autoencoders(
             X_c,
-            subspace_dim=sd_c,
+            subspace_dim=subspace_dim,
             Nb=Nb,
             n_jobs=1,
-            verbose=True,
+            verbose=False,
         )
         AE_arr.append(AE_c_list)
 
@@ -414,12 +435,45 @@ def train_kahm_regressor(
 # Soft probability mapping
 # ----------------------------
 
+def _topk_truncate_inplace(S: np.ndarray, k: int, *, chunk_cols: int = 64) -> None:
+    """Zero all but the top-k entries per column of S in-place (memory-aware).
+
+    This helper is designed to avoid allocating an index matrix of shape (C, N),
+    which can dominate peak RAM when C and N are large.
+
+    Implementation detail:
+      - processes columns in chunks, limiting temporary index arrays to (C, chunk_cols)
+    """
+    if S.ndim != 2:
+        raise ValueError("S must be 2D shaped (C, N).")
+    C, N = S.shape
+    k = int(k)
+    if k <= 0 or k >= C or N == 0:
+        return
+
+    # Cap temporary index memory (~32 MiB by default).
+    max_index_bytes = 32 * 1024 * 1024
+    max_chunk = max(1, int(max_index_bytes // (8 * max(1, C))))
+    chunk_cols = max(1, min(int(chunk_cols), max_chunk))
+
+    for start in range(0, N, chunk_cols):
+        end = min(N, start + chunk_cols)
+        sub = S[:, start:end]  # (C, B)
+        # argpartition returns full indices for the submatrix, but B is bounded.
+        idx = np.argpartition(sub, -k, axis=0)
+        idx_top = idx[-k:, :]  # (k, B)
+        vals_top = np.take_along_axis(sub, idx_top, axis=0).copy()
+        sub.fill(S.dtype.type(0.0))
+        np.put_along_axis(sub, idx_top, vals_top, axis=0)
+
+
 def distances_to_probabilities_one_minus_sharp(
     distance_matrix: np.ndarray,
     *,
     alpha: float = 10.0,
     topk: int | None = 10,
     eps: float = 1e-12,
+    inplace: bool = False,
 ) -> np.ndarray:
     """
     Convert distances D (C, N) into probabilities P (C, N):
@@ -428,46 +482,56 @@ def distances_to_probabilities_one_minus_sharp(
         (optional) keep only top-k scores per column
         P = S / sum_c S
 
-    Assumes D in [0,1]. Uses uniform fallback if sum_c S == 0 for a sample.
+    Notes on memory
+    ---------------
+    - This implementation avoids creating an additional full-size `P` matrix.
+      The returned array *is* the score/probability buffer.
+    - If `inplace=True`, the input matrix is overwritten (or copied if not writeable).
 
-    Precision:
-      - Respects the input dtype (no forced float32 downcast).
-      - Promotes low-precision floats to at least float32 for numerical stability.
+    Assumes D in [0,1]. Uses uniform fallback if sum_c S == 0 for a sample.
     """
     D = _as_float_ndarray(distance_matrix)
     if D.ndim != 2:
-        raise ValueError(f"distance_matrix must be 2D; got {D.shape}.")
+        raise ValueError("distance_matrix must be 2D shaped (C, N).")
 
+    C, N = D.shape
     dtype = D.dtype
     one = dtype.type(1.0)
     zero = dtype.type(0.0)
     eps_t = dtype.type(eps)
 
-    D = np.clip(D, zero, one).astype(dtype, copy=False)
+    if inplace:
+        S = D if D.flags.writeable else D.copy()
+        np.subtract(one, S, out=S)
+    else:
+        # Allocate a single full-size buffer for scores/probabilities.
+        S = np.subtract(one, D)
 
-    alpha_t = dtype.type(alpha)
-    S = np.power(one - D, alpha_t).astype(dtype, copy=False)
+    # Clamp to [0, 1] to avoid negative scores if D has minor numerical drift.
+    np.clip(S, zero, one, out=S)
+
+    a = float(alpha)
+    if a != 1.0:
+        np.power(S, dtype.type(a), out=S)
 
     if topk is not None:
         k = int(topk)
-        if k <= 0:
-            raise ValueError("topk must be a positive integer or None.")
-        if k < S.shape[0]:
-            idx_small = np.argpartition(S, -k, axis=0)[:-k, :]
-            S[idx_small, np.arange(S.shape[1])] = zero
+        if 0 < k < C:
+            _topk_truncate_inplace(S, k)
 
-    denom = S.sum(axis=0, keepdims=True).astype(dtype, copy=False)
-    zero_mask = denom <= eps_t
-    denom_safe = np.where(zero_mask, one, denom).astype(dtype, copy=False)
-    P = (S / denom_safe).astype(dtype, copy=False)
+    denom = S.sum(axis=0, dtype=dtype)  # (N,)
+    zero_cols = denom <= eps_t
+    if np.any(zero_cols):
+        denom = denom.copy()
+        denom[zero_cols] = one
 
-    if np.any(zero_mask):
-        C = S.shape[0]
-        cols = np.where(zero_mask.squeeze())[0]
-        P[:, cols] = dtype.type(1.0 / C)
+    # Normalize in-place (broadcast along rows).
+    np.divide(S, denom, out=S)
 
-    return P
+    if np.any(zero_cols):
+        S[:, zero_cols] = dtype.type(1.0 / C)
 
+    return S
 
 def _ensure_distance_matrix_shape(
     D: np.ndarray,
@@ -613,7 +677,8 @@ def kahm_regress(
         * return Y_hat = cluster_centers @ P
 
     Distance computation uses:
-        combine_multiple_autoencoders_extended(X, [AE_c], distance_type="folding")
+        combine_multiple_autoencoders_extended(X, AE_c_list, distance_type="folding")
+        where AE_c_list is a list/tuple of autoencoder components (or a single autoencoder wrapped in a list).
     """
     X_new = _as_float_ndarray(X_new)
     if X_new.ndim != 2:
@@ -652,7 +717,7 @@ def kahm_regress(
         best_idx = np.zeros((N_new,), dtype=np.int64)
 
         for c, AE_c in enumerate(AE_arr):
-            d = combine_multiple_autoencoders_extended(X_new, AE_c, distance_type)
+            d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
             d = np.asarray(d).reshape(-1)
             if d.size != N_new:
                 raise ValueError(
@@ -690,7 +755,7 @@ def kahm_regress(
             # Build distance matrix for the batch: (C_eff, N_b)
             D_batch = np.empty((C_eff, N_b), dtype=np.float64)
             for c, AE_c in enumerate(AE_arr):
-                d = combine_multiple_autoencoders_extended(X_batch, [AE_c], distance_type)
+                d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
                 d = np.asarray(d).reshape(-1)
                 if d.size != N_b:
                     raise ValueError(
@@ -699,7 +764,7 @@ def kahm_regress(
                 D_batch[c, :] = d
 
             D_batch = _ensure_distance_matrix_shape(_as_float_ndarray(D_batch), C_eff, N_b, labels=None)
-            P_batch = distances_to_probabilities_one_minus_sharp(D_batch, alpha=alpha_resolved, topk=topk_resolved)
+            P_batch = distances_to_probabilities_one_minus_sharp(D_batch, alpha=alpha_resolved, topk=topk_resolved, inplace=True)
             Y_pred[:, start:end] = cluster_centers @ P_batch
 
         if return_probabilities:
@@ -709,7 +774,7 @@ def kahm_regress(
     # Non-batched (returns full P if requested)
     D = np.empty((C_eff, N_new), dtype=np.float64)
     for c, AE_c in enumerate(AE_arr):
-        d = combine_multiple_autoencoders_extended(X_new, AE_c, distance_type)
+        d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
         d = np.asarray(d).reshape(-1)
         if d.size != N_new:
             raise ValueError(
@@ -718,7 +783,7 @@ def kahm_regress(
         D[c, :] = d
 
     D = _ensure_distance_matrix_shape(_as_float_ndarray(D), C_eff, N_new, labels=None)
-    P = distances_to_probabilities_one_minus_sharp(D, alpha=alpha_resolved, topk=topk_resolved)
+    P = distances_to_probabilities_one_minus_sharp(D, alpha=alpha_resolved, topk=topk_resolved, inplace=True)
     Y_pred = cluster_centers @ P
 
     if return_probabilities:
@@ -787,7 +852,7 @@ def tune_soft_params(
     # Compute full distance matrix once for X_val and reuse it for all grid points.
     D_val = np.empty((C_eff, N_val), dtype=np.float64)
     for c, AE_c in enumerate(AE_arr):
-        d = combine_multiple_autoencoders_extended(Xv, AE_c, "folding")
+        d = combine_multiple_autoencoders_extended(Xv, _ae_as_list(AE_c), "folding")
         d = np.asarray(d).reshape(-1)
         if d.size != N_val:
             raise ValueError(
@@ -814,18 +879,47 @@ def tune_soft_params(
         print(f"Grid: alphas={list(alphas)}, topks={list(topks)}")
         print(f"Validation samples: {N_val}, clusters: {C_eff}")
 
+    # Reusable probability buffer (one full C_eff x N_val matrix)
+    work = np.empty_like(D_val, dtype=D_val.dtype)
+    dtype = work.dtype
+    one = dtype.type(1.0)
+    zero = dtype.type(0.0)
+    eps_t = dtype.type(1e-12)
+
     for a in alphas:
+        a_f = float(a)
         for k in topks:
-            P = distances_to_probabilities_one_minus_sharp(D_val, alpha=float(a), topk=k)
-            Y_hat = cluster_centers @ P
+            # work = (1 - D_val) ** alpha
+            np.subtract(one, D_val, out=work)
+            np.clip(work, zero, one, out=work)
+            if a_f != 1.0:
+                np.power(work, dtype.type(a_f), out=work)
+
+            if k is not None:
+                kk = int(k)
+                if 0 < kk < C_eff:
+                    _topk_truncate_inplace(work, kk)
+
+            denom = work.sum(axis=0, dtype=dtype)
+            zero_cols = denom <= eps_t
+            if np.any(zero_cols):
+                denom = denom.copy()
+                denom[zero_cols] = one
+
+            np.divide(work, denom, out=work)
+
+            if np.any(zero_cols):
+                work[:, zero_cols] = dtype.type(1.0 / C_eff)
+
+            Y_hat = cluster_centers @ work
             mse = float(np.mean((Y_hat - Y_val) ** 2))
 
             if verbose:
-                print(f"  alpha={float(a):g}, topk={k}: MSE={mse:.6f}")
+                print(f"  alpha={a_f:g}, topk={k}: MSE={mse:.6f}")
 
             if mse < best_mse:
                 best_mse = mse
-                best_alpha = float(a)
+                best_alpha = a_f
                 best_topk = k
 
     # Persist into model for later inference defaults
