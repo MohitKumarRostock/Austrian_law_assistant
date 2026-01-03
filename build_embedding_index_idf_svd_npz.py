@@ -38,7 +38,7 @@ Run:
   --word_ngrams 1,3 --char_ngrams 3,6 \
   --max_features_word 600000 --max_features_char 300000 \
   --transformer_weight_word 1.0 --transformer_weight_char 1.0 \
-  --dim 768 --svd_n_iter 20 \
+  --dim 1024 --svd_n_iter 20 \
   --tfidf_dtype float32 --embeddings_dtype float32 \
   --union_n_jobs 1 \
   --no_l2_n_jobs 1 \
@@ -168,7 +168,7 @@ class AdaptiveTruncatedSVD(BaseEstimator, TransformerMixin):
 
     def __init__(
         self,
-        n_components: int = 768,
+        n_components: int = 1024,
         *,
         n_iter: int = 20,
         random_state: int = 42,
@@ -432,7 +432,7 @@ class IDFSVDConfig:
     sublinear_tf: bool = False
 
     # SVD
-    dim: int = 768
+    dim: int = 1024
     svd_n_iter: int = 20
     random_state: int = 42
 
@@ -838,7 +838,7 @@ def parse_args(argv) -> argparse.Namespace:
     )
 
     # SVD / normalization
-    p.add_argument("--dim", type=int, default=768, help="SVD dimension.")
+    p.add_argument("--dim", type=int, default=1024, help="SVD dimension.")
     p.add_argument("--svd_n_iter", type=int, default=20)
     p.add_argument("--no_l2", action="store_true", help="Disable L2 normalization after SVD.")
 
