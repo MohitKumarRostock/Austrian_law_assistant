@@ -86,7 +86,6 @@ def enable_otfl_blocksafe(
     dr = importlib.import_module("dim_reduce")
     ae_mod = importlib.import_module("autoencoder")
     pa_mod = importlib.import_module("parallel_autoencoders")
-    clf_mod = importlib.import_module("classifier")
 
     orig_dim_reduce = getattr(dr, "dim_reduce", None)
     orig_autoencoder = getattr(ae_mod, "autoencoder", None)
@@ -184,10 +183,6 @@ def enable_otfl_blocksafe(
     if hasattr(pa_mod, "dim_reduce"):
         pa_mod.dim_reduce = dim_reduce_safe  # type: ignore[attr-defined]
 
-    if hasattr(clf_mod, "autoencoder"):
-        clf_mod.autoencoder = autoencoder_safe  # type: ignore[attr-defined]
-    if hasattr(clf_mod, "dim_reduce"):
-        clf_mod.dim_reduce = dim_reduce_safe  # type: ignore[attr-defined]
 
     def _ctx():
         return parallel_backend(str(backend))
