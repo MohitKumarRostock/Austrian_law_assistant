@@ -1,27 +1,52 @@
 #!/usr/bin/env python3
+"""build_embedding_index_npz.py
+
+Build a sentence embedding index from a RIS-derived corpus parquet.
+
+This script intentionally mirrors the performance characteristics of
+`build_query_embedding_index_npz.py`:
+  - use SentenceTransformer.encode() for efficient CUDA batching
+  - let the model decide its maximum sequence length by default
+
+Output NPZ contains:
+  - sentence_id: (N,) int64
+  - embeddings: (N, D)
+  - minimal metadata scalars
+"""
+
 from __future__ import annotations
+
+import os
+
+# Must come after future import, before importing transformers/sentence_transformers
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Optional: reduce oversubscription during embedding (users can override via env vars)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import argparse
 import hashlib
-import os
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
 
 
 DEFAULT_CORPUS_PATH = Path("ris_sentences.parquet")
 DEFAULT_OUT_NPZ = Path("embedding_index.npz")
 DEFAULT_MODEL = "mixedbread-ai/deepset-mxbai-embed-de-large-v1"
+
+
+DEFAULT_BATCH = 1
 
 
 # ----------------------------- Utilities -----------------------------
@@ -141,6 +166,19 @@ def atomic_save_npz(
 
 # ----------------------------- Embedding -----------------------------
 
+def _iter_batches(n: int, batch_size: int) -> Iterable[Tuple[int, int]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    for i in range(0, n, batch_size):
+        yield i, min(n, i + batch_size)
+
+
+def _as_device_str(d: torch.device) -> str:
+    # SentenceTransformer accepts strings like 'cpu', 'cuda', 'mps' (optionally with indices).
+    # torch.device('cuda:0') stringifies as 'cuda:0' which ST accepts.
+    return str(d)
+
+
 @torch.inference_mode()
 def encode_sentences(
     sentences: Sequence[str],
@@ -151,38 +189,90 @@ def encode_sentences(
     max_length: int,
     normalize_embeddings: bool,
     truncate_dim: Optional[int],
+    stream: bool,
+    show_progress: bool,
 ) -> np.ndarray:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModel.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
+    # Match query script behavior: let SentenceTransformer handle batching/tokenization.
+    from sentence_transformers import SentenceTransformer
 
-    all_embeds: List[np.ndarray] = []
+    dev = _as_device_str(device)
+    td = int(truncate_dim) if (truncate_dim is not None and truncate_dim > 0) else None
 
-    for i in tqdm(range(0, len(sentences), batch_size), total=(len(sentences) + batch_size - 1) // batch_size, desc="Batches"):
-        batch = sentences[i : i + batch_size]
-        enc = tokenizer(
-            list(batch),
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
+    # NOTE: SentenceTransformer supports truncate_dim (as used by build_query_embedding_index_npz.py).
+    model = SentenceTransformer(model_name, device=dev, truncate_dim=(td or 0))
+
+    # "Auto" max length behavior: if max_length <= 0, keep model.max_seq_length.
+    # Otherwise, override it (useful for speed experiments).
+    if int(max_length) > 0:
+        model.max_seq_length = int(max_length)
+
+    n = len(sentences)
+    if n == 0:
+        raise ValueError("No sentences to encode.")
+
+    # Small robustness feature: if the requested batch size OOMs on CUDA, we automatically downshift.
+    def _encode_list(texts: Sequence[str], bs: int, progress: bool) -> np.ndarray:
+        return np.asarray(
+            model.encode(
+                list(texts),
+                batch_size=int(bs),
+                show_progress_bar=bool(progress),
+                convert_to_numpy=True,
+                normalize_embeddings=bool(normalize_embeddings),
+            )
         )
-        enc = {k: v.to(device) for k, v in enc.items()}
 
-        out = model(**enc)
-        pooled = mean_pooling(out.last_hidden_state, enc["attention_mask"])  # [B, H]
+    def _is_oom(e: BaseException) -> bool:
+        s = str(e).lower()
+        return "out of memory" in s or "cuda oom" in s or "cublas" in s
 
-        if truncate_dim is not None and truncate_dim > 0:
-            pooled = pooled[:, :truncate_dim]
+    bs = int(batch_size)
+    if not stream:
+        while True:
+            try:
+                Y = _encode_list(sentences, bs, progress=show_progress)
+                break
+            except RuntimeError as e:
+                if _is_oom(e) and bs > 1:
+                    bs = max(1, bs // 2)
+                    if torch.cuda.is_available() and device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    print(f"OOM during encode; retrying with batch_size={bs}", file=sys.stderr)
+                    continue
+                raise
+        return Y.astype(np.float32, copy=False)
 
-        pooled = pooled.detach().cpu().numpy().astype(np.float32, copy=False)
-        all_embeds.append(pooled)
+    # Streaming path: repeated encode calls into a preallocated output buffer.
+    # This reduces peak RAM for very large corpora and still uses ST's internal tokenization.
+    # We still do an OOM fallback by reducing bs.
+    while True:
+        try:
+            s0, e0 = next(iter(_iter_batches(n, bs)))
+            first = _encode_list(sentences[s0:e0], bs, progress=False)
+            # Ensure float32 output for compatibility with existing downstream expectations.
+            out = np.empty((n, first.shape[1]), dtype=np.float32)
+            out[s0:e0] = first.astype(np.float32, copy=False)
 
-    embeddings = np.vstack(all_embeds).astype(np.float32, copy=False)
-    if normalize_embeddings:
-        embeddings = l2_normalize(embeddings).astype(np.float32, copy=False)
-    return embeddings
+            if show_progress:
+                print(f"Encoded {e0}/{n}")
+
+            for s, e in _iter_batches(n, bs):
+                if s == s0 and e == e0:
+                    continue
+                chunk = _encode_list(sentences[s:e], bs, progress=False)
+                out[s:e] = chunk.astype(np.float32, copy=False)
+                if show_progress and (e == n or (e // bs) % 10 == 0):
+                    print(f"Encoded {e}/{n}")
+
+            return out
+        except RuntimeError as e:
+            if _is_oom(e) and bs > 1:
+                bs = max(1, bs // 2)
+                if torch.cuda.is_available() and device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print(f"OOM during streaming encode; retrying with batch_size={bs}", file=sys.stderr)
+                continue
+            raise
 
 
 # ----------------------------- Main pipeline -----------------------------
@@ -197,6 +287,9 @@ def build_embedding_index_npz(
     max_length: int,
     normalize_embeddings: bool,
     truncate_dim: Optional[int],
+    compressed: bool,
+    show_progress: bool,
+    stream: bool,
     id_col: str = "sentence_id",
     text_col: str = "sentence",
 ) -> Path:
@@ -230,6 +323,8 @@ def build_embedding_index_npz(
         max_length=max_length,
         normalize_embeddings=normalize_embeddings,
         truncate_dim=truncate_dim,
+        stream=stream,
+        show_progress=show_progress,
     )
     enc_end = time.perf_counter()
 
@@ -238,7 +333,6 @@ def build_embedding_index_npz(
 
     created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    compressed = True
     print(f"Writing NPZ bundle: {out_npz} (compressed={compressed})")
     atomic_save_npz(
         out_npz,
@@ -281,10 +375,33 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--out", type=Path, default=DEFAULT_OUT_NPZ, help="Output NPZ bundle path.")
     p.add_argument("--model", type=str, default=DEFAULT_MODEL, help="HF model name for embeddings.")
     p.add_argument("--device", type=str, default="auto", help="Device: auto|cpu|cuda|mps")
-    p.add_argument("--batch-size", type=int, default=4, help="Batch size for encoding.")
-    p.add_argument("--max-length", type=int, default=512, help="Max token length for encoder.")
-    p.add_argument("--normalize", action="store_true", help="L2-normalize embeddings.")
+    p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH, help=f"Batch size for encoding (default: {DEFAULT_BATCH}).")
+    p.add_argument(
+        "--max-length",
+        type=int,
+        default=0,
+        help="Max token length for encoder. Use 0 to keep the model's default (auto).",
+    )
+    p.add_argument("--normalize", action="store_true", help="L2-normalize embeddings (default: disabled).")
     p.add_argument("--truncate-dim", type=int, default=0, help="If >0, truncate embedding dimension to this value.")
+    p.add_argument(
+        "--compress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write compressed NPZ (default: enabled). Disable for faster saves.",
+    )
+    p.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show progress during encoding (default: enabled).",
+    )
+    p.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stream batches via repeated encode calls to reduce peak RAM (default: disabled).",
+    )
     p.add_argument("--id-col", type=str, default="sentence_id", help="ID column name.")
     p.add_argument("--text-col", type=str, default="sentence", help="Text column name.")
     return p.parse_args(list(argv))
@@ -295,6 +412,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     device = choose_device(args.device)
     truncate_dim = args.truncate_dim if args.truncate_dim > 0 else None
+    compressed = bool(args.compress)
+    show_progress = bool(args.progress)
+    stream = bool(args.stream)
 
     build_embedding_index_npz(
         corpus_path=args.corpus,
@@ -305,6 +425,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_length=args.max_length,
         normalize_embeddings=bool(args.normalize),
         truncate_dim=truncate_dim,
+        compressed=compressed,
+        show_progress=show_progress,
+        stream=stream,
         id_col=args.id_col,
         text_col=args.text_col,
     )

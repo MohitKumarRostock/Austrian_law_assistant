@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """
-Extract (meaningful) sentences from RIS law PDFs, label with law type + page number (v2: keep §/Art anchors),
+Extract (meaningful) sentences from RIS law PDFs, label with law type + page number,
 and write to a Parquet file. Also prints ONE example sentence per PDF.
 
-Folder layout:
+Design goal (v4): maximize recall for semantically relevant content.
+- Avoid losing content due to header/footer patterns being merged into real text.
+- Avoid false sentence boundaries in Austrian legal references (e.g., "§ 1. Abs. 2").
+- Keep filtering conservative (recall-first); default drop patterns only remove
+  trivial page/URL artifacts, while common RIS field labels are stripped rather than dropped.
+
+Folder layout (default):
   ris_pdfs/
     ABGB.pdf
     ArbVG.pdf
     StPO.pdf
     ...
 
-Dependencies:
-  - pandas
-  - PyMuPDF (pip install pymupdf) -> preferred import "pymupdf" (legacy: "fitz")
-  - (optional fallback) pdfplumber (pip install pdfplumber)
-  - parquet engine: pyarrow (recommended) or fastparquet
+Output (default): ris_sentences.parquet
+Columns: sentence_id, law_type, page, sentence, source_file
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable, List, Optional, Tuple, Dict, Any, Callable, cast
 import argparse
 import importlib
 import re
-import sys
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
 import pandas as pd
 
@@ -33,14 +35,74 @@ import pandas as pd
 
 _ABBREV_PLACEHOLDER = "∯"  # unlikely to appear in RIS law texts
 
-# Regex-based abbreviation protection (RIS / Austrian statutory texts)
-#
-# Goal: prevent sentence splitting on dots that are part of legal/common abbreviations.
-#
-# Notes:
-#   - Patterns are intentionally conservative (anchored with \b where sensible).
-#   - Some patterns allow optional internal whitespace (e.g., "z. B." / "d. h.").
+
+# Trivial noise lines we can safely drop (FULL line match only).
+_DEFAULT_DROP_PATTERNS: List[str] = [
+    r"^\s*Seite\s+\d+(\s+von\s+\d+)?\s*$",
+    r"^\s*www\.ris\.bka\.gv\.at\s*$",
+    r"^\s*RIS\s*$",
+]
+
+# Some RIS/metadata headers are better *stripped* than dropped if they appear inline.
+# We only apply these at LINE START, before collapsing newlines.
+_NOISE_PREFIX_STRIP_REGEXES: List[re.Pattern[str]] = [
+    re.compile(r"^\s*Bundesrecht\s+konsolidiert\s*:?\s*", flags=re.IGNORECASE),
+    re.compile(r"^\s*Gesamte\s+Rechtsvorschrift(?:\s+für)?\s*:?\s*", flags=re.IGNORECASE),
+    re.compile(r"^\s*RIS\s*-\s*Rechtsinformationssystem(?:\s+des\s+Bundes)?\s*:?\s*", flags=re.IGNORECASE),
+    re.compile(r"^\s*Rechtsinformationssystem(?:\s+des\s+Bundes)?\s*:?\s*", flags=re.IGNORECASE),
+    re.compile(r"^\s*CELEX-?Nr\.?\s*:?\s*", flags=re.IGNORECASE),
+    # Common RIS field labels on the title page: keep suggesting value, but strip label.
+    re.compile(
+        r"^\s*(?:Kundmachungsorgan|Gesetzesnummer|Dokumenttyp|Kurztitel|Langtitel|Abkürzung|Fassung\s+vom|"
+        r"Inkrafttretensdatum|Zuletzt\s+geändert\s+durch|Zuletzt\s+aktualisiert|Norm|Anmerkung|Schlagworte|"
+        r"Dokumentnummer|Stand)\s*:?\s*",
+        flags=re.IGNORECASE,
+    ),
+]
+
+# RIS inline footer that sometimes appears mid-extraction.
+_RIS_INLINE_FOOTER_RE = re.compile(
+    r"^\s*www\.ris\.bka\.gv\.at\s+Seite\s+\d+\s+von\s+\d+\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+_RIS_URL_ONLY_RE = re.compile(r"^\s*www\.ris\.bka\.gv\.at\s*$", flags=re.IGNORECASE | re.MULTILINE)
+
+# Headings: keep §/Art numbers with the following text (avoid creating standalone fragments).
+_SECTION_HEADING_LINE_RE = re.compile(
+    r"^\s*§\s*\.?\s*(\d+[A-Za-z]?)\s*(?:\.\s*|\s+)",
+    flags=re.MULTILINE,
+)
+_ARTICLE_HEADING_LINE_RE = re.compile(
+    r"^\s*(?:Art\.?|Artikel)\s*(\d+[A-Za-z]?|[IVXLCDM]+)\s*(?:\.\s*|\s+|:\s*)",
+    flags=re.MULTILINE,
+)
+
+# Enumerations at line start: "1." / "a." / "I."  -> "1)" etc.
+_ENUM_LINE_RE = re.compile(r"^\s*(\d{1,3})\.\s+", flags=re.MULTILINE)
+_ENUM_ALPHA_LINE_RE = re.compile(r"^\s*([A-Za-z])\.\s+", flags=re.MULTILINE)
+_ENUM_ROMAN_LINE_RE = re.compile(r"^\s*([IVXLCDM]{1,8})\.\s+", flags=re.MULTILINE)
+
+# Enumerations after ":" or ";" on the same line: "... gilt: 1. ..." -> "... gilt: 1) ..."
+_ENUM_AFTER_COLON_SEMI_RE = re.compile(r"([:;])\s*(\d{1,3})\.\s+")
+
+# v4: protect dots in *legal references* that are not sentence ends, e.g. "§ 1. Abs. 2"
+# NOTE: These patterns are applied via `_protect_abbreviations`, which replaces '.' inside matches.
+_LEGAL_REF_DOT_REGEXES: List[re.Pattern[str]] = [
+    re.compile(
+        r"§{1,2}\s*\d+[A-Za-z]?\.(?=\s*(?:Abs|Absatz|Z|Ziffer|Ziff|lit|Satz|Nr|iVm|i\.?V\.?m)\b)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:Art\.?|Artikel)\s*\d+[A-Za-z]?\.(?=\s*(?:Abs|Absatz|Z|Ziffer|Ziff|lit|Satz|Nr|iVm|i\.?V\.?m)\b)",
+        flags=re.IGNORECASE,
+    ),
+]
+
+# Regex-based abbreviation protection (RIS / Austrian statutory texts).
 _ABBREVIATION_REGEXES: List[re.Pattern[str]] = [
+    *_LEGAL_REF_DOT_REGEXES,
+
     # Multi-dot abbreviations first (avoid partial matches like "z." before "z.B.")
     re.compile(r"\bz\.\s*B\.", flags=re.IGNORECASE),
     re.compile(r"\bu\.\s*a\.", flags=re.IGNORECASE),
@@ -48,11 +110,11 @@ _ABBREVIATION_REGEXES: List[re.Pattern[str]] = [
     re.compile(r"\bi\.\s*d\.\s*R\.", flags=re.IGNORECASE),
     re.compile(r"\bu\.\s*U\.", flags=re.IGNORECASE),
 
-    # Common single-token abbreviations
+    # Common abbreviations in statutes
     re.compile(r"\bAbs\.", flags=re.IGNORECASE),
     re.compile(r"\bArt\.", flags=re.IGNORECASE),
     re.compile(r"\bZl\.", flags=re.IGNORECASE),
-    # Protect "Z." but not when it is the first fragment of a multi-dot abbreviation (e.g. "z.B.")
+    # Protect "Z." but not when it's part of a multi-dot abbreviation like "z.B."
     re.compile(r"\bZ\.(?!\s*[A-Za-z]\.)", flags=re.IGNORECASE),
     re.compile(r"\blit\.", flags=re.IGNORECASE),
     re.compile(r"\bNr\.", flags=re.IGNORECASE),
@@ -60,22 +122,16 @@ _ABBREVIATION_REGEXES: List[re.Pattern[str]] = [
     re.compile(r"\biVm\.", flags=re.IGNORECASE),
     re.compile(r"\biSd\.", flags=re.IGNORECASE),
     re.compile(r"\biSv\.", flags=re.IGNORECASE),
-    re.compile(r"\bzB\.", flags=re.IGNORECASE),
     re.compile(r"\bbzw\.", flags=re.IGNORECASE),
     re.compile(r"\bua\.", flags=re.IGNORECASE),
     re.compile(r"\bvgl\.", flags=re.IGNORECASE),
     re.compile(r"\bmwN\.", flags=re.IGNORECASE),
-    re.compile(r"\buU\.", flags=re.IGNORECASE),
+
+    # Titles / generic
     re.compile(r"\bDr\.", flags=re.IGNORECASE),
     re.compile(r"\bProf\.", flags=re.IGNORECASE),
-    re.compile(r"\bS\.", flags=re.IGNORECASE),  # often "S." = Satz/Seite
-    re.compile(r"\bff\.", flags=re.IGNORECASE),
-    re.compile(r"\bf\.", flags=re.IGNORECASE),
-    re.compile(r"\bgem\.", flags=re.IGNORECASE),
-    re.compile(r"\bggf\.", flags=re.IGNORECASE),
-    re.compile(r"\binsb\.", flags=re.IGNORECASE),
-    re.compile(r"\binsbes\.", flags=re.IGNORECASE),
-    re.compile(r"\bsog\.", flags=re.IGNORECASE),
+
+    # Gazette abbreviations (often appear in amendments/refs)
     re.compile(r"\bBGBl\.", flags=re.IGNORECASE),
     re.compile(r"\bRGBl\.", flags=re.IGNORECASE),
     re.compile(r"\bStGBl\.", flags=re.IGNORECASE),
@@ -83,118 +139,105 @@ _ABBREVIATION_REGEXES: List[re.Pattern[str]] = [
     re.compile(r"\bJGS\.", flags=re.IGNORECASE),
 ]
 
-_RIS_INLINE_FOOTER_RE = re.compile(
-    r"^\s*www\.ris\.bka\.gv\.at\s+Seite\s+\d+\s+von\s+\d+\s*$",
-    flags=re.IGNORECASE | re.MULTILINE,
+
+# v4: split list items after normalization ("1)" / "a)" / "(1)" / bullets) into separate sentences.
+_LIST_MARKER_RE = re.compile(
+    r"""(?x)
+    (?:
+        (?<=\s) | ^
+    )
+    (?P<marker>
+        # Parenthesized items: (1), (2), (a), (I) ...
+        \(\s*\d{1,3}\s*\)
+        |\(\s*[A-Za-z]\s*\)
+        |\(\s*[IVXLCDM]{1,8}\s*\)
+        # Non-parenthesized items: 1), a), I)
+        |\d{1,3}\)
+        |[A-Za-z]\)
+        |[IVXLCDM]{1,8}\)
+        # Bullets/dashes
+        |[•·]
+        |[-–—]
+    )
+    \s+
+    """
 )
-_RIS_URL_ONLY_RE = re.compile(r"^\s*www\.ris\.bka\.gv\.at\s*$", flags=re.IGNORECASE | re.MULTILINE)
-
-# Headings in many RIS PDFs are formatted as lines like:
-#   "§ 871." or "§. 871." or "Art. 10."
-# If we keep the trailing dot, the sentence splitter will often create
-# a standalone sentence ("§ 871.") which is then dropped as non-meaningful,
-# causing the following paragraph to lose its section anchor.
-_SECTION_HEADING_LINE_RE = re.compile(
-    # Examples:
-    #   "§ 871."  / "§. 871." / "§ 1" / "§ 1. Geltungsbereich"
-    r"^\s*§\s*\.?\s*(\d+[A-Za-z]?)\s*(?:\.\s*|\s+)",
-    flags=re.MULTILINE,
-)
-
-_ARTICLE_HEADING_LINE_RE = re.compile(
-    # Examples:
-    #   "Art. 10." / "Art 10" / "Artikel 10" / "Art. I" (amendment acts)
-    r"^\s*(?:Art\.?|Artikel)\s*(\d+[A-Za-z]?|[IVXLCDM]+)\s*(?:\.\s*|\s+|:\s*)",
-    flags=re.MULTILINE,
-)
-
-# Enumerations frequently appear at line start as "1." / "2." etc.
-# If left unchanged, splitting on '.' can drop the numeric marker.
-_ENUM_LINE_RE = re.compile(r"^\s*(\d+)\.\s+", flags=re.MULTILINE)
-
-# Sometimes PDF extraction flattens enumerations onto one line, e.g. "gilt: 1. ... 2. ...".
-# Restrict to list markers that follow ':' or ';' to avoid corrupting legal references like "§ 1.".
-_ENUM_AFTER_COLON_SEMI_RE = re.compile(r"(?:(?<=:)|(?<=;))\s*(\d+)\.\s+")
-
-# Letter / roman numeral enumerations at line start: "a." / "I." etc.
-_ENUM_ALPHA_LINE_RE = re.compile(r"^\s*([A-Za-z])\.\s+", flags=re.MULTILINE)
-_ENUM_ROMAN_LINE_RE = re.compile(r"^\s*([IVXLCDM]{1,8})\.\s+", flags=re.MULTILINE)
-
-_DEFAULT_DROP_PATTERNS = [
-    # Common RIS-ish headers/footers/noise. Extend as you discover recurring lines.
-    r"^\s*Seite\s+\d+(\s+von\s+\d+)?\s*$",
-    r"^\s*RIS\s*$",
-    r"^\s*RIS\s*-\s*Rechtsinformationssystem.*$",
-    r"^\s*Rechtsinformationssystem.*$",
-    r"^\s*Bundesrecht\s+konsolidiert\s*$",
-    r"^\s*Bundesrecht\s+konsolidiert\s*:\s*$",
-    # Consolidated-law compilation headers often appear as a single long line after PDF extraction.
-    r"^\s*Bundesrecht\s+konsolidiert\b.*$",
-    r"^\s*Gesamte\s+Rechtsvorschrift\b.*$",
-    r"^\s*Gesamte\s+Rechtsvorschrift\s+für\b.*$",
-    r"^\s*Umsetzungshinweis\b.*$",
-    r"^\s*Beachte\b.*$",
-    r"^\s*CELEX-?Nr\.?\s*:?.*$",
-    # CELEX identifiers may be preceded by brackets/roman numerals in extracted text.
-    r"\bCELEX\b",
-    r"\bEWR\/Anh\.",
-    r"^\s*StF\s*:?.*$",
-    r"^\s*Änderung\s+(?:BGBl|RGBl|dRGBl|StGBl|JGS)\..*$",
-    r"^\s*(?:BGBl|RGBl|dRGBl|StGBl|JGS)\.?\s*(?:I\s+)?Nr\.?\s*\d+\/\d{2,4}.*$",
-    # Citation-only lines often contain additional parenthetical references before the gazette token.
-    r"^\s*Nr\.?\s*\d+\/\d{2,4}.*\b(?:BGBl|RGBl|dRGBl|StGBl|JGS)\..*$",
-    r"^\s*BR\s*:\s*.*$",
-    r"^\s*BT\s*:\s*.*$",
-    r"^\s*NR\s*:\s*.*$",
-    r"^\s*Bundeskanzleramt.*$",
-    r"^\s*Kundmachungsorgan\s*:?.*$",
-    r"^\s*Gesetzesnummer\s*:?.*$",
-    r"^\s*Dokumenttyp\s*:?.*$",
-    r"^\s*Kurztitel\s*:?.*$",
-    r"^\s*Langtitel\s*:?.*$",
-    r"^\s*Abkürzung\s*:?.*$",
-    r"^\s*Fassung\s+vom\s+.*$",
-    r"^\s*Inkrafttretensdatum\s*:?.*$",
-    r"^\s*Zuletzt\s+geändert\s+durch\s*:?.*$",
-    r"^\s*Text\s*:?.*$",
-    r"^\s*Norm\s*:?.*$",
-    r"^\s*Anmerkung\s*:?.*$",
-    r"^\s*Schlagworte\s*:?.*$",
-    r"^\s*Zuletzt\s+aktualisiert.*$",
-    r"^\s*Stand\s+\d{1,2}\.\d{1,2}\.\d{2,4}\s*$",
-    r"^\s*Dokumentnummer.*$",
-    r"\bPNV\s*:\b",
-    r"\(NR:\s*GP\b",
-    r"\bGP\s+[IVXLCDM]+\b\s+RV\b",
-]
 
 
-def _normalize_whitespace(s: str) -> str:
-    # Remove soft hyphen
-    s = s.replace("\u00ad", "")
+def _strip_noise_prefixes(line: str) -> str:
+    """
+    Strip known RIS header/field prefixes, but never delete the whole line unless it becomes empty.
+    Applies repeatedly (some PDFs stack multiple prefixes).
+    """
+    s = line
+    for _ in range(3):  # prevent pathological loops
+        before = s
+        for rx in _NOISE_PREFIX_STRIP_REGEXES:
+            s = rx.sub("", s)
+        if s == before:
+            break
+        s = s.strip()
+        if not s:
+            break
+    return s.strip()
 
-    # Drop RIS inline footers that sometimes appear mid-text extraction
-    # (and can leak into sentences).
+
+def _normalize_whitespace(raw: str, *, drop_patterns: Optional[List[str]] = None) -> str:
+    """
+    Recall-first normalization.
+    - Keep original line boundaries long enough to remove/strip RIS headers and page artefacts safely.
+    - Dehyphenate across line breaks.
+    - Normalize headings and list markers.
+    - Collapse remaining whitespace to single spaces.
+    """
+    if not raw:
+        return ""
+
+    s = raw.replace("\u00ad", "")  # soft hyphen
+
+    # Remove RIS inline footers/URL-only lines (multiline).
     s = _RIS_INLINE_FOOTER_RE.sub("", s)
     s = _RIS_URL_ONLY_RE.sub("", s)
+
+    # Drop/strip noise line-by-line BEFORE newlines are collapsed.
+    patterns = drop_patterns if drop_patterns is not None else _DEFAULT_DROP_PATTERNS
+    cleaned_lines: List[str] = []
+    for ln in s.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+
+        # Drop only if the ENTIRE line matches a trivial noise pattern.
+        is_noise = False
+        for pat in patterns:
+            if re.fullmatch(pat, ln, flags=re.IGNORECASE):
+                is_noise = True
+                break
+        if is_noise:
+            continue
+
+        ln = _strip_noise_prefixes(ln)
+        if ln:
+            cleaned_lines.append(ln)
+
+    s = "\n".join(cleaned_lines).strip()
+    if not s:
+        return ""
 
     # De-hyphenate across line breaks: "Verant-\nwortung" -> "Verantwortung"
     s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
 
-    # Normalize common heading lines so §/Art numbers are kept with the following text.
-    # Examples:
-    #   "§ 871."   -> "§871 "
-    #   "§. 871."  -> "§871 "
-    #   "Art. 10." -> "Art. 10 "
+    # Normalize headings so §/Art numbers are kept with following text.
     s = _SECTION_HEADING_LINE_RE.sub(r"§\1 ", s)
     s = _ARTICLE_HEADING_LINE_RE.sub(r"Art. \1 ", s)
 
-    # Preserve list markers (avoid splitting on "1." / "a." / "I.").
-    # Apply *before* newlines are collapsed so MULTILINE anchors still work.
+    # Preserve list markers at start of lines, BEFORE remaining newlines are collapsed.
     s = _ENUM_ROMAN_LINE_RE.sub(r"\1) ", s)
     s = _ENUM_ALPHA_LINE_RE.sub(r"\1) ", s)
     s = _ENUM_LINE_RE.sub(r"\1) ", s)
-    s = _ENUM_AFTER_COLON_SEMI_RE.sub(r" \1) ", s)
+
+    # Preserve enumerations after ':' or ';'
+    s = _ENUM_AFTER_COLON_SEMI_RE.sub(r"\1 \2) ", s)
 
     # Remaining newlines -> spaces
     s = re.sub(r"\s*\n\s*", " ", s)
@@ -203,13 +246,11 @@ def _normalize_whitespace(s: str) -> str:
     s = re.sub(r"[ \t\r\f\v]+", " ", s).strip()
     return s
 
+
 def _protect_abbreviations(text: str) -> Tuple[str, Dict[str, str]]:
     """
-    Replace dots in known abbreviations with a placeholder so sentence splitting
-    doesn't break on them.
-
-    Uses regex patterns (instead of naive substring replace) to reduce false matches
-    and to support spacing variants such as "z. B." and "d. h.".
+    Replace dots in known abbreviations / legal reference fragments with a placeholder so
+    sentence splitting doesn't break on them.
     """
     placeholder_map: Dict[str, str] = {}
     out = text
@@ -226,45 +267,189 @@ def _protect_abbreviations(text: str) -> Tuple[str, Dict[str, str]]:
     return out, placeholder_map
 
 
-def _restore_abbreviations(text: str, placeholder_map: Dict[str, str]) -> str:
+def _restore_abbreviations(text: str, mapping: Dict[str, str]) -> str:
     out = text
-    for safe, abbr in placeholder_map.items():
-        out = out.replace(safe, abbr)
+    # Restore longer placeholders first (avoid partial overlaps).
+    for safe in sorted(mapping.keys(), key=len, reverse=True):
+        out = out.replace(safe, mapping[safe])
     return out
 
 
-def split_into_sentences(text: str) -> List[str]:
+_DANGLING_REF_RE = re.compile(
+    r"""
+    (?:                           # end-of-fragment patterns that often indicate a false split
+        §{1,2}\s*\d+[A-Za-z]?      # § 1 / §§ 1
+        |(?:Art\.?|Artikel)\s*\d+[A-Za-z]?  # Art. 10 / Artikel 10
+    )
+    \.\s*$                         # ends with a dot
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+_CONTINUATION_START_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        \(?\s*\d{1,3}\s*\)?        # (1) / 1 / ( 1 )
+        |Abs\.?|Absatz
+        |Z\.?|Ziffer|Ziff\.
+        |lit\.?
+        |Satz
+        |Nr\.?
+        |[A-Za-zÄÖÜäöüß]           # any letter (headings like "Geltungsbereich")
+        |§{1,2}|Art\.?|Artikel
+    )
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _merge_false_boundaries(sentences: List[str]) -> List[str]:
     """
-    Conservative rule-based sentence splitter (dependency-light).
+    Repair common false splits created by dots in legal references, e.g.
+      "... gemäß § 1." + "Abs. 2 gilt ..." -> one sentence.
+
+    This is intentionally biased toward MERGING rather than dropping.
     """
-    text = _normalize_whitespace(text)
-    if not text:
+    if not sentences:
+        return sentences
+
+    merged: List[str] = []
+    i = 0
+    while i < len(sentences):
+        cur = sentences[i].strip()
+        if i + 1 < len(sentences):
+            nxt = sentences[i + 1].strip()
+            if cur and nxt and _DANGLING_REF_RE.search(cur) and _CONTINUATION_START_RE.search(nxt):
+                merged.append(f"{cur} {nxt}".strip())
+                i += 2
+                continue
+        merged.append(cur)
+        i += 1
+    return merged
+
+
+def _split_on_list_markers(sentence: str) -> List[str]:
+    """
+    Split a sentence into multiple sentences whenever it contains multiple list markers.
+
+    Conservative:
+      - Only split when there are at least two markers.
+      - Never split at the first marker; keep prefix with item 1.
+    """
+    matches = list(_LIST_MARKER_RE.finditer(sentence))
+    if len(matches) < 2:
+        return [sentence]
+
+    # Determine plausible item starts (avoid splitting on a single dash used mid-sentence).
+    candidates: List[int] = []
+    for m in matches:
+        marker = m.group("marker")
+        start = m.start("marker")
+
+        if marker in {"-", "–", "—"}:
+            if start == 0:
+                candidates.append(start)
+                continue
+
+            prev = sentence[max(0, start - 2):start]
+            if ":" in prev or ";" in prev or "." in prev:
+                candidates.append(start)
+                continue
+
+            # Avoid splitting hyphenated words like "rechts-".
+            if start > 0 and sentence[start - 1].isalpha():
+                continue
+
+            candidates.append(start)
+        else:
+            candidates.append(start)
+
+    candidates = sorted(set(candidates))
+    if len(candidates) < 2:
+        return [sentence]
+
+    split_points = candidates[1:]
+    out: List[str] = []
+    last = 0
+    for sp in split_points:
+        chunk = sentence[last:sp].strip()
+        if chunk:
+            out.append(chunk)
+        last = sp
+
+    tail = sentence[last:].strip()
+    if tail:
+        out.append(tail)
+
+    return out
+
+
+def split_into_sentences(
+    text: str,
+    *,
+    split_enumerations: bool = True,
+    drop_patterns_for_normalization: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Recall-first rule-based sentence splitter (dependency-light).
+
+    Notes:
+      - Uses normalization that strips (not drops) common RIS prefixes.
+      - Protects common abbreviations + legal-reference dots before splitting.
+      - Repairs frequent false boundaries via merge step.
+      - Optionally splits within long sentences on list markers ("1)", "(1)", "a)", bullets).
+    """
+    normalized = _normalize_whitespace(text, drop_patterns=drop_patterns_for_normalization)
+    if not normalized:
         return []
 
-    protected, mapping = _protect_abbreviations(text)
-    parts = re.split(r"(?<=[.!?])\s+", protected)
+    protected, mapping = _protect_abbreviations(normalized)
+
+    # Split on punctuation + whitespace, but require a plausible sentence start afterwards.
+    # This reduces accidental splits in weird PDF extractions while keeping recall high.
+    parts = re.split(r"(?<=[.!?])\s+(?=(?:[A-ZÄÖÜ0-9\"“„\(\[]|§))", protected)
 
     sentences: List[str] = []
     for p in parts:
         p = _restore_abbreviations(p, mapping).strip()
         if p:
             sentences.append(p)
+
+    sentences = _merge_false_boundaries(sentences)
+
+    if split_enumerations:
+        expanded: List[str] = []
+        for s in sentences:
+            for sub in _split_on_list_markers(s):
+                sub = sub.strip()
+                if sub:
+                    expanded.append(sub)
+        sentences = expanded
+
     return sentences
 
 
 def is_semantically_meaningful(
     sentence: str,
     *,
-    min_chars: int = 15,
-    min_alpha_tokens: int = 2,
-    max_digit_ratio: float = 0.65,
+    min_chars: int = 10,
+    min_alpha_tokens: int = 1,
+    max_digit_ratio: float = 0.85,
     drop_patterns: Optional[List[str]] = None,
 ) -> bool:
     """
-    Heuristic filter:
-      - drop empty, headers/footers, numeric-only lines
-      - require at least some alphabetic content
-      - reject overly digit-heavy fragments with little language content
+    Extremely permissive, recall-first filter.
+
+    Objective: do not drop semantically relevant statutory text.
+
+    This function only removes:
+      - empty strings
+      - strings that are purely punctuation/whitespace
+      - trivial RIS/page artefacts when they match *entirely* (fullmatch) against drop_patterns
+
+    The parameters are retained for backwards-compatibility with the CLI, but the current
+    implementation deliberately does not apply aggressive length/digit heuristics.
     """
     s = sentence.strip()
     if not s:
@@ -272,46 +457,24 @@ def is_semantically_meaningful(
 
     if drop_patterns:
         for pat in drop_patterns:
-            if re.search(pat, s, flags=re.IGNORECASE):
+            if re.fullmatch(pat, s, flags=re.IGNORECASE):
                 return False
 
-    # Must contain at least one letter (incl. umlauts/ß)
-    if not re.search(r"[A-Za-zÄÖÜäöüß]", s):
-        return False
-
-    # Numeric/punctuation-only (covers §, etc. if no letters)
-    if re.fullmatch(r"[\d\s§\-\–\—\.,;:/()\[\]{}]+", s):
-        return False
-
-    # Token heuristics
-    alpha_tokens = re.findall(r"[A-Za-zÄÖÜäöüß]{2,}", s)
-    if len(s) < min_chars:
-        # keep short sentences if they still have enough words
-        return len(alpha_tokens) >= min_alpha_tokens
-
-    # Digit ratio heuristic
-    digits = sum(ch.isdigit() for ch in s)
-    if digits / max(len(s), 1) > max_digit_ratio:
-        if len(alpha_tokens) < (min_alpha_tokens + 1):
-            return False
-
-    if len(alpha_tokens) < min_alpha_tokens:
+    # Drop pure punctuation/whitespace (including common bullet dashes).
+    if re.fullmatch(r"[\s\-\–\—\.,;:/()\[\]{}]+", s):
         return False
 
     return True
 
-
 # ----------------------------- PDF extraction (robust + fallback) -----------------------------
+
 
 def _extract_pages_with_pymupdf(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     """
     Primary extractor: PyMuPDF.
 
-    Implementation notes:
-      - Prefer `import pymupdf` (the current import name).
-      - Fall back to `import fitz` (legacy import name for PyMuPDF).
-      - Avoid direct attribute access like `fitz.open(...)` so that static type checkers
-        (Pylance/Pyright) do not flag missing attributes when stubs are incomplete.
+    We prefer "sort=True" (when available) to improve reading order and reduce
+    accidental header/body interleaving.
     """
     pymupdf_mod: Any = None
     errors: List[str] = []
@@ -319,9 +482,9 @@ def _extract_pages_with_pymupdf(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     for module_name in ("pymupdf", "fitz"):
         try:
             candidate = importlib.import_module(module_name)
-            # Basic sanity check: PyMuPDF exposes Document and/or open.
-            has_document = callable(getattr(candidate, "Document", None))
-            has_open = callable(getattr(candidate, "open", None))
+
+            has_document = hasattr(candidate, "Document")
+            has_open = hasattr(candidate, "open")
             if not (has_document or has_open):
                 raise ImportError(
                     f"Imported '{module_name}' does not look like PyMuPDF (missing Document/open). "
@@ -335,7 +498,6 @@ def _extract_pages_with_pymupdf(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     if pymupdf_mod is None:
         raise RuntimeError("PyMuPDF import failed. Tried pymupdf, fitz. " + " | ".join(errors))
 
-    # Open the PDF. Prefer Document(...) because it is typically present in stubs.
     Document = cast(Optional[Callable[..., Any]], getattr(pymupdf_mod, "Document", None))
     open_fn = cast(Optional[Callable[..., Any]], getattr(pymupdf_mod, "open", None))
 
@@ -344,23 +506,27 @@ def _extract_pages_with_pymupdf(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     elif callable(open_fn):
         doc = open_fn(str(pdf_path))
     else:
-        # Should be unreachable due to sanity check above.
         raise RuntimeError("PyMuPDF module loaded but provides neither Document nor open().")
 
     try:
         if getattr(doc, "needs_pass", False):
             raise RuntimeError(f"Encrypted PDF (password needed): {pdf_path.name}")
+
         for i, page in enumerate(doc, start=1):  # 1-based pages
-            yield i, (page.get_text("text") or "")
+            # Prefer sort=True if supported by the installed PyMuPDF.
+            try:
+                txt = page.get_text("text", sort=True)  # type: ignore[call-arg]
+            except TypeError:
+                txt = page.get_text("text")
+            yield i, (txt or "")
     finally:
         doc.close()
 
 
 def _extract_pages_with_pdfplumber(pdf_path: Path) -> Iterable[Tuple[int, str]]:
-    """
-    Fallback extractor: pdfplumber.
-    """
+    """Fallback extractor: pdfplumber."""
     import pdfplumber  # optional dependency
+
     with pdfplumber.open(str(pdf_path)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             yield i, (page.extract_text() or "")
@@ -373,7 +539,6 @@ def extract_pages_text(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     """
     try:
         yield from _extract_pages_with_pymupdf(pdf_path)
-        return
     except Exception as e_pymupdf:
         try:
             yield from _extract_pages_with_pdfplumber(pdf_path)
@@ -389,22 +554,29 @@ def extract_pages_text(pdf_path: Path) -> Iterable[Tuple[int, str]]:
 
 # ----------------------------- Main pipeline -----------------------------
 
+
 def ris_pdfs_to_parquet(
     input_dir: str | Path = "ris_pdfs",
     output_parquet: str | Path = "ris_sentences.parquet",
     *,
     recursive: bool = False,
-    min_chars: int = 15,
-    min_alpha_tokens: int = 2,
-    max_digit_ratio: float = 0.65,
+    min_chars: int = 10,
+    min_alpha_tokens: int = 1,
+    max_digit_ratio: float = 0.85,
     drop_patterns: Optional[List[str]] = None,
     print_example_per_pdf: bool = True,
+    split_enumerations: bool = True,
+    filter_sentences: bool = True,
 ) -> pd.DataFrame:
     """
     Reads all PDFs in input_dir, extracts and filters sentences page-by-page,
     labels them with law_type (PDF stem) and page number, writes Parquet.
 
-    Also prints one example sentence per PDF (the first retained sentence encountered).
+    Pipeline is unchanged:
+      PDFs -> page text -> sentence split -> (optional) filter -> Parquet
+
+    Notes for maximal recall:
+      - Set --no_filter to keep everything post-split.
     """
     input_dir = Path(input_dir)
     output_parquet = Path(output_parquet)
@@ -418,19 +590,26 @@ def ris_pdfs_to_parquet(
 
     rows: List[Dict[str, Any]] = []
     sentence_id = 0
-    first_example: Dict[str, Tuple[int, str]] = {}  # law_type -> (page, sentence)
+    first_example: Dict[str, Tuple[int, str]] = {}
 
     for pdf_path in pdf_paths:
         law_type = pdf_path.stem
 
         for page_no, page_text in extract_pages_text(pdf_path):
-            page_text = _normalize_whitespace(page_text)
-            if not page_text:
+            if not page_text or not page_text.strip():
                 continue
 
-            for sent in split_into_sentences(page_text):
+            # Normalize inside the splitter (single normalization pass).
+            for sent in split_into_sentences(
+                page_text,
+                split_enumerations=split_enumerations,
+                drop_patterns_for_normalization=drop_patterns,
+            ):
                 sent = sent.strip()
-                if not is_semantically_meaningful(
+                if not sent:
+                    continue
+
+                if filter_sentences and not is_semantically_meaningful(
                     sent,
                     min_chars=min_chars,
                     min_alpha_tokens=min_alpha_tokens,
@@ -458,14 +637,13 @@ def ris_pdfs_to_parquet(
         for pdf_path in pdf_paths:
             law_type = pdf_path.stem
             if law_type in first_example:
-                page_no, sent = first_example[law_type]
-                print(f"- {law_type} (page {page_no}): {sent}")
+                p, s = first_example[law_type]
+                print(f"  - {pdf_path.name}: p.{p}: {s}")
             else:
-                print(f"- {law_type}: [no retained sentence found]")
+                print(f"  - {pdf_path.name}: (no sentences retained)")
 
     df = pd.DataFrame(rows, columns=["sentence_id", "law_type", "page", "sentence", "source_file"])
 
-    # Write Parquet (requires pyarrow or fastparquet)
     try:
         df.to_parquet(output_parquet, index=False)
     except Exception as e:
@@ -481,20 +659,27 @@ def ris_pdfs_to_parquet(
 
 # ----------------------------- CLI -----------------------------
 
+
 def _parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract labeled sentences from RIS PDFs and write Parquet.")
     p.add_argument("--input_dir", default="ris_pdfs", help="Folder containing RIS PDF files.")
     p.add_argument("--output", default="ris_sentences.parquet", help="Output Parquet file path.")
     p.add_argument("--recursive", action="store_true", help="Search PDFs recursively.")
     p.add_argument("--no_print_examples", action="store_true", help="Do not print per-PDF example sentences.")
-    p.add_argument("--min_chars", type=int, default=15, help="Minimum character length for a sentence.")
-    p.add_argument("--min_alpha_tokens", type=int, default=2, help="Minimum count of alphabetic tokens.")
-    p.add_argument("--max_digit_ratio", type=float, default=0.65, help="Max allowed digit/char ratio.")
+
+    # Defaults tuned for recall-first behavior.
+    p.add_argument("--min_chars", type=int, default=10, help="Minimum character length for a sentence.")
+    p.add_argument("--min_alpha_tokens", type=int, default=1, help="Minimum count of alphabetic tokens.")
+    p.add_argument("--max_digit_ratio", type=float, default=0.85, help="Max allowed digit/char ratio.")
+
+    p.add_argument("--no_split_enumerations", action="store_true", help="Disable splitting on list markers like '1)'.")
+    p.add_argument("--no_filter", action="store_true", help="Disable semantic filtering (maximal recall; includes more noise).")
     return p.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    args = _parse_args(argv or [])
+
     ris_pdfs_to_parquet(
         input_dir=args.input_dir,
         output_parquet=args.output,
@@ -503,6 +688,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_alpha_tokens=args.min_alpha_tokens,
         max_digit_ratio=args.max_digit_ratio,
         print_example_per_pdf=not args.no_print_examples,
+        split_enumerations=not args.no_split_enumerations,
+        filter_sentences=not args.no_filter,
     )
     return 0
 

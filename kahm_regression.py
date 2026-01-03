@@ -4,8 +4,8 @@ kahm_regression.py
 KAHM-based multivariate regression via output clustering.
 
 Soft / "true" regression (distance-matrix based):
-- prediction_classifier_extended is called with return_distance_matrix=True
-  to obtain per-class distances D of shape (C_eff, N_new).
+- combine_multiple_autoencoders_extended is used with one autoencoder per output cluster
+  to obtain per-cluster distances D of shape (C_eff, N_new).
 - Distances are assumed to lie in [0, 1] and be monotone with (1 - probability).
 
 Sharpened + truncated probability mapping (recommended when C_eff is large):
@@ -39,9 +39,9 @@ from numpy.typing import DTypeLike
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from joblib import dump, load
 
-from otfl.classifier import classifier
-from otfl.prediction_classifier_extended import prediction_classifier_extended
-from otfl.prediction_classifier_extended_v2 import prediction_classifier_extended_v2
+from parallel_autoencoders import parallel_autoencoders
+from combine_multiple_autoencoders_extended import combine_multiple_autoencoders_extended
+
 
 # ----------------------------
 # Precision helpers
@@ -180,7 +180,7 @@ def train_kahm_regressor(
         print(f"Requested number of clusters: {n_clusters}")
         print(f"Input scaling factor (input_scale): {input_scale}")
 
-    # Apply input scaling (for KAHM classifier training)
+    # Apply input scaling (for AE-based cluster assignment)
     if input_scale != 1.0:
         X = _scale_like(X, float(input_scale), inplace=False)
 
@@ -286,7 +286,7 @@ def train_kahm_regressor(
     if verbose:
         print(f"Min cluster size after preprocessing: {final_counts.min()}")
 
-    # 2) Optionally subsample per output cluster for classifier training
+    # 2) Optionally subsample per output cluster for autoencoder training
     #    This is the most effective way to control memory when n_clusters is large.
     X_clf = X
     labels_one_based_clf = labels_one_based
@@ -296,7 +296,7 @@ def train_kahm_regressor(
         if m <= 0:
             raise ValueError("max_train_per_cluster must be a positive integer or None")
         if verbose:
-            print(f"Subsampling classifier training data: max_train_per_cluster={m}")
+            print(f"Subsampling autoencoder training data: max_train_per_cluster={m}")
 
         rng = np.random.RandomState(int(random_state) if random_state is not None else 0)
         keep_idx_parts: list[np.ndarray] = []
@@ -312,9 +312,9 @@ def train_kahm_regressor(
         X_clf = X[:, keep_idx]
         labels_one_based_clf = labels_one_based[keep_idx]
         if verbose:
-            print(f"Classifier training samples: {X_clf.shape[1]} (was {X.shape[1]})")
+            print(f"Autoencoder training samples: {X_clf.shape[1]} (was {X.shape[1]})")
 
-    # 3) Train KAHM classifier
+    # 3) Train per-cluster autoencoders
 
     # Y is no longer needed after computing cluster_centers; free it before classifier training.
     try:
@@ -325,20 +325,42 @@ def train_kahm_regressor(
     _gc.collect()
 
     if verbose:
-        print("Training KAHM classifier (otfl.classifier)...")
+        print("Training per-cluster autoencoders (parallel_autoencoders)...")
 
-    # Ensure OTFL sees float32 (avoid implicit float64 copies inside OTFL)
+    # Ensure float32 to minimize peak memory inside OTFL autoencoder code
     if X_clf.dtype != np.float32:
         X_clf = X_clf.astype(np.float32, copy=False)
     labels_one_based_clf = labels_one_based_clf.astype(np.int32, copy=False)
-    clf = classifier(
-        X_clf,
-        labels_one_based_clf,
-        subspace_dim=subspace_dim,
-        Nb=Nb,
-        n_jobs=1,
-        verbose=False,
-    )
+
+    # Train one autoencoder per output cluster.
+    # We call `parallel_autoencoders` on each cluster with Nb == N_cluster so it returns a single AE.
+    AE_arr: list[Any] = []
+    for c in range(n_clusters_eff):
+        idx_c = np.where(labels_one_based_clf == (c + 1))[0]
+        if idx_c.size < 2:
+            raise ValueError(
+                f"Cluster {c + 1} has only {idx_c.size} sample(s) after subsampling; "
+                "need at least 2 to train an autoencoder. "
+                "Increase max_train_per_cluster or reduce n_clusters."
+            )
+
+        X_c = X_clf[:, idx_c]
+        # Ensure subspace_dim is feasible for this cluster.
+        sd_c = int(min(subspace_dim, X_c.shape[0], X_c.shape[1] - 1))
+        sd_c = max(1, sd_c)
+
+        AE_c_list = parallel_autoencoders(
+            X_c,
+            subspace_dim=sd_c,
+            Nb=Nb,
+            n_jobs=1,
+            verbose=True,
+        )
+        AE_arr.append(AE_c_list)
+
+    # For backward compatibility with the rest of this file, we keep the name `clf`.
+    # In the per-cluster-AE variant, `clf` is a list of length C_eff (one autoencoder per cluster).
+    clf = AE_arr
 
     # 4) Downcast model arrays to reduce RAM footprint
     #    NOTE: We keep this conservative: float32 for all numeric arrays.
@@ -577,18 +599,21 @@ def kahm_regress(
     """
     Predict outputs for new inputs using a trained KAHM regressor.
 
-    Parameters
-    ----------
-    X_new : (D_in, N_new)
-    mode : {'hard','soft'}
-    alpha, topk : soft-mode calibration; if None, uses model['soft_alpha'/'soft_topk'] if set.
-    batch_size : optional int; if set, soft predictions are computed in chunks.
+    This variant assumes the trained model stores **one autoencoder per output cluster**
+    in `model['classifier']` (kept for backward compatibility with the earlier API).
 
-    Returns
-    -------
-    Y_pred : (D_out, N_new)
-    optionally P : (C_eff, N_new) if requested in soft mode AND batch_size is None.
-    Note: returning full P with batching would require assembling a potentially huge matrix.
+    - Hard mode:
+        * compute distance-to-cluster for each cluster autoencoder (reconstruction distance)
+        * predict cluster label by argmin distance
+        * output the corresponding cluster center
+
+    - Soft mode:
+        * build a distance matrix D of shape (C_eff, N_new)
+        * convert to probabilities with `distances_to_probabilities_one_minus_sharp`
+        * return Y_hat = cluster_centers @ P
+
+    Distance computation uses:
+        combine_multiple_autoencoders_extended(X, [AE_c], distance_type="folding")
     """
     X_new = _as_float_ndarray(X_new)
     if X_new.ndim != 2:
@@ -598,25 +623,51 @@ def kahm_regress(
     if input_scale != 1.0:
         X_new = _scale_like(X_new, float(input_scale), inplace=False)
 
-    clf = model["classifier"]
+    AE_arr = model["classifier"]
+    if not isinstance(AE_arr, (list, tuple)) or len(AE_arr) == 0:
+        raise TypeError(
+            "This kahm_regression variant expects model['classifier'] to be a non-empty list of "
+            "per-cluster autoencoders (trained with parallel_autoencoders on each cluster)."
+        )
+
     cluster_centers = _as_float_ndarray(model["cluster_centers"])  # (D_out, C_eff)
     # If the trained model indicates centroid normalization, enforce it here (idempotent).
     if str(model.get("cluster_centers_normalization", "none")).lower().strip() == "l2":
         cluster_centers = l2_normalize_columns(cluster_centers)
-    C_eff = cluster_centers.shape[1]
-    N_new = X_new.shape[1]
 
+    C_eff = int(cluster_centers.shape[1])
+    if len(AE_arr) != C_eff:
+        raise ValueError(
+            f"Mismatch: got {len(AE_arr)} autoencoders but cluster_centers has C_eff={C_eff} clusters."
+        )
+
+    N_new = int(X_new.shape[1])
     out_dtype = np.result_type(cluster_centers.dtype, np.float32)
 
+    distance_type = "folding"
+
     if mode == "hard":
-        _, labels_pred = prediction_classifier_extended(X_new, clf, "folding", n_jobs=n_jobs)
-        idx = labels_pred.astype(int) - 1
-        Y_pred = cluster_centers[:, idx]
+        # Streaming argmin over clusters (does not materialize a full (C_eff, N_new) matrix).
+        best_dist = np.full((N_new,), np.inf, dtype=np.float64)
+        best_idx = np.zeros((N_new,), dtype=np.int64)
+
+        for c, AE_c in enumerate(AE_arr):
+            d = combine_multiple_autoencoders_extended(X_new, AE_c, distance_type)
+            d = np.asarray(d).reshape(-1)
+            if d.size != N_new:
+                raise ValueError(
+                    f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
+                )
+            mask = d < best_dist
+            best_dist[mask] = d[mask]
+            best_idx[mask] = c
+
+        Y_pred = cluster_centers[:, best_idx]
 
         if return_probabilities:
             # One-hot probabilities for hard assignments.
             P_hard = np.zeros((C_eff, N_new), dtype=out_dtype)
-            P_hard[idx, np.arange(N_new)] = 1.0
+            P_hard[best_idx, np.arange(N_new)] = 1.0
             return Y_pred, P_hard
 
         return Y_pred
@@ -634,19 +685,20 @@ def kahm_regress(
         for start in range(0, N_new, bs):
             end = min(start + bs, N_new)
             X_batch = X_new[:, start:end]
-            N_b = X_batch.shape[1]
+            N_b = int(X_batch.shape[1])
 
-            try:
-                D_batch, labels_batch = prediction_classifier_extended_v2(
-                    X_batch, clf, "folding", n_jobs=n_jobs, return_distance_matrix=True
-                )
-            except TypeError as exc:
-                raise TypeError(
-                    "prediction_classifier_extended does not accept return_distance_matrix=True. "
-                    "Apply the modification to make it return (distance_matrix, labels) when requested."
-                ) from exc
+            # Build distance matrix for the batch: (C_eff, N_b)
+            D_batch = np.empty((C_eff, N_b), dtype=np.float64)
+            for c, AE_c in enumerate(AE_arr):
+                d = combine_multiple_autoencoders_extended(X_batch, [AE_c], distance_type)
+                d = np.asarray(d).reshape(-1)
+                if d.size != N_b:
+                    raise ValueError(
+                        f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_b},)."
+                    )
+                D_batch[c, :] = d
 
-            D_batch = _ensure_distance_matrix_shape(_as_float_ndarray(D_batch), C_eff, N_b, labels=labels_batch)
+            D_batch = _ensure_distance_matrix_shape(_as_float_ndarray(D_batch), C_eff, N_b, labels=None)
             P_batch = distances_to_probabilities_one_minus_sharp(D_batch, alpha=alpha_resolved, topk=topk_resolved)
             Y_pred[:, start:end] = cluster_centers @ P_batch
 
@@ -655,24 +707,23 @@ def kahm_regress(
         return Y_pred
 
     # Non-batched (returns full P if requested)
-    try:
-        D, labels_full = prediction_classifier_extended_v2(
-            X_new, clf, "folding", n_jobs=n_jobs, return_distance_matrix=True
-        )
-    except TypeError as exc:
-        raise TypeError(
-            "prediction_classifier_extended does not accept return_distance_matrix=True. "
-            "Apply the modification to make it return (distance_matrix, labels) when requested."
-        ) from exc
+    D = np.empty((C_eff, N_new), dtype=np.float64)
+    for c, AE_c in enumerate(AE_arr):
+        d = combine_multiple_autoencoders_extended(X_new, AE_c, distance_type)
+        d = np.asarray(d).reshape(-1)
+        if d.size != N_new:
+            raise ValueError(
+                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
+            )
+        D[c, :] = d
 
-    D = _ensure_distance_matrix_shape(_as_float_ndarray(D), C_eff, N_new, labels=labels_full)
+    D = _ensure_distance_matrix_shape(_as_float_ndarray(D), C_eff, N_new, labels=None)
     P = distances_to_probabilities_one_minus_sharp(D, alpha=alpha_resolved, topk=topk_resolved)
     Y_pred = cluster_centers @ P
 
     if return_probabilities:
         return Y_pred, P
     return Y_pred
-
 
 # ----------------------------
 # Autotuning
@@ -690,8 +741,8 @@ def tune_soft_params(
     X_val: np.ndarray,
     Y_val: np.ndarray,
     *,
-    alphas: Sequence[float] = (5.0, 10.0, 20.0),
-    topks: Sequence[int | None] = (5, 10, 20),
+    alphas: Sequence[float] = (5.0, 10.0, 15.0, 20.0),
+    topks: Sequence[int | None] = (5, 10, 15, 20),
     n_jobs: int = -1,
     verbose: bool = True,
 ) -> SoftTuningResult:
@@ -721,17 +772,30 @@ def tune_soft_params(
     C_eff = cluster_centers.shape[1]
     N_val = Xv.shape[1]
 
-    try:
-        D_val, labels_val = prediction_classifier_extended_v2(
-            Xv, clf, "folding", n_jobs=n_jobs, return_distance_matrix=True
-        )
-    except TypeError as exc:
+    # This variant expects per-cluster autoencoders in model['classifier'].
+    AE_arr = clf
+    if not isinstance(AE_arr, (list, tuple)) or len(AE_arr) == 0:
         raise TypeError(
-            "prediction_classifier_extended does not accept return_distance_matrix=True. "
-            "Apply the modification to make it return (distance_matrix, labels) when requested."
-        ) from exc
+            "This kahm_regression variant expects model['classifier'] to be a non-empty list of "
+            "per-cluster autoencoders."
+        )
+    if len(AE_arr) != C_eff:
+        raise ValueError(
+            f"Mismatch: got {len(AE_arr)} autoencoders but cluster_centers has C_eff={C_eff} clusters."
+        )
 
-    D_val = _ensure_distance_matrix_shape(_as_float_ndarray(D_val), C_eff, N_val, labels=labels_val)
+    # Compute full distance matrix once for X_val and reuse it for all grid points.
+    D_val = np.empty((C_eff, N_val), dtype=np.float64)
+    for c, AE_c in enumerate(AE_arr):
+        d = combine_multiple_autoencoders_extended(Xv, AE_c, "folding")
+        d = np.asarray(d).reshape(-1)
+        if d.size != N_val:
+            raise ValueError(
+                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_val},)."
+            )
+        D_val[c, :] = d
+
+    D_val = _ensure_distance_matrix_shape(_as_float_ndarray(D_val), C_eff, N_val, labels=None)
 
     # Materialize sequences to allow validation and stable repr in verbose output
     alphas = tuple(alphas)
@@ -826,9 +890,9 @@ if __name__ == "__main__":
         Y_train,
         n_clusters=1000,
         subspace_dim=20,
-        Nb=100,
+        Nb=50,
         random_state=0,
-        verbose=True,
+        verbose=False,
         input_scale=0.5,
         cluster_center_normalization="none"
     )

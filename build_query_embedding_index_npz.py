@@ -42,8 +42,8 @@ import numpy as np
 
 DEFAULT_OUT = "queries_embedding_index.npz"
 DEFAULT_MODEL = "mixedbread-ai/deepset-mxbai-embed-de-large-v1"
-DEFAULT_DEVICE = "cpu"
-DEFAULT_BATCH = 64
+DEFAULT_DEVICE = "auto"
+DEFAULT_BATCH = 1
 DEFAULT_QUERY_PREFIX = "query: "
 DEFAULT_DIM = 1024
 

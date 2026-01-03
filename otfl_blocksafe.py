@@ -83,15 +83,15 @@ def enable_otfl_blocksafe(
     import importlib
     from joblib import parallel_backend
 
-    dr = importlib.import_module("otfl.dim_reduce")
-    ae_mod = importlib.import_module("otfl.autoencoder")
-    pa_mod = importlib.import_module("otfl.parallel_autoencoders")
-    clf_mod = importlib.import_module("otfl.classifier")
+    dr = importlib.import_module("dim_reduce")
+    ae_mod = importlib.import_module("autoencoder")
+    pa_mod = importlib.import_module("parallel_autoencoders")
+    clf_mod = importlib.import_module("classifier")
 
     orig_dim_reduce = getattr(dr, "dim_reduce", None)
     orig_autoencoder = getattr(ae_mod, "autoencoder", None)
     if orig_dim_reduce is None or orig_autoencoder is None:
-        raise AttributeError("blocksafe patch: could not locate otfl.dim_reduce.dim_reduce or otfl.autoencoder.autoencoder")
+        raise AttributeError("blocksafe patch: could not locate dim_reduce.dim_reduce or autoencoder.autoencoder")
 
     # Infer eps (best-effort)
     eps_used = pca_eps
