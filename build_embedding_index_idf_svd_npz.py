@@ -296,29 +296,36 @@ def compute_dataset_fingerprint(
     *,
     id_col: str,
     text_col: str,
-    include_cols: Tuple[str, ...] = ("law_type", "page"),
+    include_cols: Tuple[str, ...] = (),
 ) -> str:
     """
-    sha256 over sentence_id + (optional cols) + sentence text.
+    Compute a stable SHA256 over (sentence_id + content) for all rows in order.
+
+    This is intentionally equivalent to sha256_fingerprint_sentence_id_content:
+      - hashes ONLY id_col and text_col
+      - uses str(...) conversion for both fields
+      - separators: NUL between id/text, newline per row
+      - utf-8 encoding with strict error handling
     """
+    if include_cols:
+        raise ValueError(
+            "This fingerprint function is defined to be equivalent to "
+            "sha256_fingerprint_sentence_id_content and therefore does not "
+            "support include_cols. Pass include_cols=() to proceed."
+        )
+
+    if id_col not in df.columns or text_col not in df.columns:
+        raise ValueError(
+            f"Corpus is missing required column '{id_col}' or '{text_col}'. "
+            f"Columns: {list(df.columns)}"
+        )
+
     h = hashlib.sha256()
-
-    ids = df[id_col].astype("int64").to_numpy()
-    texts = df[text_col].astype(str).to_numpy()
-
-    extras = []
-    for c in include_cols:
-        extras.append(df[c].astype(str).to_numpy() if c in df.columns else None)
-
-    for i in range(len(df)):
-        h.update(ids[i].tobytes())
-        h.update(b"\x00")
-        for ex in extras:
-            if ex is not None:
-                h.update(ex[i].encode("utf-8", errors="replace"))
-                h.update(b"\x00")
-        h.update(texts[i].encode("utf-8", errors="replace"))
-        h.update(b"\x00")
+    for sid, content in df[[id_col, text_col]].itertuples(index=False, name=None):
+        h.update(str(sid).encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(content).encode("utf-8"))
+        h.update(b"\n")
 
     return h.hexdigest()
 

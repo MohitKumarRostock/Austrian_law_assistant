@@ -1,7 +1,7 @@
 import numpy as np
 
 def autoencoder(y_data: np.ndarray, subspace_dim: int, min_range: float = 1e-3):
-    y_data = np.asarray(y_data, dtype=float)
+    y_data = np.asarray(y_data, dtype=np.float32)
     D, N = y_data.shape
 
     if subspace_dim > (N - 1):
@@ -39,7 +39,9 @@ def autoencoder(y_data: np.ndarray, subspace_dim: int, min_range: float = 1e-3):
     # matrix square root of weights_matrix
     eigvals, eigvecs = np.linalg.eigh(weights_matrix)
     eigvals_clipped = np.clip(eigvals, a_min=0.0, a_max=None)
-    sqrt_weights_matrix = eigvecs @ np.diag(np.sqrt(eigvals_clipped)) @ eigvecs.T
+    s = np.sqrt(eigvals_clipped).astype(eigvecs.dtype, copy=False)
+    sqrt_weights_matrix = (eigvecs * s[None, :]) @ eigvecs.T
+
 
     AE = {
         "y_data_n_subspace": y_data_n_subspace,

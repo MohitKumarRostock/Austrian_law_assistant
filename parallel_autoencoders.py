@@ -41,7 +41,7 @@ def parallel_autoencoders(
     AE_arr : list
         List of AE objects (dicts if using the previous autoencoder() implementation).
     """
-    y_data = np.ascontiguousarray(y_data, dtype=float)
+    y_data = np.ascontiguousarray(y_data, dtype=np.float32)
     D, N = y_data.shape  # noqa: F841 (D is not used but kept for clarity)
 
     if Nb <= 0:

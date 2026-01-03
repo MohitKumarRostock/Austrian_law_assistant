@@ -41,7 +41,29 @@ from joblib import dump, load
 
 from parallel_autoencoders import parallel_autoencoders
 from combine_multiple_autoencoders_extended import combine_multiple_autoencoders_extended
+from pathlib import Path
 
+import os
+import gc as _gc
+import tempfile
+
+
+
+def _is_pathlike(x) -> bool:
+    return isinstance(x, (str, os.PathLike, Path))
+
+def _load_ae_maybe(AE_ref):
+    """Return (AE_object, from_disk_bool)."""
+    if _is_pathlike(AE_ref):
+        return load(AE_ref), True
+    return AE_ref, False
+
+def _short_repr(x, maxlen=200) -> str:
+    try:
+        s = repr(x)
+    except Exception:
+        s = f"<unreprable {type(x).__name__}>"
+    return s if len(s) <= maxlen else (s[:maxlen] + "...")
 
 # ----------------------------
 # Precision helpers
@@ -344,7 +366,6 @@ def train_kahm_regressor(
         del Y
     except Exception:
         pass
-    import gc as _gc
     _gc.collect()
 
     if verbose:
@@ -355,9 +376,24 @@ def train_kahm_regressor(
         X_clf = X_clf.astype(np.float32, copy=False)
     labels_one_based_clf = labels_one_based_clf.astype(np.int32, copy=False)
 
+    md = str(model_dtype).lower().strip()
+    if md in ("auto", "none", ""):
+        _dtype = work_dtype
+    elif md in ("float32", "f32"):
+        _dtype = np.float32
+    elif md in ("float64", "f64"):
+        _dtype = np.float64
+    else:
+        raise ValueError("model_dtype must be one of {'auto','float32','float64'}")
+
     # Train one autoencoder per output cluster.
     # We call `parallel_autoencoders` on each cluster with Nb == N_cluster so it returns a single AE.
-    AE_arr: list[Any] = []
+    # Directory where per-cluster AEs will be written.
+    # Pick something stable (and with enough disk space).
+    ae_dir = Path("kahm_ae_cache").resolve()
+    ae_dir.mkdir(parents=True, exist_ok=True)
+    # Store file paths instead of in-memory AEs
+    AE_arr: list[str] = []
     for c in range(n_clusters_eff):
         idx_c = np.where(labels_one_based_clf == (c + 1))[0]
         if idx_c.size < 2:
@@ -377,49 +413,44 @@ def train_kahm_regressor(
             n_jobs=1,
             verbose=False,
         )
-        AE_arr.append(AE_c_list)
-
-    # For backward compatibility with the rest of this file, we keep the name `clf`.
-    # In the per-cluster-AE variant, `clf` is a list of length C_eff (one autoencoder per cluster).
-    clf = AE_arr
-
-    # 4) Downcast model arrays to reduce RAM footprint
-    #    NOTE: We keep this conservative: float32 for all numeric arrays.
-    #    If you need even more savings, you can change PC to float16,
-    #    but that may affect numerical stability in some OTFL implementations.
-    md = str(model_dtype).lower().strip()
-    if md in ("auto", "none", ""):
-        _dtype = work_dtype
-    elif md in ("float32", "f32"):
-        _dtype = np.float32
-    elif md in ("float64", "f64"):
-        _dtype = np.float64
-    else:
-        raise ValueError("model_dtype must be one of {'auto','float32','float64'}")
-
-    def _downcast_obj(obj):
-        if isinstance(obj, np.ndarray) and obj.dtype.kind in "fc":
-            return obj.astype(_dtype, copy=False)
-        if isinstance(obj, dict):
-            for k, v in list(obj.items()):
-                obj[k] = _downcast_obj(v)
+        
+        def _downcast_obj(obj):
+            if isinstance(obj, np.ndarray) and obj.dtype.kind in "fc":
+                return obj.astype(_dtype, copy=False)
+            if isinstance(obj, dict):
+                for k, v in list(obj.items()):
+                    obj[k] = _downcast_obj(v)
+                return obj
+            if isinstance(obj, (list, tuple)):
+                out = [ _downcast_obj(v) for v in obj ]
+                return out if isinstance(obj, list) else tuple(out)
             return obj
-        if isinstance(obj, (list, tuple)):
-            out = [ _downcast_obj(v) for v in obj ]
-            return out if isinstance(obj, list) else tuple(out)
-        return obj
 
-    try:
-        clf = _downcast_obj(clf)
-    except Exception:
-        # If OTFL returns unexpected structures, keep the model unmodified.
-        pass
+        AE_c_list = _downcast_obj(AE_c_list)
+        
+        # To avoid too many files in a single directory, shard into subfolders (optional but useful for 15k)
+        shard = ae_dir / f"{c // 1000:03d}"
+        shard.mkdir(parents=True, exist_ok=True)
 
+        ae_path = shard / f"ae_cluster_{c + 1:05d}.joblib"
+        dump(AE_c_list, ae_path, compress=3)
+        AE_arr.append(str(ae_path))
+        # Free per-iteration memory aggressively
+        del X_c, idx_c, AE_c_list
+        _gc.collect()
+    # clf now holds paths, not the AE dicts
+    clf = AE_arr
+    if len(clf) != n_clusters_eff:
+        raise RuntimeError(
+            f"Internal error: trained/saved {len(clf)} AEs, expected {n_clusters_eff}. "
+        "Your AE loop is not appending paths correctly."
+        )
     if verbose:
         print("Training finished.")
 
     return {
         "classifier": clf,
+        "classifier_dir": str(ae_dir),
         "cluster_centers": np.asarray(cluster_centers, dtype=_dtype),  # (D_out, C_eff)
         "n_clusters": int(n_clusters_eff),
         "input_scale": float(input_scale),
@@ -663,23 +694,25 @@ def kahm_regress(
     """
     Predict outputs for new inputs using a trained KAHM regressor.
 
-    This variant assumes the trained model stores **one autoencoder per output cluster**
-    in `model['classifier']` (kept for backward compatibility with the earlier API).
+    Supports model['classifier'] as either:
+      - a list of in-memory autoencoder objects (legacy), or
+      - a list of file paths (joblib) to per-cluster autoencoders (disk-backed).
 
     - Hard mode:
-        * compute distance-to-cluster for each cluster autoencoder (reconstruction distance)
-        * predict cluster label by argmin distance
-        * output the corresponding cluster center
+        * streaming argmin distance over clusters (no full (C_eff, N_new) matrix)
+        * output cluster center for the best cluster
 
     - Soft mode:
-        * build a distance matrix D of shape (C_eff, N_new)
-        * convert to probabilities with `distances_to_probabilities_one_minus_sharp`
-        * return Y_hat = cluster_centers @ P
+        * build distance matrix D of shape (C_eff, N_new)
+        * convert to probabilities via distances_to_probabilities_one_minus_sharp
+        * output Y_hat = cluster_centers @ P
 
-    Distance computation uses:
-        combine_multiple_autoencoders_extended(X, AE_c_list, distance_type="folding")
-        where AE_c_list is a list/tuple of autoencoder components (or a single autoencoder wrapped in a list).
+    Notes for disk-backed AEs:
+      - Hard mode loads one AE at a time.
+      - Soft mode + batch_size uses an on-disk memmap for D so each AE is loaded once.
     """
+
+
     X_new = _as_float_ndarray(X_new)
     if X_new.ndim != 2:
         raise ValueError("X_new must be 2D shaped (D_in, N_new).")
@@ -692,11 +725,10 @@ def kahm_regress(
     if not isinstance(AE_arr, (list, tuple)) or len(AE_arr) == 0:
         raise TypeError(
             "This kahm_regression variant expects model['classifier'] to be a non-empty list of "
-            "per-cluster autoencoders (trained with parallel_autoencoders on each cluster)."
+            "per-cluster autoencoders (or file paths to them)."
         )
 
     cluster_centers = _as_float_ndarray(model["cluster_centers"])  # (D_out, C_eff)
-    # If the trained model indicates centroid normalization, enforce it here (idempotent).
     if str(model.get("cluster_centers_normalization", "none")).lower().strip() == "l2":
         cluster_centers = l2_normalize_columns(cluster_centers)
 
@@ -711,84 +743,173 @@ def kahm_regress(
 
     distance_type = "folding"
 
+    # -----------------------
+    # HARD MODE (streaming)
+    # -----------------------
     if mode == "hard":
-        # Streaming argmin over clusters (does not materialize a full (C_eff, N_new) matrix).
         best_dist = np.full((N_new,), np.inf, dtype=np.float64)
         best_idx = np.zeros((N_new,), dtype=np.int64)
 
-        for c, AE_c in enumerate(AE_arr):
-            d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
-            d = np.asarray(d).reshape(-1)
-            if d.size != N_new:
-                raise ValueError(
-                    f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
-                )
-            mask = d < best_dist
-            best_dist[mask] = d[mask]
-            best_idx[mask] = c
+        # Optional batching over samples to reduce peak temporaries inside distance computation
+        bs = int(batch_size) if (batch_size is not None and int(batch_size) > 0) else None
+
+        for c, AE_ref in enumerate(AE_arr):
+            AE_c, from_disk = _load_ae_maybe(AE_ref)
+
+            try:
+                if bs is None:
+                    d = combine_multiple_autoencoders_extended(
+                        X_new, _ae_as_list(AE_c), distance_type
+                    )
+                    d = np.asarray(d, dtype=np.float64).reshape(-1)
+                    if d.size != N_new:
+                        raise ValueError(
+                            f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
+                        )
+                    mask = d < best_dist
+                    best_dist[mask] = d[mask]
+                    best_idx[mask] = c
+                else:
+                    for start in range(0, N_new, bs):
+                        end = min(start + bs, N_new)
+                        X_batch = X_new[:, start:end]
+                        d = combine_multiple_autoencoders_extended(
+                            X_batch, _ae_as_list(AE_c), distance_type
+                        )
+                        d = np.asarray(d, dtype=np.float64).reshape(-1)
+                        if d.size != (end - start):
+                            raise ValueError(
+                                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({end-start},)."
+                            )
+                        sl = slice(start, end)
+                        mask = d < best_dist[sl]
+                        # assign only where improved
+                        best_dist[sl][mask] = d[mask]
+                        best_idx[sl][mask] = c
+            finally:
+                if from_disk:
+                    del AE_c
+                    _gc.collect()
 
         Y_pred = cluster_centers[:, best_idx]
 
         if return_probabilities:
-            # One-hot probabilities for hard assignments.
             P_hard = np.zeros((C_eff, N_new), dtype=out_dtype)
             P_hard[best_idx, np.arange(N_new)] = 1.0
             return Y_pred, P_hard
 
         return Y_pred
 
+    # -----------------------
+    # SOFT MODE
+    # -----------------------
     if mode != "soft":
         raise ValueError("mode must be either 'hard' or 'soft'.")
 
     alpha_resolved, topk_resolved = _get_soft_params_from_model(model, alpha, topk)
 
-    # Batching for memory safety
+    # Soft mode with batching:
+    # If AEs are on disk, do NOT do (batch -> cluster) because it would reload AEs for every batch.
+    # Instead:
+    #   1) build full D on disk (memmap), loading each AE once
+    #   2) compute Y_pred in batches by slicing the memmap
     if batch_size is not None and int(batch_size) > 0:
-        bs = int(batch_size)
-        Y_pred = np.empty((cluster_centers.shape[0], N_new), dtype=out_dtype)
-
-        for start in range(0, N_new, bs):
-            end = min(start + bs, N_new)
-            X_batch = X_new[:, start:end]
-            N_b = int(X_batch.shape[1])
-
-            # Build distance matrix for the batch: (C_eff, N_b)
-            D_batch = np.empty((C_eff, N_b), dtype=np.float64)
-            for c, AE_c in enumerate(AE_arr):
-                d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
-                d = np.asarray(d).reshape(-1)
-                if d.size != N_b:
-                    raise ValueError(
-                        f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_b},)."
-                    )
-                D_batch[c, :] = d
-
-            D_batch = _ensure_distance_matrix_shape(_as_float_ndarray(D_batch), C_eff, N_b, labels=None)
-            P_batch = distances_to_probabilities_one_minus_sharp(D_batch, alpha=alpha_resolved, topk=topk_resolved, inplace=True)
-            Y_pred[:, start:end] = cluster_centers @ P_batch
-
         if return_probabilities:
             raise ValueError("return_probabilities=True is not supported when batch_size is set.")
-        return Y_pred
 
-    # Non-batched (returns full P if requested)
+        bs = int(batch_size)
+
+        # Create on-disk distance matrix
+        tmp = tempfile.NamedTemporaryFile(prefix="kahm_D_", suffix=".dat", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        D_mm = None
+        try:
+            # Store as float32 on disk to reduce I/O and disk usage.
+            D_mm = np.memmap(tmp_path, mode="w+", dtype=np.float32, shape=(C_eff, N_new))
+
+            # Fill D_mm by iterating over clusters (load each AE once)
+            for c, AE_ref in enumerate(AE_arr):
+                AE_c, from_disk = _load_ae_maybe(AE_ref)
+                try:
+                    for start in range(0, N_new, bs):
+                        end = min(start + bs, N_new)
+                        X_batch = X_new[:, start:end]
+                        d = combine_multiple_autoencoders_extended(
+                            X_batch, _ae_as_list(AE_c), distance_type
+                        )
+                        d = np.asarray(d, dtype=np.float32).reshape(-1)
+                        if d.size != (end - start):
+                            raise ValueError(
+                                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({end-start},)."
+                            )
+                        D_mm[c, start:end] = d
+                finally:
+                    if from_disk:
+                        del AE_c
+                        _gc.collect()
+
+            D_mm.flush()
+
+            # Compute predictions in batches from memmap slices
+            Y_pred = np.empty((cluster_centers.shape[0], N_new), dtype=out_dtype)
+
+            for start in range(0, N_new, bs):
+                end = min(start + bs, N_new)
+                N_b = end - start
+
+                # Bring one slice into RAM for probability conversion
+                D_batch = np.asarray(D_mm[:, start:end], dtype=np.float64)
+                D_batch = _ensure_distance_matrix_shape(
+                    _as_float_ndarray(D_batch), C_eff, N_b, labels=None
+                )
+                P_batch = distances_to_probabilities_one_minus_sharp(
+                    D_batch, alpha=alpha_resolved, topk=topk_resolved, inplace=True
+                )
+                Y_pred[:, start:end] = cluster_centers @ P_batch
+
+            return Y_pred
+
+        finally:
+            # Ensure memmap is closed and temp file removed
+            try:
+                if D_mm is not None:
+                    del D_mm
+            except Exception:
+                pass
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    # Soft mode without batching: build D in RAM (loads one AE at a time)
     D = np.empty((C_eff, N_new), dtype=np.float64)
-    for c, AE_c in enumerate(AE_arr):
-        d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
-        d = np.asarray(d).reshape(-1)
-        if d.size != N_new:
-            raise ValueError(
-                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
-            )
-        D[c, :] = d
+    for c, AE_ref in enumerate(AE_arr):
+        AE_c, from_disk = _load_ae_maybe(AE_ref)
+        try:
+            d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
+            d = np.asarray(d, dtype=np.float64).reshape(-1)
+            if d.size != N_new:
+                raise ValueError(
+                    f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
+                )
+            D[c, :] = d
+        finally:
+            if from_disk:
+                del AE_c
+                _gc.collect()
 
     D = _ensure_distance_matrix_shape(_as_float_ndarray(D), C_eff, N_new, labels=None)
-    P = distances_to_probabilities_one_minus_sharp(D, alpha=alpha_resolved, topk=topk_resolved, inplace=True)
+    P = distances_to_probabilities_one_minus_sharp(
+        D, alpha=alpha_resolved, topk=topk_resolved, inplace=True
+    )
     Y_pred = cluster_centers @ P
 
     if return_probabilities:
         return Y_pred, P
     return Y_pred
+
 
 # ----------------------------
 # Autotuning
@@ -806,25 +927,100 @@ def tune_soft_params(
     X_val: np.ndarray,
     Y_val: np.ndarray,
     *,
-    alphas: Sequence[float] = (5.0, 10.0, 15.0, 20.0),
-    topks: Sequence[int | None] = (5, 10, 15, 20),
+    alphas: "Sequence[float]" = (5.0, 10.0, 15.0, 20.0),
+    topks: "Sequence[int | None]" = (5, 10, 15, 20),
     n_jobs: int = -1,
     verbose: bool = True,
-) -> SoftTuningResult:
+) -> "SoftTuningResult":
     """
     Tune (alpha, topk) on a validation set and store the best choice in `model`.
 
-    Notes
-    -----
-    - Computes the full distance matrix once for X_val and reuses it for all grid points.
-    - Objective: minimize mean squared error (MSE) over all output dimensions and samples.
+    Works with model['classifier'] as:
+      - list/tuple of in-memory AEs (legacy), OR
+      - list/tuple of joblib paths, OR
+      - 1D numpy object array of either, OR
+      - a directory path containing *.joblib AE files (recursively).
+
+    Also supports alternative keys if 'classifier' is missing/empty:
+      'clf', 'classifier_paths', 'ae_paths', 'classifier_dir', 'ae_dir'.
+
+    Memory safety:
+      - Builds D_val once (C_eff, N_val); uses float32 memmap on disk when large.
+      - Evaluates each (alpha, topk) in validation batches to avoid allocating
+        a full (C_eff, N_val) probability matrix in RAM.
     """
+
+
+    # ----------------------------
+    # Helpers
+    # ----------------------------
+
+
+
+    def _normalize_classifier_to_list(clf_raw):
+        """
+        Normalize to a concrete Python list of either:
+          - in-memory AE objects, or
+          - file paths to joblib files holding AE objects.
+        If clf_raw is a directory, collect *.joblib recursively.
+        """
+        if clf_raw is None:
+            return []
+
+        # Directory path: collect joblib files
+        if _is_pathlike(clf_raw) and os.path.isdir(clf_raw):
+            p = Path(clf_raw)
+            files = sorted(p.rglob("*.joblib"))
+            return [str(f) for f in files]
+
+        # 1D numpy object array -> list
+        if isinstance(clf_raw, np.ndarray):
+            if clf_raw.ndim != 1:
+                raise TypeError("model classifier is a numpy array but not 1D; expected 1D object array.")
+            return clf_raw.tolist()
+
+        # list/tuple
+        if isinstance(clf_raw, (list, tuple)):
+            return list(clf_raw)
+
+        # dict (rare): treat as unsupported; do NOT iterate keys silently
+        if isinstance(clf_raw, dict):
+            raise TypeError(
+                "model classifier is a dict; expected list/tuple/1D array of AEs or paths, "
+                "or a directory path."
+            )
+
+        # Try generic iterable
+        try:
+            return list(clf_raw)
+        except TypeError:
+            return []
+
+    def _resolve_classifier(model_dict: dict):
+        """
+        Resolve classifier from multiple potential keys and normalize to list.
+        Returns (AE_arr, source_key, raw_value).
+        """
+        keys = ("classifier", "clf", "classifier_paths", "ae_paths", "classifier_dir", "ae_dir")
+        for k in keys:
+            if k in model_dict and model_dict[k] is not None:
+                raw = model_dict[k]
+                arr = _normalize_classifier_to_list(raw)
+                if len(arr) > 0:
+                    return arr, k, raw
+        # If 'classifier' exists but empty, preserve for diagnostics
+        raw = model_dict.get("classifier", None)
+        arr = _normalize_classifier_to_list(raw) if raw is not None else []
+        return arr, None, raw
+
+    # ----------------------------
+    # Validate inputs
+    # ----------------------------
     X_val = _as_float_ndarray(X_val)
     Y_val = _as_float_ndarray(Y_val)
 
     if X_val.ndim != 2 or Y_val.ndim != 2:
         raise ValueError("X_val and Y_val must be 2D shaped (D, N).")
-
     if X_val.shape[1] != Y_val.shape[1]:
         raise ValueError("X_val and Y_val must have the same number of samples (columns).")
 
@@ -832,37 +1028,31 @@ def tune_soft_params(
     input_scale = float(model.get("input_scale", 1.0))
     Xv = _scale_like(X_val, float(input_scale), inplace=False) if input_scale != 1.0 else X_val
 
-    clf = model["classifier"]
-    cluster_centers = _as_float_ndarray(model["cluster_centers"])
-    C_eff = cluster_centers.shape[1]
-    N_val = Xv.shape[1]
+    AE_arr, source_key, raw_classifier = _resolve_classifier(model)
 
-    # This variant expects per-cluster autoencoders in model['classifier'].
-    AE_arr = clf
-    if not isinstance(AE_arr, (list, tuple)) or len(AE_arr) == 0:
+    if len(AE_arr) == 0:
         raise TypeError(
-            "This kahm_regression variant expects model['classifier'] to be a non-empty list of "
-            "per-cluster autoencoders."
+            "Could not resolve model autoencoders. "
+            "Expected model['classifier'] (or one of: 'clf','classifier_paths','ae_paths','classifier_dir','ae_dir') "
+            "to be a non-empty list/tuple/1D array of AEs or AE joblib paths, or a directory containing *.joblib.\n"
+            f"Found classifier key source={source_key!r}, type={type(raw_classifier).__name__}, value={_short_repr(raw_classifier)}\n"
+            f"Model keys available: {sorted(list(model.keys()))}"
         )
+
+    cluster_centers = _as_float_ndarray(model["cluster_centers"])  # (D_out, C_eff)
+    if str(model.get("cluster_centers_normalization", "none")).lower().strip() == "l2":
+        cluster_centers = l2_normalize_columns(cluster_centers)
+
+    C_eff = int(cluster_centers.shape[1])
+    N_val = int(Xv.shape[1])
+
     if len(AE_arr) != C_eff:
         raise ValueError(
-            f"Mismatch: got {len(AE_arr)} autoencoders but cluster_centers has C_eff={C_eff} clusters."
+            f"Mismatch: resolved {len(AE_arr)} autoencoders but cluster_centers has C_eff={C_eff} clusters. "
+            f"(resolved from key={source_key!r})"
         )
 
-    # Compute full distance matrix once for X_val and reuse it for all grid points.
-    D_val = np.empty((C_eff, N_val), dtype=np.float64)
-    for c, AE_c in enumerate(AE_arr):
-        d = combine_multiple_autoencoders_extended(Xv, _ae_as_list(AE_c), "folding")
-        d = np.asarray(d).reshape(-1)
-        if d.size != N_val:
-            raise ValueError(
-                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_val},)."
-            )
-        D_val[c, :] = d
-
-    D_val = _ensure_distance_matrix_shape(_as_float_ndarray(D_val), C_eff, N_val, labels=None)
-
-    # Materialize sequences to allow validation and stable repr in verbose output
+    # Materialize sequences
     alphas = tuple(alphas)
     topks = tuple(topks)
     if len(alphas) == 0:
@@ -870,66 +1060,148 @@ def tune_soft_params(
     if len(topks) == 0:
         raise ValueError("topks must contain at least one value.")
 
-    best_mse = float("inf")
-    best_alpha: float = float(alphas[0])
-    best_topk: int | None = topks[0]
-
     if verbose:
         print("Tuning soft parameters on validation set...")
+        print(f"Resolved classifier from key={source_key!r} with {len(AE_arr)} entries.")
         print(f"Grid: alphas={list(alphas)}, topks={list(topks)}")
         print(f"Validation samples: {N_val}, clusters: {C_eff}")
 
-    # Reusable probability buffer (one full C_eff x N_val matrix)
-    work = np.empty_like(D_val, dtype=D_val.dtype)
-    dtype = work.dtype
-    one = dtype.type(1.0)
-    zero = dtype.type(0.0)
-    eps_t = dtype.type(1e-12)
+    # ----------------------------
+    # 1) Compute D_val once
+    # ----------------------------
+    D_bytes_float64 = int(C_eff) * int(N_val) * 8
+    use_memmap = D_bytes_float64 >= 512 * 1024 * 1024  # >= 512MB if float64 in RAM
 
-    for a in alphas:
-        a_f = float(a)
-        for k in topks:
-            # work = (1 - D_val) ** alpha
-            np.subtract(one, D_val, out=work)
-            np.clip(work, zero, one, out=work)
-            if a_f != 1.0:
-                np.power(work, dtype.type(a_f), out=work)
+    tmp_path = None
+    D_val = None  # ndarray(float64) or memmap(float32)
 
-            if k is not None:
-                kk = int(k)
-                if 0 < kk < C_eff:
-                    _topk_truncate_inplace(work, kk)
-
-            denom = work.sum(axis=0, dtype=dtype)
-            zero_cols = denom <= eps_t
-            if np.any(zero_cols):
-                denom = denom.copy()
-                denom[zero_cols] = one
-
-            np.divide(work, denom, out=work)
-
-            if np.any(zero_cols):
-                work[:, zero_cols] = dtype.type(1.0 / C_eff)
-
-            Y_hat = cluster_centers @ work
-            mse = float(np.mean((Y_hat - Y_val) ** 2))
-
+    try:
+        if use_memmap:
+            tmp = tempfile.NamedTemporaryFile(prefix="kahm_Dval_", suffix=".dat", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            D_val = np.memmap(tmp_path, mode="w+", dtype=np.float32, shape=(C_eff, N_val))
             if verbose:
-                print(f"  alpha={a_f:g}, topk={k}: MSE={mse:.6f}")
+                size_mb = (C_eff * N_val * 4) / (1024 * 1024)
+                print(f"Distance matrix stored on disk (memmap float32): ~{size_mb:.1f} MB")
+        else:
+            D_val = np.empty((C_eff, N_val), dtype=np.float64)
 
-            if mse < best_mse:
-                best_mse = mse
-                best_alpha = a_f
-                best_topk = k
+        for c, AE_ref in enumerate(AE_arr):
+            AE_c, from_disk = _load_ae_maybe(AE_ref)
+            try:
+                d = combine_multiple_autoencoders_extended(Xv, _ae_as_list(AE_c), "folding")
+                d = np.asarray(d, dtype=(np.float32 if use_memmap else np.float64)).reshape(-1)
+                if d.size != N_val:
+                    raise ValueError(
+                        f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_val},)."
+                    )
+                D_val[c, :] = d
+            finally:
+                if from_disk:
+                    del AE_c
+                    _gc.collect()
 
-    # Persist into model for later inference defaults
-    model["soft_alpha"] = best_alpha
-    model["soft_topk"] = best_topk
+        if use_memmap:
+            if isinstance(D_val, np.memmap):
+                D_val.flush()
+        else:
+            D_val = _ensure_distance_matrix_shape(_as_float_ndarray(D_val), C_eff, N_val, labels=None)
 
-    if verbose:
-        print(f"Best soft params: alpha={best_alpha}, topk={best_topk}, val MSE={best_mse:.6f}")
+        # ----------------------------
+        # 2) Grid search in validation batches
+        # ----------------------------
+        target_bytes = 256 * 1024 * 1024  # ~256MB work buffer
+        bs = max(16, min(N_val, int(target_bytes // (8 * max(C_eff, 1)))))
+        if verbose:
+            print(f"Using validation batch_size={bs} (auto).")
 
-    return SoftTuningResult(best_alpha=best_alpha, best_topk=best_topk, best_mse=best_mse)
+        best_mse = float("inf")
+        best_alpha: float = float(alphas[0])
+        best_topk: int | None = topks[0]
+
+        work = np.empty((C_eff, bs), dtype=np.float64)
+        dtype = work.dtype
+        one = dtype.type(1.0)
+        zero = dtype.type(0.0)
+        eps_t = dtype.type(1e-12)
+
+        D_out = int(cluster_centers.shape[0])
+        denom_total = float(D_out * N_val)
+
+        for a in alphas:
+            a_f = float(a)
+            for k in topks:
+                sse = 0.0
+
+                for start in range(0, N_val, bs):
+                    end = min(start + bs, N_val)
+                    nb = end - start
+
+                    if use_memmap:
+                        work[:, :nb] = np.asarray(D_val[:, start:end], dtype=np.float64)
+                    else:
+                        work[:, :nb] = D_val[:, start:end]
+
+                    W = work[:, :nb]
+
+                    # W = (1 - D)**alpha with clipping
+                    np.subtract(one, W, out=W)
+                    np.clip(W, zero, one, out=W)
+                    if a_f != 1.0:
+                        np.power(W, dtype.type(a_f), out=W)
+
+                    if k is not None:
+                        kk = int(k)
+                        if 0 < kk < C_eff:
+                            _topk_truncate_inplace(W, kk)
+
+                    denom = W.sum(axis=0, dtype=dtype)
+                    zero_cols = denom <= eps_t
+                    if np.any(zero_cols):
+                        denom = denom.copy()
+                        denom[zero_cols] = one
+
+                    np.divide(W, denom, out=W)
+                    if np.any(zero_cols):
+                        W[:, zero_cols] = dtype.type(1.0 / C_eff)
+
+                    Y_hat = cluster_centers @ W
+                    err = Y_hat - Y_val[:, start:end]
+                    sse += float(np.sum(err * err))
+
+                mse = sse / denom_total
+
+                if verbose:
+                    print(f"  alpha={a_f:g}, topk={k}: MSE={mse:.6f}")
+
+                if mse < best_mse:
+                    best_mse = mse
+                    best_alpha = a_f
+                    best_topk = k
+
+        model["soft_alpha"] = best_alpha
+        model["soft_topk"] = best_topk
+
+        if verbose:
+            print(f"Best soft params: alpha={best_alpha}, topk={best_topk}, val MSE={best_mse:.6f}")
+
+        return SoftTuningResult(best_alpha=best_alpha, best_topk=best_topk, best_mse=best_mse)
+
+    finally:
+        try:
+            if use_memmap and D_val is not None:
+                del D_val
+        except Exception:
+            pass
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+
 
 
 # ----------------------------
@@ -984,7 +1256,7 @@ if __name__ == "__main__":
         Y_train,
         n_clusters=1000,
         subspace_dim=20,
-        Nb=50,
+        Nb=100,
         random_state=0,
         verbose=False,
         input_scale=0.5,
@@ -996,8 +1268,8 @@ if __name__ == "__main__":
         model,
         X_val,
         Y_val,
-        alphas=(5.0, 10.0, 15.0, 20.0),
-        topks=(5, 10, 15, 20),
+        alphas=(2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 18.0, 20.0, 25.0, 50.0),
+        topks=(2, 5, 10, 11, 12, 13, 14, 15, 20, 25, 50),
         n_jobs=-1,
         verbose=True,
     )
@@ -1006,7 +1278,7 @@ if __name__ == "__main__":
     loaded_model = load_kahm_regressor(MODEL_PATH)
 
     # Hard prediction
-    Y_pred_hard = kahm_regress(loaded_model, X_test, mode="hard")
+    Y_pred_hard = kahm_regress(loaded_model, X_test, mode="hard",batch_size=64)
 
     # Soft prediction: uses stored (soft_alpha, soft_topk) automatically
     Y_pred_soft, P = kahm_regress(loaded_model, X_test, mode="soft", return_probabilities=True)
