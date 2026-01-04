@@ -85,7 +85,7 @@ class AdaptiveTruncatedSVD(BaseEstimator, TransformerMixin):
 
     def __init__(
         self,
-        n_components: int = 768,
+        n_components: int = 1024,
         *,
         n_iter: int = 20,
         random_state: int = 42,

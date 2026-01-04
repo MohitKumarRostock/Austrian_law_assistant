@@ -46,6 +46,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -54,6 +55,7 @@ try:
     # Prefer the memory-optimized implementation if present.
     from kahm_regression import (
         kahm_regress,
+        preload_kahm_classifier,
         save_kahm_regressor,
         train_kahm_regressor,
         tune_soft_params,
@@ -61,6 +63,7 @@ try:
 except ImportError:  # pragma: no cover
     # Fallback to the baseline implementation.
     from kahm_regression import kahm_regress, save_kahm_regressor, train_kahm_regressor, tune_soft_params
+    preload_kahm_classifier = None  # type: ignore
 
 
 
@@ -93,6 +96,12 @@ DEFAULT_SEMANTIC_NPZ = "embedding_index.npz"
 DEFAULT_IDF_SVD_MODEL = "idf_svd_model.joblib"
 DEFAULT_OUT = "kahm_regressor_idf_to_mixedbread.joblib"
 
+# Autoencoder storage (disk-backed classifier)
+DEFAULT_AE_CACHE_ROOT = "kahm_ae_cache"
+DEFAULT_AE_DIR = None
+DEFAULT_OVERWRITE_AE_DIR = False
+DEFAULT_MODEL_ID = None
+
 DEFAULT_INCLUDE_QUERIES = True
 DEFAULT_QUERIES_NPZ = "queries_embedding_index.npz"
 
@@ -111,7 +120,11 @@ DEFAULT_MODEL_DTYPE = "float32"
 DEFAULT_CLUSTER_CENTER_NORMALIZATION = "none"  # none|l2|auto_l2
 
 # Soft-mode memory controls
-DEFAULT_SOFT_BATCH_SIZE = 2048
+DEFAULT_SOFT_BATCH_SIZE = 1024
+
+# AE persistence / collision-avoidance defaults
+DEFAULT_AE_CACHE_ROOT = "kahm_ae_cache"
+DEFAULT_OVERWRITE_AE_DIR = False
 
 # Soft-mode tuning defaults
 DEFAULT_EVAL_SOFT = True
@@ -478,6 +491,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--idf_svd_model", default=DEFAULT_IDF_SVD_MODEL, help="Path to idf_svd_model.joblib (required if --include_queries)")
     p.add_argument("--out", default=DEFAULT_OUT, help="Output path for saved KAHM regressor joblib")
 
+    # AE persistence / collision avoidance
+    p.add_argument(
+        "--model_id",
+        default=None,
+        help=(
+            "Identifier used to create a unique autoencoder directory under --ae_cache_root. "
+            "If omitted, defaults to the stem of --out."
+        ),
+    )
+    p.add_argument(
+        "--ae_cache_root",
+        default=DEFAULT_AE_CACHE_ROOT,
+        help=f"Root directory for saved per-cluster autoencoders (default: {DEFAULT_AE_CACHE_ROOT})",
+    )
+    p.add_argument(
+        "--ae_dir",
+        default=None,
+        help=(
+            "Explicit directory to save per-cluster autoencoders. If set, overrides --ae_cache_root/--model_id. "
+            "Use with care to avoid collisions."
+        ),
+    )
+    p.add_argument(
+        "--overwrite_ae_dir",
+        action="store_true",
+        default=DEFAULT_OVERWRITE_AE_DIR,
+        help="Allow overwriting existing *.joblib files in --ae_dir (default: no)",
+    )
+
+    p.add_argument(
+        "--preload_eval_classifier",
+        action="store_true",
+        default=False,
+        help="Preload all autoencoders into RAM before evaluation (faster but may use a lot of memory).",
+    )
+
     p.add_argument("--include_queries", action="store_true", default=DEFAULT_INCLUDE_QUERIES, help="Include QUERY_SET as additional training samples")
     p.add_argument(
         "--queries_npz",
@@ -728,6 +777,11 @@ def main() -> int:
 
     # Train KAHM regressor
     print("\nTraining KAHM regressor (IDF–SVD → Mixedbread, L2-normalized spaces) ...")
+
+    # Ensure AE cache isolation: by default create a unique directory under --ae_cache_root
+    # derived from --model_id or the output filename stem.
+    run_model_id = str(args.model_id) if args.model_id else Path(str(args.out)).stem
+
     with ctx:
         model = train_kahm_regressor(
             X=X_train,
@@ -742,8 +796,19 @@ def main() -> int:
             kmeans_batch_size=int(args.kmeans_batch_size),
             max_train_per_cluster=(None if args.max_train_per_cluster is None else int(args.max_train_per_cluster)),
             model_dtype=str(args.model_dtype),
-            cluster_center_normalization=str(args.cluster_center_normalization)
+            cluster_center_normalization=str(args.cluster_center_normalization),
+            # Disk-backed classifier + collision avoidance (kahm_regression.py v4)
+            save_ae_to_disk=True,
+            ae_cache_root=str(args.ae_cache_root),
+            ae_dir=(None if args.ae_dir is None else str(args.ae_dir)),
+            overwrite_ae_dir=bool(args.overwrite_ae_dir),
+            model_id=run_model_id,
         )
+
+    try:
+        print(f"Trained classifier_dir: {model.get('classifier_dir')} | model_id={model.get('model_id')}")
+    except Exception:
+        pass
 
     if args.blocksafe and _BLOCKSAFE_STATS is not None:
         try:
@@ -773,6 +838,16 @@ def main() -> int:
 
     # Evaluate on validation (if present) or test (fallback)
     print(f"\nEvaluating on {eval_name} set (sentences only) ...")
+
+    # Optional: preload classifier into RAM once (speeds up repeated kahm_regress calls).
+    # Use only if you have sufficient RAM; otherwise leave disabled.
+    if bool(args.preload_eval_classifier) and preload_kahm_classifier is not None:
+        try:
+            print("Preloading per-cluster autoencoders into RAM for evaluation ...")
+            preload_kahm_classifier(model, n_jobs=min(8, (os.cpu_count() or 1)))
+        except Exception as exc:
+            print("WARNING: preload_kahm_classifier failed (continuing without preload).")
+            print(f"  Reason: {type(exc).__name__}: {exc}")
     Y_pred_hard = kahm_regress(model, X_eval, mode="hard")
     metrics_hard = compute_embedding_metrics(Y_pred_hard, Y_eval)
 
