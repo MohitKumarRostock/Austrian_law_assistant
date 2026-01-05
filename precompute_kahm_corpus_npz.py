@@ -42,7 +42,7 @@ DEFAULT_IDF_SVD_NPZ = "embedding_index_idf_svd.npz"
 DEFAULT_KAHM_MODEL = "kahm_regressor_idf_to_mixedbread.joblib"
 DEFAULT_OUT_NPZ = "embedding_index_kahm_mixedbread_approx.npz"
 DEFAULT_KAHM_MODE = "soft"
-DEFAULT_BATCH = 2048
+DEFAULT_BATCH = 1024
 
 
 def l2_normalize_rows(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -200,11 +200,21 @@ def main() -> int:
     )
 
     print(f"Saving precomputed KAHM corpus NPZ: {args.out_npz}")
+    # NOTE: Expanded '**out_meta' can confuse static type checkers (e.g., Pylance) because
+    # it cannot prove that 'allow_pickle' is not a key. We therefore pass meta fields explicitly.
     np.savez_compressed(
         args.out_npz,
         sentence_id=ids.astype(np.int64, copy=False),
         embeddings=Yn.astype(np.float32, copy=False),
-        **out_meta,
+        created_at_utc=np.asarray(created_at),
+        source_idf_svd_npz=np.asarray(os.path.basename(args.idf_svd_npz)),
+        source_idf_svd_fingerprint_sha256=np.asarray((fp_x or '')),
+        source_kahm_model=np.asarray(os.path.basename(args.kahm_model)),
+        kahm_mode=np.asarray(str(args.kahm_mode)),
+        n_sentences=np.asarray(int(ids.shape[0])),
+        d_in=np.asarray(int(X.shape[1])),
+        d_out=np.asarray(int(Yn.shape[1])),
+        note=np.asarray('KAHM-regressed approximate Mixedbread embeddings from IDF–SVD; L2-normalized for cosine/IP FAISS.'),
     )
     print("Done.")
     return 0

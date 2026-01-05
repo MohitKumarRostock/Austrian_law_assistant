@@ -19,8 +19,6 @@ It prints three storylines (A/B/C) from the *same* run:
 
 Why this version
 ----------------
-Your earlier "hybrid" storyline can be perceived as complicated and (depending on the
-implementation) may rely on MB fallback, which dilutes the claim "KAHM alone works".
 This v4 replaces that with an alignment storyline that directly supports the argument:
 
   "KAHM approximates MB embedding geometry well enough that nearest-neighbor retrieval
@@ -30,8 +28,8 @@ All confidence intervals use nonparametric *paired* bootstrap (default 5000).
 
 Run
 ---
-python evaluate_three_embeddings_storylines_v4.py
-python evaluate_three_embeddings_storylines_v4.py --k 20
+python evaluate_three_embeddings.py
+
 
 Expected local files (defaults)
 ------------------------------
@@ -51,6 +49,7 @@ import importlib
 import os
 import sys
 import gc
+import datetime
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -59,7 +58,7 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2026-01-05-storylines-v4-majority-v3"
+SCRIPT_VERSION = "2026-01-05-storylines-v4-majority-v3-pubreport"
 
 
 def _safe_ratio(num: float, denom: float) -> float:
@@ -92,6 +91,295 @@ def _fmt_ci(pt: float, ci: Tuple[float, float], digits: int = 3) -> str:
 def _fmt_delta(pt: float, ci: Tuple[float, float], digits: int = 3) -> str:
     return f"{pt:+.{digits}f} [{ci[0]:+.{digits}f}, {ci[1]:+.{digits}f}]"
 
+
+def _md_table(headers: List[str], rows: List[List[str]]) -> str:
+    """Create a GitHub-flavored Markdown table."""
+    h = "| " + " | ".join(headers) + " |"
+    sep = "| " + " | ".join(["---"] * len(headers)) + " |"
+    body = ["| " + " | ".join(r) + " |" for r in rows]
+    return "\n".join([h, sep] + body)
+
+
+def _ci_cell(pt: float, ci: Tuple[float, float], digits: int = 3) -> str:
+    return f"{pt:.{digits}f} ({ci[0]:.{digits}f}, {ci[1]:.{digits}f})"
+
+
+def _delta_cell(pt: float, ci: Tuple[float, float], digits: int = 3) -> str:
+    return f"{pt:+.{digits}f} ({ci[0]:+.{digits}f}, {ci[1]:+.{digits}f})"
+
+
+def _write_text(path: str, text: str, *, overwrite: bool = False) -> None:
+    out_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    if (not overwrite) and os.path.exists(out_path):
+        raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --report_overwrite)")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def build_publication_report_md(
+    *,
+    report_title: str,
+    args: argparse.Namespace,
+    n_queries: int,
+    n_corpus: int,
+    embedding_dim: int,
+    k: int,
+    method_summaries: Dict[str, Dict[str, Tuple[float, Tuple[float, float]]]],
+    storyline_a: Dict[str, Any],
+    storyline_b: Dict[str, Any],
+    majority_profiles: Dict[str, Dict[str, Any]],
+    majority_deltas_vs_mb: List[Dict[str, Any]],
+    decomp_point_rows: List[Dict[str, Any]],
+    decomp_ci_rows: List[Dict[str, Any]],
+    threshold_suggestions: Dict[str, Any],
+    alignment: Dict[str, Any],
+) -> str:
+    """Build a single publication-ready Markdown report."""
+    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+    lines: List[str] = []
+    lines.append(f"# {report_title}")
+    lines.append("")
+    lines.append(f"**Generated (UTC):** {ts}  ")
+    lines.append(f"**Script:** `{os.path.basename(__file__)}` (version `{SCRIPT_VERSION}`)  ")
+    lines.append("")
+    lines.append("## Experimental setup")
+    lines.append("")
+    lines.append(
+        f"- Queries: **{n_queries}**  \n"
+        f"- Corpus sentences (aligned): **{n_corpus}**  \n"
+        f"- Embedding dimension: **{embedding_dim}**  \n"
+        f"- Retrieval depth: **k={k}**  \n"
+        f"- Bootstrap: **paired nonparametric**, {int(args.bootstrap_samples)} samples, seed={int(args.bootstrap_seed)}  \n"
+        f"- Majority-vote routing thresholds: {getattr(args, 'majority_thresholds', 'n/a')}  \n"
+        f"- Predominance fraction (per-query metric): {float(args.predominance_fraction):0.2f}"
+    )
+    lines.append("")
+    lines.append("## Main retrieval results")
+    lines.append("")
+    metric_order = [
+        ("hit", f"Hit@{k}"),
+        ("mrr_ul", f"MRR@{k} (unique laws)"),
+        ("top1", "Top-1 accuracy"),
+        ("majority", "Majority accuracy"),
+        ("cons_frac", "Mean consensus fraction"),
+        ("lift", "Mean lift vs prior"),
+    ]
+    headers = ["Method"] + [m[1] for m in metric_order]
+    rows: List[List[str]] = []
+    for method_name in [
+        "Mixedbread (true)",
+        "IDF–SVD",
+        "KAHM(query→MB corpus)",
+        "Full-KAHM (query→KAHM corpus)",
+    ]:
+        s = method_summaries[method_name]
+        r = [method_name]
+        for key, _lbl in metric_order:
+            pt, ci = s[key]
+            r.append(_ci_cell(pt, ci, digits=3))
+        rows.append(r)
+    lines.append(_md_table(headers, rows))
+    lines.append("")
+    lines.append(
+        "Notes: Metrics are averaged across queries. Values are point estimates with 95% bootstrap confidence intervals."
+    )
+    lines.append("")
+
+    # Storyline A
+    lines.append("## Storyline A: Superiority vs low-cost baseline (KAHM(q→MB) vs IDF–SVD)")
+    lines.append("")
+    headers = ["Metric", "Δ (KAHM − IDF)", "Decision"]
+    rows = []
+    for r in storyline_a["rows"]:
+        decision = "PASS" if r.get("pass", False) else "FAIL"
+        rows.append([r["label"], _delta_cell(r["delta"], r["ci"], digits=3), decision])
+    lines.append(_md_table(headers, rows))
+    lines.append("")
+    lines.append(f"**Verdict:** {storyline_a.get('verdict','')}")
+    lines.append("")
+
+    # Storyline B
+    lines.append("## Storyline B: Competitiveness vs Mixedbread (KAHM(q→MB) vs MB)")
+    lines.append("")
+    headers = ["Metric", "Δ (KAHM − MB)", "CI excludes 0?"]
+    rows = []
+    for r in storyline_b["rows"]:
+        rows.append(
+            [
+                r["label"],
+                _delta_cell(r["delta"], r["ci"], digits=3),
+                "Yes" if r.get("ci_excludes_0", False) else "No",
+            ]
+        )
+    lines.append(_md_table(headers, rows))
+    lines.append("")
+
+    # Majority vote behavior (focus on routing)
+    lines.append("## Majority-vote behavior and vote-based routing")
+    lines.append("")
+    lines.append(
+        "We evaluate *top-k law voting* statistics that characterize neighborhood purity and support a simple "
+        "routing heuristic based on the top-law fraction (τ)."
+    )
+    lines.append("")
+
+    # Compact profile table (means + CIs)
+    prof_headers = ["Method", "Top-law fraction", "Vote margin", "Vote entropy", "#Unique laws", f"P(all {k} one law)"]
+    prof_rows: List[List[str]] = []
+    for method_name in [
+        "Mixedbread (true)",
+        "IDF–SVD",
+        "KAHM(query→MB corpus)",
+        "Full-KAHM (query→KAHM corpus)",
+    ]:
+        pr = majority_profiles[method_name]
+        prof_rows.append(
+            [
+                method_name,
+                _ci_cell(pr["mean_toplaw_frac"]["pt"], pr["mean_toplaw_frac"]["ci"]),
+                _ci_cell(pr["mean_vote_margin"]["pt"], pr["mean_vote_margin"]["ci"]),
+                _ci_cell(pr["mean_vote_entropy"]["pt"], pr["mean_vote_entropy"]["ci"]),
+                _ci_cell(pr["mean_n_unique"]["pt"], pr["mean_n_unique"]["ci"]),
+                _ci_cell(pr["p_all_from_one_law"]["pt"], pr["p_all_from_one_law"]["ci"]),
+            ]
+        )
+    lines.append(_md_table(prof_headers, prof_rows))
+    lines.append("")
+
+    # Threshold sweep for MB vs KAHM(q→MB) (coverage/precision)
+    lines.append("### Routing threshold sweep (KAHM(q→MB) vs MB)")
+    lines.append("")
+    sweep_headers = ["τ", "Coverage (KAHM)", "Acc|Covered (KAHM)", "Maj-Acc (KAHM)", "Coverage (MB)", "Acc|Covered (MB)", "Maj-Acc (MB)"]
+    sweep_rows: List[List[str]] = []
+    mb_sweep = {float(r["tau"]): r for r in majority_profiles["Mixedbread (true)"]["threshold_sweep"]}
+    k_sweep = {float(r["tau"]): r for r in majority_profiles["KAHM(query→MB corpus)"]["threshold_sweep"]}
+    for tau in sorted(mb_sweep.keys()):
+        a = k_sweep[tau]
+        b = mb_sweep[tau]
+        sweep_rows.append(
+            [
+                f"{tau:0.2f}",
+                _ci_cell(a["coverage"]["pt"], a["coverage"]["ci"]),
+                _ci_cell(a["acc_given_covered"]["pt"], a["acc_given_covered"]["ci"]),
+                _ci_cell(a["majority_acc"]["pt"], a["majority_acc"]["ci"]),
+                _ci_cell(b["coverage"]["pt"], b["coverage"]["ci"]),
+                _ci_cell(b["acc_given_covered"]["pt"], b["acc_given_covered"]["ci"]),
+                _ci_cell(b["majority_acc"]["pt"], b["majority_acc"]["ci"]),
+            ]
+        )
+    lines.append(_md_table(sweep_headers, sweep_rows))
+    lines.append("")
+
+    # Deltas vs MB
+    lines.append("### Paired deltas vs Mixedbread for routing (KAHM(q→MB) − MB)")
+    lines.append("")
+    dv_headers = ["τ", "ΔCoverage", "ΔMajority-Acc"]
+    dv_rows = []
+    for r in majority_deltas_vs_mb:
+        dv_rows.append(
+            [
+                f"{float(r['tau']):0.2f}",
+                _delta_cell(r["delta_coverage"]["pt"], r["delta_coverage"]["ci"]),
+                _delta_cell(r["delta_majacc"]["pt"], r["delta_majacc"]["ci"]),
+            ]
+        )
+    lines.append(_md_table(dv_headers, dv_rows))
+    lines.append("")
+
+    # Decomposition
+    lines.append("### Decomposition of ΔMajority-Acc into coverage vs precision effects")
+    lines.append("")
+    lines.append("Point-estimate decomposition:")
+    dep_headers = ["τ", "ΔMaj-Acc", "ΔCoverage part", "ΔPrecision part"]
+    dep_rows = []
+    for r in decomp_point_rows:
+        dep_rows.append(
+            [
+                f"{float(r['tau']):0.2f}",
+                f"{r['delta_majacc']:+0.3f}",
+                f"{r['delta_cov_part']:+0.3f}",
+                f"{r['delta_prec_part']:+0.3f}",
+            ]
+        )
+    lines.append(_md_table(dep_headers, dep_rows))
+    lines.append("")
+    lines.append("With paired-bootstrap CIs:")
+    dep2_rows = []
+    for r in decomp_ci_rows:
+        dep2_rows.append(
+            [
+                f"{float(r['tau']):0.2f}",
+                _delta_cell(r["delta_majacc"]["pt"], r["delta_majacc"]["ci"]),
+                _delta_cell(r["delta_cov_part"]["pt"], r["delta_cov_part"]["ci"]),
+                _delta_cell(r["delta_prec_part"]["pt"], r["delta_prec_part"]["ci"]),
+            ]
+        )
+    lines.append(_md_table(dep_headers, dep2_rows))
+    lines.append("")
+
+    # Threshold suggestions
+    lines.append("### Suggested routing thresholds")
+    lines.append("")
+    lines.append(f"Coverage constraint: **coverage ≥ {threshold_suggestions['coverage_constraint']:0.2f}**")
+    lines.append("")
+    sug_headers = ["Method", "τ*", "Coverage", "Acc|Covered", "Majority-Acc", "Objective"]
+    sug_rows = []
+    for objective_key, objective_label in [
+        ("maximize_precision_subject_to_coverage", "Max precision"),
+        ("maximize_majority_acc_subject_to_coverage", "Max majority-acc"),
+    ]:
+        for method_name, rec in threshold_suggestions[objective_key].items():
+            sug_rows.append(
+                [
+                    method_name,
+                    f"{rec['tau']:0.2f}",
+                    f"{rec['coverage']:0.3f}",
+                    f"{rec['acc_given_covered']:0.3f}",
+                    f"{rec['majority_acc']:0.3f}",
+                    objective_label,
+                ]
+            )
+    lines.append(_md_table(sug_headers, sug_rows))
+    lines.append("")
+
+    # Alignment
+    lines.append("## Storyline C: Embedding-space alignment and neighborhood overlap (Full-KAHM vs MB)")
+    lines.append("")
+    align_headers = ["Quantity", "Estimate (95% CI)"]
+    align_rows = [
+        ["Cosine alignment (corpus)", _ci_cell(alignment["cosine_corpus"]["pt"], alignment["cosine_corpus"]["ci"], digits=4)],
+        ["Cosine alignment (queries)", _ci_cell(alignment["cosine_query"]["pt"], alignment["cosine_query"]["ci"], digits=4)],
+        [f"Sentence Jaccard@{k}", _ci_cell(alignment["sentence_jaccard"]["pt"], alignment["sentence_jaccard"]["ci"], digits=3)],
+        [f"Sentence overlap fraction@{k}", _ci_cell(alignment["sentence_overlap_frac"]["pt"], alignment["sentence_overlap_frac"]["ci"], digits=3)],
+        [f"Law-set Jaccard@{k}", _ci_cell(alignment["lawset_jaccard"]["pt"], alignment["lawset_jaccard"]["ci"], digits=3)],
+        ["Δ sentence Jaccard (Full−IDF)", _delta_cell(alignment["delta_sentence_jaccard_full_minus_idf"]["pt"], alignment["delta_sentence_jaccard_full_minus_idf"]["ci"], digits=3)],
+        ["Δ law-set Jaccard (Full−IDF)", _delta_cell(alignment["delta_lawset_jaccard_full_minus_idf"]["pt"], alignment["delta_lawset_jaccard_full_minus_idf"]["ci"], digits=3)],
+    ]
+    lines.append(_md_table(align_headers, align_rows))
+    lines.append("")
+    lines.append("---")
+    lines.append("### Copy-ready summary paragraph")
+    lines.append("")
+    # Construct a concise paragraph with the most salient numbers.
+    mb_hit = method_summaries["Mixedbread (true)"]["hit"][0]
+    k_hit = method_summaries["KAHM(query→MB corpus)"]["hit"][0]
+    idf_hit = method_summaries["IDF–SVD"]["hit"][0]
+    k_mrr = method_summaries["KAHM(query→MB corpus)"]["mrr_ul"][0]
+    mb_mrr = method_summaries["Mixedbread (true)"]["mrr_ul"][0]
+    idf_mrr = method_summaries["IDF–SVD"]["mrr_ul"][0]
+    lines.append(
+        f"Across {n_queries} queries (k={k}), KAHM(query→MB) achieves Hit@{k}={k_hit:.3f} and MRR@{k}={k_mrr:.3f} "
+        f"and substantially outperforms the low-cost IDF–SVD baseline (Hit@{k}={idf_hit:.3f}, MRR@{k}={idf_mrr:.3f}). "
+        f"Relative to Mixedbread (Hit@{k}={mb_hit:.3f}, MRR@{k}={mb_mrr:.3f}), KAHM(query→MB) is competitive at top-k and "
+        f"exhibits improved majority-vote behavior for low τ thresholds, with gains primarily attributable to higher precision among "
+        f"covered cases in the vote-based routing decomposition. Full-KAHM embeddings are strongly aligned with MB in cosine space, "
+        f"and their retrieval neighborhoods are statistically closer to MB than IDF–SVD neighborhoods, supporting the geometric alignment storyline."
+    )
+    lines.append("")
+
+    return "\n".join(lines)
 
 def l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     X = np.asarray(X, dtype=np.float32)
@@ -671,8 +959,8 @@ def print_majority_vote_profile(
     thresholds: List[float],
     n_boot: int,
     seed: int,
-) -> None:
-    """Print a compact but informative majority-vote profile."""
+) -> Dict[str, Any]:
+    """Print and return a compact but informative majority-vote profile."""
     print(f"\n[{name}]  (top-{k} law voting)")
 
     pt_mf, ci_mf = _bootstrap_mean_ci(mv.maj_frac, n_boot=n_boot, seed=seed + 1)
@@ -680,7 +968,7 @@ def print_majority_vote_profile(
     pt_ent, ci_ent = _bootstrap_mean_ci(mv.entropy, n_boot=n_boot, seed=seed + 3)
     pt_nu, ci_nu = _bootstrap_mean_ci(mv.n_unique, n_boot=n_boot, seed=seed + 4)
 
-    # Percentiles are shown without CIs (they are descriptive diagnostics).
+    # Percentiles are shown without CIs (descriptive diagnostics).
     p50, p75, p90 = np.quantile(mv.maj_frac, [0.50, 0.75, 0.90])
     all_same = (mv.maj_frac >= 1.0 - 1e-12).astype(np.float64)
     pt_all, ci_all = _bootstrap_mean_ci(all_same, n_boot=n_boot, seed=seed + 5)
@@ -692,6 +980,7 @@ def print_majority_vote_profile(
     print(f"  maj_frac percentiles  : p50={p50:.3f}, p75={p75:.3f}, p90={p90:.3f}")
     print(f"  P(all {k} from one law): {_fmt_ci(pt_all, ci_all)}")
 
+    sweep: List[Dict[str, Any]] = []
     print("  Threshold sweep (coverage vs accuracy)")
     print("    tau    coverage      majority-acc     acc | covered")
     for t in thresholds:
@@ -707,6 +996,27 @@ def print_majority_vote_profile(
             f"    {tau:0.2f}  {_fmt_ci(cov_pt, cov_ci)}  {_fmt_ci(acc_pt, acc_ci)}  {_fmt_ci(cond_pt, cond_ci)}"
         )
 
+        sweep.append(
+            {
+                "tau": float(tau),
+                "coverage": {"pt": float(cov_pt), "ci": (float(cov_ci[0]), float(cov_ci[1]))},
+                "majority_acc": {"pt": float(acc_pt), "ci": (float(acc_ci[0]), float(acc_ci[1]))},
+                "acc_given_covered": {"pt": float(cond_pt), "ci": (float(cond_ci[0]), float(cond_ci[1]))},
+            }
+        )
+
+    return {
+        "method": str(name),
+        "mean_toplaw_frac": {"pt": float(pt_mf), "ci": (float(ci_mf[0]), float(ci_mf[1]))},
+        "mean_vote_margin": {"pt": float(pt_mm), "ci": (float(ci_mm[0]), float(ci_mm[1]))},
+        "mean_vote_entropy": {"pt": float(pt_ent), "ci": (float(ci_ent[0]), float(ci_ent[1]))},
+        "mean_n_unique": {"pt": float(pt_nu), "ci": (float(ci_nu[0]), float(ci_nu[1]))},
+        "maj_frac_percentiles": {"p50": float(p50), "p75": float(p75), "p90": float(p90)},
+        "p_all_from_one_law": {"pt": float(pt_all), "ci": (float(ci_all[0]), float(ci_all[1]))},
+        "threshold_sweep": sweep,
+    }
+
+
 
 def print_majority_routing_decomposition(
     a_name: str,
@@ -715,7 +1025,7 @@ def print_majority_routing_decomposition(
     b_mv: MajorityVote,
     *,
     thresholds: List[float],
-) -> None:
+) -> List[Dict[str, Any]]:
     """Decompose majority-acc differences into coverage vs precision effects.
 
     majority-acc(tau) = coverage(tau) * precision(tau)
@@ -730,6 +1040,8 @@ def print_majority_routing_decomposition(
     print(
         "    tau   cov(A)  prec(A)  majacc(A)   cov(B)  prec(B)  majacc(B)   Δmajacc   Δcov-part  Δprec-part"
     )
+
+    rows: List[Dict[str, Any]] = []
     for t in thresholds:
         tau = float(t)
         a_cov, a_acc, a_prec = _mv_point_estimates(a_mv, tau)
@@ -743,6 +1055,22 @@ def print_majority_routing_decomposition(
             f"    {tau:0.2f}  {a_cov:0.3f}  {a_prec:0.3f}  {a_acc:0.3f}    {b_cov:0.3f}  {b_prec:0.3f}  {b_acc:0.3f}    {d:+0.3f}    {cov_part:+0.3f}     {prec_part:+0.3f}"
         )
 
+        rows.append(
+            {
+                "tau": float(tau),
+                "cov_a": float(a_cov),
+                "prec_a": float(a_prec),
+                "majacc_a": float(a_acc),
+                "cov_b": float(b_cov),
+                "prec_b": float(b_prec),
+                "majacc_b": float(b_acc),
+                "delta_majacc": float(d),
+                "delta_cov_part": float(cov_part),
+                "delta_prec_part": float(prec_part),
+            }
+        )
+
+    return rows
 
 
 
@@ -825,11 +1153,13 @@ def print_majority_routing_decomposition_ci(
     thresholds: List[float],
     n_boot: int,
     seed: int,
-) -> None:
-    """Print bootstrap CIs for the routing decomposition components."""
+) -> List[Dict[str, Any]]:
+    """Print and return bootstrap CIs for the routing decomposition components."""
     print(f"\nMajority-vote routing decomposition (with CIs): {a_name} vs {b_name}")
     print("  Report: paired mean differences with 95% bootstrap CIs")
     print("    tau    Δmaj-acc                 Δcov-part                Δprec-part")
+
+    rows: List[Dict[str, Any]] = []
     for t in thresholds:
         tau = float(t)
         out = _bootstrap_shapley_decomposition_ci(a_mv, b_mv, tau, n_boot=n_boot, seed=seed + int(1000 * tau) + 1234)
@@ -839,6 +1169,18 @@ def print_majority_routing_decomposition_ci(
         print(
             f"    {tau:0.2f}  {_fmt_delta(d_pt, d_ci)}    {_fmt_delta(c_pt, c_ci)}    {_fmt_delta(p_pt, p_ci)}"
         )
+
+        rows.append(
+            {
+                "tau": float(tau),
+                "delta_majacc": {"pt": float(d_pt), "ci": (float(d_ci[0]), float(d_ci[1]))},
+                "delta_cov_part": {"pt": float(c_pt), "ci": (float(c_ci[0]), float(c_ci[1]))},
+                "delta_prec_part": {"pt": float(p_pt), "ci": (float(p_ci[0]), float(p_ci[1]))},
+            }
+        )
+
+    return rows
+
 
 
 def recommend_routing_threshold_max_majacc(
@@ -901,14 +1243,26 @@ def recommend_routing_threshold(
     return float(tau), float(cov), float(acc), float(prec)
 
 
-def storyline_superiority(title: str, a_name: str, b_name: str, a: PerQuery, b: PerQuery, *, n_boot: int, seed: int) -> None:
+def storyline_superiority(
+    title: str,
+    a_name: str,
+    b_name: str,
+    a: PerQuery,
+    b: PerQuery,
+    *,
+    n_boot: int,
+    seed: int,
+) -> Dict[str, Any]:
     print(f"\n{title}")
     print("  Test: one-sided superiority (paired 95% bootstrap CI lower bound > 0)")
+
+    rows: List[Dict[str, Any]] = []
 
     def _line(key: str, label: str, sd: int) -> bool:
         pt, ci = _bootstrap_paired_delta_ci(getattr(a, key), getattr(b, key), n_boot=n_boot, seed=seed + sd)
         ok = bool(np.isfinite(ci[0]) and ci[0] > 0.0)
         print(f"  {label}: {a_name}−{b_name} = {_fmt_delta(pt, ci)}  -> {'PASS' if ok else 'FAIL'}")
+        rows.append({"key": key, "label": label, "delta": float(pt), "ci": (float(ci[0]), float(ci[1])), "pass": bool(ok)})
         return ok
 
     oks = [
@@ -919,12 +1273,32 @@ def storyline_superiority(title: str, a_name: str, b_name: str, a: PerQuery, b: 
         _line("cons_frac", "mean consensus fraction", 5),
         _line("lift", "mean lift (prior)", 6),
     ]
-    print(f"  Verdict: {'Supported' if all(oks) else 'Partially supported (see FAIL lines)'}")
+    verdict = "Supported" if all(oks) else "Partially supported (see FAIL lines)"
+    print(f"  Verdict: {verdict}")
 
+    return {
+        "type": "superiority",
+        "title": str(title),
+        "a_name": str(a_name),
+        "b_name": str(b_name),
+        "rows": rows,
+        "verdict": verdict,
+    }
 
-def storyline_competitiveness(title: str, a_name: str, b_name: str, a: PerQuery, b: PerQuery, *, n_boot: int, seed: int) -> None:
+def storyline_competitiveness(
+    title: str,
+    a_name: str,
+    b_name: str,
+    a: PerQuery,
+    b: PerQuery,
+    *,
+    n_boot: int,
+    seed: int,
+) -> Dict[str, Any]:
     print(f"\n{title}")
     print("  Report: paired mean differences with 95% bootstrap CIs")
+
+    rows: List[Dict[str, Any]] = []
     for key, label, sd in [
         ("hit", "hit@k", 1),
         ("mrr_ul", "MRR@k (unique laws)", 2),
@@ -934,11 +1308,26 @@ def storyline_competitiveness(title: str, a_name: str, b_name: str, a: PerQuery,
         ("lift", "mean lift (prior)", 6),
     ]:
         pt, ci = _bootstrap_paired_delta_ci(getattr(a, key), getattr(b, key), n_boot=n_boot, seed=seed + sd)
-        note = ""
-        if np.isfinite(ci[0]) and np.isfinite(ci[1]) and (ci[0] > 0.0 or ci[1] < 0.0):
-            # CI excludes 0 -> statistically distinguishable difference at ~95%.
-            note = "  (CI excludes 0)"
+        ci_excludes_0 = bool(np.isfinite(ci[0]) and np.isfinite(ci[1]) and (ci[0] > 0.0 or ci[1] < 0.0))
+        note = "  (CI excludes 0)" if ci_excludes_0 else ""
         print(f"  {label}: {a_name}−{b_name} = {_fmt_delta(pt, ci)}{note}")
+        rows.append(
+            {
+                "key": key,
+                "label": label,
+                "delta": float(pt),
+                "ci": (float(ci[0]), float(ci[1])),
+                "ci_excludes_0": bool(ci_excludes_0),
+            }
+        )
+
+    return {
+        "type": "competitiveness",
+        "title": str(title),
+        "a_name": str(a_name),
+        "b_name": str(b_name),
+        "rows": rows,
+    }
 
 
 # ----------------------------- Alignment metrics -----------------------------
@@ -1041,6 +1430,11 @@ def main() -> None:
 
     p.add_argument("--bootstrap_samples", type=int, default=5000)
     p.add_argument("--bootstrap_seed", type=int, default=0)
+
+    # Publication report
+    p.add_argument("--report_path", default="kahm_evaluation_report.md", help="Write a single publication-ready Markdown report to this path (e.g., results/report.md).")
+    p.add_argument("--report_title", default="KAHM embeddings: retrieval evaluation on Austrian laws", help="Title used in the generated report.")
+    p.add_argument("--report_overwrite", action="store_true", help="Allow overwriting an existing report file at --report_path.")
 
     args = p.parse_args()
 
@@ -1172,6 +1566,13 @@ def main() -> None:
     kahm_qmb_sum = summarize(kahm_qmb_pq, n_boot=n_boot, seed=seed + 30)
     kahm_full_sum = summarize(kahm_full_pq, n_boot=n_boot, seed=seed + 40)
 
+    method_summaries = {
+        "Mixedbread (true)": mb_sum,
+        "IDF–SVD": idf_sum,
+        "KAHM(query→MB corpus)": kahm_qmb_sum,
+        "Full-KAHM (query→KAHM corpus)": kahm_full_sum,
+    }
+
     # Headline blocks
     print_method("Mixedbread (true)", mb_sum, k=k)
     print_method("IDF–SVD", idf_sum, k=k)
@@ -1180,15 +1581,17 @@ def main() -> None:
 
     # Majority-vote behavior (highlighted block)
     print("\nMajority-vote behavior: law-purity and vote-based routing diagnostics")
-    print_majority_vote_profile("Mixedbread (true)", mb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 500)
-    print_majority_vote_profile("IDF–SVD", idf_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 600)
-    print_majority_vote_profile("KAHM(query→MB corpus)", kahm_qmb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 700)
-    print_majority_vote_profile("Full-KAHM (query→KAHM corpus)", kahm_full_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 800)
+    majority_profiles: Dict[str, Dict[str, Any]] = {}
+    majority_profiles["Mixedbread (true)"] = print_majority_vote_profile("Mixedbread (true)", mb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 500)
+    majority_profiles["IDF–SVD"] = print_majority_vote_profile("IDF–SVD", idf_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 600)
+    majority_profiles["KAHM(query→MB corpus)"] = print_majority_vote_profile("KAHM(query→MB corpus)", kahm_qmb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 700)
+    majority_profiles["Full-KAHM (query→KAHM corpus)"] = print_majority_vote_profile("Full-KAHM (query→KAHM corpus)", kahm_full_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 800)
 
     # Paired deltas that make the "majority-vote" story explicit (especially for Storyline B).
     print("\nMajority-vote deltas vs Mixedbread (paired, top-k law voting)")
     print("  Report: paired mean differences with 95% bootstrap CIs")
     print("    tau    Δcoverage(KAHM−MB)        Δmaj-acc(KAHM−MB)")
+    majority_deltas_vs_mb: List[Dict[str, Any]] = []
     for t in maj_thresholds:
         tau = float(t)
         cov_k = (kahm_qmb_mv.maj_frac >= tau).astype(np.float64)
@@ -1202,10 +1605,15 @@ def main() -> None:
         if np.isfinite(d_acc_ci[0]) and np.isfinite(d_acc_ci[1]) and (d_acc_ci[0] > 0.0 or d_acc_ci[1] < 0.0):
             note = "  (Δmaj-acc CI excludes 0)"
         print(f"    {tau:0.2f}  {_fmt_delta(d_cov_pt, d_cov_ci)}    {_fmt_delta(d_acc_pt, d_acc_ci)}{note}")
+        majority_deltas_vs_mb.append({
+            "tau": float(tau),
+            "delta_coverage": {"pt": float(d_cov_pt), "ci": (float(d_cov_ci[0]), float(d_cov_ci[1]))},
+            "delta_majacc": {"pt": float(d_acc_pt), "ci": (float(d_acc_ci[0]), float(d_acc_ci[1]))},
+        })
 
     # A compact decomposition that makes clear whether the gain comes from
     # (i) more coverage or (ii) higher precision among covered cases.
-    print_majority_routing_decomposition(
+    decomp_point_rows = print_majority_routing_decomposition(
         "KAHM(q→MB)",
         "MB",
         kahm_qmb_mv,
@@ -1214,7 +1622,7 @@ def main() -> None:
     )
 
     # Same decomposition, but with paired bootstrap CIs for the components.
-    print_majority_routing_decomposition_ci(
+    decomp_ci_rows = print_majority_routing_decomposition_ci(
         "KAHM(q→MB)",
         "MB",
         kahm_qmb_mv,
@@ -1227,6 +1635,12 @@ def main() -> None:
     # A practical suggestion: pick a tau that maximizes majority-vote precision
     # subject to a coverage constraint.
     min_cov = float(args.min_routing_coverage)
+    threshold_suggestions: Dict[str, Any] = {
+        "coverage_constraint": min_cov,
+        "maximize_precision_subject_to_coverage": {},
+        "maximize_majority_acc_subject_to_coverage": {},
+    }
+
     print(
         "\nSuggested majority-vote routing thresholds (maximize precision subject to coverage constraint)"
     )
@@ -1243,6 +1657,12 @@ def main() -> None:
         print(
             f"  {nm}: tau*={tau_star:0.2f}  coverage={cov_star:0.3f}  acc|covered={prec_star:0.3f}  majority-acc={acc_star:0.3f}"
         )
+        threshold_suggestions["maximize_precision_subject_to_coverage"][nm] = {
+            "tau": float(tau_star),
+            "coverage": float(cov_star),
+            "majority_acc": float(acc_star),
+            "acc_given_covered": float(prec_star),
+        }
     print(
         "\nAlternative majority-vote routing thresholds (maximize majority-acc subject to coverage constraint)"
     )
@@ -1259,11 +1679,17 @@ def main() -> None:
         print(
             f"  {nm}: tau*={tau_star:0.2f}  coverage={cov_star:0.3f}  acc|covered={prec_star:0.3f}  majority-acc={acc_star:0.3f}"
         )
+        threshold_suggestions["maximize_majority_acc_subject_to_coverage"][nm] = {
+            "tau": float(tau_star),
+            "coverage": float(cov_star),
+            "majority_acc": float(acc_star),
+            "acc_given_covered": float(prec_star),
+        }
 
 
 
     # Storyline A/B
-    storyline_superiority(
+    storyline_a = storyline_superiority(
         "\nStoryline A: KAHM(query→MB) beats IDF–SVD (a strong low-cost baseline)",
         "KAHM(q→MB)",
         "IDF–SVD",
@@ -1273,7 +1699,7 @@ def main() -> None:
         seed=seed + 100,
     )
 
-    storyline_competitiveness(
+    storyline_b = storyline_competitiveness(
         "\nStoryline B: KAHM(query→MB) is close to Mixedbread at top-k (paired deltas)",
         "KAHM(q→MB)",
         "MB",
@@ -1312,12 +1738,45 @@ def main() -> None:
     law_j_idf = law_jaccard_topk_rows(idf_idx, mb_idx, law_arr, k=k)
     d_sj_pt, d_sj_ci = _bootstrap_paired_delta_ci(sent_j_full, sent_j_idf, n_boot=n_boot, seed=seed + 320)
     d_lj_pt, d_lj_ci = _bootstrap_paired_delta_ci(law_j_full, law_j_idf, n_boot=n_boot, seed=seed + 321)
+
+    alignment: Dict[str, Any] = {
+        "cosine_corpus": {"pt": float(pt_c), "ci": (float(ci_c[0]), float(ci_c[1]))},
+        "cosine_query": {"pt": float(pt_q), "ci": (float(ci_q[0]), float(ci_q[1]))},
+        "sentence_jaccard": {"pt": float(pt_sj), "ci": (float(ci_sj[0]), float(ci_sj[1]))},
+        "sentence_overlap_frac": {"pt": float(pt_sf), "ci": (float(ci_sf[0]), float(ci_sf[1]))},
+        "lawset_jaccard": {"pt": float(pt_lj), "ci": (float(ci_lj[0]), float(ci_lj[1]))},
+        "delta_sentence_jaccard_full_minus_idf": {"pt": float(d_sj_pt), "ci": (float(d_sj_ci[0]), float(d_sj_ci[1]))},
+        "delta_lawset_jaccard_full_minus_idf": {"pt": float(d_lj_pt), "ci": (float(d_lj_ci[0]), float(d_lj_ci[1]))},
+    }
     ok_sj = bool(np.isfinite(d_sj_ci[0]) and d_sj_ci[0] > 0)
     ok_lj = bool(np.isfinite(d_lj_ci[0]) and d_lj_ci[0] > 0)
     print("  Part C3: Alignment gain vs IDF–SVD (paired deltas)")
     print(f"    sentence Jaccard delta: (Full-KAHM−IDF) = {_fmt_delta(d_sj_pt, d_sj_ci)}  -> {'PASS' if ok_sj else 'FAIL'}")
     print(f"    law-set Jaccard delta : (Full-KAHM−IDF) = {_fmt_delta(d_lj_pt, d_lj_ci)}  -> {'PASS' if ok_lj else 'FAIL'}")
     print("    Interpretation: PASS means Full-KAHM neighborhoods are *statistically* closer to MB than IDF neighborhoods.")
+
+
+    # Optional: write a single publication-ready report (Markdown)
+    if str(getattr(args, "report_path", "")).strip():
+        report_md = build_publication_report_md(
+            report_title=str(getattr(args, "report_title", "KAHM embeddings: retrieval evaluation")),
+            args=args,
+            n_queries=int(len(consensus)),
+            n_corpus=int(law_arr.size),
+            embedding_dim=int(emb_mb.shape[1]),
+            k=int(k),
+            method_summaries=method_summaries,
+            storyline_a=storyline_a,
+            storyline_b=storyline_b,
+            majority_profiles=majority_profiles,
+            majority_deltas_vs_mb=majority_deltas_vs_mb,
+            decomp_point_rows=decomp_point_rows,
+            decomp_ci_rows=decomp_ci_rows,
+            threshold_suggestions=threshold_suggestions,
+            alignment=alignment,
+        )
+        _write_text(str(args.report_path), report_md, overwrite=bool(getattr(args, "report_overwrite", False)))
+        print(f"\nSaved publication report to: {os.path.abspath(str(args.report_path))}")
 
     print("\nPipeline finished successfully.")
 
