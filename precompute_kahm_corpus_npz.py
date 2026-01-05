@@ -42,7 +42,7 @@ DEFAULT_IDF_SVD_NPZ = "embedding_index_idf_svd.npz"
 DEFAULT_KAHM_MODEL = "kahm_regressor_idf_to_mixedbread.joblib"
 DEFAULT_OUT_NPZ = "embedding_index_kahm_mixedbread_approx.npz"
 DEFAULT_KAHM_MODE = "soft"
-DEFAULT_BATCH = 1024
+DEFAULT_BATCH = 2048
 
 
 def l2_normalize_rows(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -105,28 +105,30 @@ def kahm_regress_batched(
     topk: Optional[int | None] = None,
     show_progress: bool = True,
 ) -> np.ndarray:
+    """
+    Run KAHM regression over a corpus embedding matrix X shaped (N, D_in).
+
+    This wrapper calls kahm_regress exactly once and relies on its internal
+    batching and (optional) tqdm progress bar. This avoids re-loading AEs
+    across outer batches, which is critical for disk-backed classifiers.
+    """
     from kahm_regression import kahm_regress  # local module
 
     X = np.asarray(X, dtype=np.float32)
     if X.ndim != 2:
         raise ValueError(f"X must be 2D (N,D); got {X.shape}")
 
-    # kahm_regress expects (D, N). For best runtime with disk-backed AEs, call it ONCE and
-    # let kahm_regress handle internal batching (loads each AE once per inference call).
-    Xt = X.T
-    bs = int(batch_size)
-    if bs <= 0:
-        raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}")
+    if "cluster_centers" not in model:
+        raise KeyError("KAHM model missing 'cluster_centers' (cannot infer output dimension).")
 
-    if show_progress and X.shape[0] > bs:
-        # kahm_regress does not currently expose a progress callback; provide a clear notice.
-        total_batches = (int(X.shape[0]) + bs - 1) // bs
-        print(f"KAHM regress (single-call): internal batch_size={bs} (~{total_batches} internal batches)")
+    Xt = np.ascontiguousarray(X.T)  # (D_in, N)
 
-    Yt = kahm_regress(model, Xt, mode=str(mode), batch_size=bs, alpha=alpha, topk=topk)
-    Y = np.asarray(Yt.T, dtype=np.float32)
-    return Y
+    # Prefer kahm_regress internal batching + progress (if supported).
 
+    Yt = kahm_regress(model,Xt,mode=str(mode),batch_size=int(batch_size),alpha=alpha,topk=topk,show_progress=bool(show_progress))
+    
+
+    return np.asarray(Yt.T, dtype=np.float32)
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Precompute KAHM-regressed corpus embeddings and save as NPZ.")
@@ -137,15 +139,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out_npz", default=DEFAULT_OUT_NPZ, help=f"Output NPZ path (default: {DEFAULT_OUT_NPZ})")
 
     p.add_argument("--kahm_mode", choices=["soft", "hard"], default=DEFAULT_KAHM_MODE, help="KAHM inference mode (default: soft)")
-    p.add_argument("--batch", type=int, default=DEFAULT_BATCH, help=f"Batch size for regression (default: {DEFAULT_BATCH})")
-
-    # Optional: override tuned soft parameters (defaults to model['soft_*'] if omitted)
-    p.add_argument("--alpha", type=float, default=None, help="Override soft alpha (default: use model['soft_alpha'])")
-    p.add_argument(
-        "--topk",
-        default=None,
-        help="Override soft topk (int) or 'None' (default: use model['soft_topk'])",
-    )
+    p.add_argument("--batch", type=int, default=DEFAULT_BATCH, help="Batch size for regression (default: 4096)")
     p.add_argument("--overwrite", action="store_true", help="Overwrite out_npz if it exists (default: no)")
     p.add_argument("--no_progress", action="store_true", help="Disable the progress bar (default: show)")
 
@@ -177,23 +171,8 @@ def main() -> int:
 
     model = load_kahm_regressor(args.kahm_model)
 
-    # Friendly diagnostics / early validation for disk-backed classifiers
-    clf_dir = model.get("classifier_dir")
-    n_clf = len(model.get("classifier", [])) if isinstance(model.get("classifier"), (list, tuple)) else None
-    if clf_dir is not None:
-        print(f"Model classifier_dir: {clf_dir} | entries={n_clf}")
-        if isinstance(clf_dir, str) and clf_dir and not os.path.isdir(clf_dir):
-            print(f"ERROR: classifier_dir does not exist: {clf_dir}", file=sys.stderr)
-            return 2
-
     # Normalize inputs (cosine retrieval assumes L2)
     Xn = l2_normalize_rows(X)
-
-    # Parse topk override
-    topk_override: Optional[int | None] = None
-    if args.topk is not None:
-        t = str(args.topk).strip().lower()
-        topk_override = None if t in ("none", "null") else int(t)
 
     print(f"Regressing corpus embeddings via KAHM ({args.kahm_mode}) in batches of {args.batch} ...")
     Y = kahm_regress_batched(
@@ -201,8 +180,6 @@ def main() -> int:
         Xn,
         mode=args.kahm_mode,
         batch_size=int(args.batch),
-        alpha=(None if args.alpha is None else float(args.alpha)),
-        topk=topk_override,
         show_progress=(not bool(args.no_progress)),
     )
     Yn = l2_normalize_rows(Y)

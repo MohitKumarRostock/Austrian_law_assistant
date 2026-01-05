@@ -49,6 +49,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import sys
+import gc
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -57,7 +59,29 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2025-12-31-storylines-v4"
+SCRIPT_VERSION = "2026-01-05-storylines-v4-majority-v3"
+
+
+def _safe_ratio(num: float, denom: float) -> float:
+    """Return num/denom with NaN on zero denom."""
+    return (float(num) / float(denom)) if float(denom) > 0 else float("nan")
+
+
+def _mv_point_estimates(mv: "MajorityVote", tau: float) -> Tuple[float, float, float]:
+    """Point estimates for vote-based routing at threshold tau.
+
+    Returns:
+      coverage = P(maj_frac >= tau)
+      maj_acc  = P(majority vote correct AND maj_frac >= tau)
+      prec     = P(majority vote correct | maj_frac >= tau)
+    """
+    tau = float(tau)
+    covered = (mv.maj_frac >= tau).astype(np.float64)
+    acc = (mv.maj_correct * covered).astype(np.float64)
+    cov = float(np.mean(covered))
+    maj_acc = float(np.mean(acc))
+    prec = _safe_ratio(maj_acc, cov)
+    return cov, maj_acc, prec
 
 
 # ----------------------------- Utilities -----------------------------
@@ -108,6 +132,48 @@ def _bootstrap_paired_delta_ci(
     for i in range(int(n_boot)):
         idx = rng.integers(0, n, size=n)
         bs[i] = float(np.mean(d[idx]))
+    lo, hi = np.quantile(bs, [0.025, 0.975])
+    return pt, (float(lo), float(hi))
+
+
+def _bootstrap_ratio_ci(
+    num: np.ndarray,
+    denom: np.ndarray,
+    *,
+    n_boot: int,
+    seed: int,
+) -> Tuple[float, Tuple[float, float]]:
+    """Bootstrap CI for a ratio E[num]/E[denom] estimated as sum(num)/sum(denom).
+
+    This is useful for conditional accuracies such as:
+        P(correct | majority_fraction >= tau)
+    where num = 1{correct & passes}, denom = 1{passes}.
+    """
+    num = np.asarray(num, dtype=np.float64)
+    denom = np.asarray(denom, dtype=np.float64)
+    if num.shape != denom.shape:
+        raise ValueError(f"Ratio arrays must have same shape; got {num.shape} vs {denom.shape}")
+    if num.size == 0:
+        return float("nan"), (float("nan"), float("nan"))
+
+    rng = np.random.default_rng(int(seed))
+    n = int(num.size)
+
+    num_sum = float(np.sum(num))
+    denom_sum = float(np.sum(denom))
+    pt = (num_sum / denom_sum) if denom_sum > 0 else float("nan")
+
+    bs = np.empty(int(n_boot), dtype=np.float64)
+    for i in range(int(n_boot)):
+        idx = rng.integers(0, n, size=n)
+        ns = float(np.sum(num[idx]))
+        ds = float(np.sum(denom[idx]))
+        bs[i] = (ns / ds) if ds > 0 else np.nan
+
+    # Drop NaNs (can occur if a bootstrap resample has zero denom).
+    bs = bs[np.isfinite(bs)]
+    if bs.size == 0:
+        return pt, (float("nan"), float("nan"))
     lo, hi = np.quantile(bs, [0.025, 0.975])
     return pt, (float(lo), float(hi))
 
@@ -277,14 +343,22 @@ def extract_consensus_laws(qs: List[Any]) -> List[str]:
 
 
 # ----------------------------- FAISS -----------------------------
-def build_faiss_index(emb: np.ndarray):
+def build_faiss_index(emb: np.ndarray, *, n_threads: int | None = None):
+    """Build a FlatIP index. If n_threads is set, cap FAISS OpenMP threads."""
     import faiss  # type: ignore
+    from typing import Any, cast
+
+    if n_threads is not None and int(n_threads) > 0:
+        try:
+            faiss.omp_set_num_threads(int(n_threads))
+        except Exception:
+            pass
 
     X = np.ascontiguousarray(emb.astype(np.float32, copy=False))
     index = faiss.IndexFlatIP(int(X.shape[1]))
-    index.add(X)
+    # Pylance/pyright stubs sometimes describe Index.add as add(n, x) while the SWIG binding accepts add(x).
+    cast(Any, index).add(X)
     return index
-
 
 def faiss_search(index, q_emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     Q = np.ascontiguousarray(q_emb.astype(np.float32, copy=False))
@@ -309,30 +383,41 @@ def embed_queries_idf_svd(pipe, texts: List[str]) -> np.ndarray:
     return l2_normalize_rows(X)
 
 
-def build_mixedbread_embedder(model_name: str, device: str, dim: int, query_prefix: str):
+def embed_queries_mixedbread(
+    *,
+    model_name: str,
+    device: str,
+    dim: int,
+    query_prefix: str,
+    texts: List[str],
+    batch_size: int,
+    show_progress_bar: bool = True,
+) -> np.ndarray:
+    """Embed queries with Mixedbread and release the model to reduce peak memory."""
     from sentence_transformers import SentenceTransformer
+    import gc
 
     m = SentenceTransformer(model_name, device=device, truncate_dim=int(dim))
+    q_texts = [query_prefix + t for t in texts]
+    Y = m.encode(
+        q_texts,
+        batch_size=int(batch_size),
+        show_progress_bar=bool(show_progress_bar),
+        convert_to_numpy=True,
+        normalize_embeddings=False,
+    ).astype(np.float32)
+    # Release transformer weights before FAISS indices are built.
+    del m
+    gc.collect()
 
-    def _embed(texts: List[str], *, batch_size: int) -> np.ndarray:
-        q_texts = [query_prefix + t for t in texts]
-        Y = m.encode(
-            q_texts,
-            batch_size=int(batch_size),
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=False,
-        ).astype(np.float32)
-        if Y.ndim != 2:
-            raise ValueError(f"Mixedbread encode output must be 2D; got {Y.shape}")
-        if Y.shape[1] != int(dim):
-            if Y.shape[1] > int(dim):
-                Y = Y[:, : int(dim)]
-            else:
-                raise ValueError(f"Mixedbread embedding dim mismatch: got {Y.shape[1]}, expected {dim}")
-        return l2_normalize_rows(Y)
-
-    return _embed
+    if Y.ndim != 2:
+        raise ValueError(f"Mixedbread encode output must be 2D; got {Y.shape}")
+    if Y.shape[1] != int(dim):
+        if Y.shape[1] > int(dim):
+            Y = Y[:, : int(dim)]
+        else:
+            raise ValueError(f"Mixedbread embedding dim mismatch: got {Y.shape[1]}, expected {dim}")
+    return l2_normalize_rows(Y)
 
 
 def load_kahm_model(path: str) -> dict:
@@ -343,22 +428,34 @@ def load_kahm_model(path: str) -> dict:
     return load_kahm_regressor(path)
 
 
-def kahm_regress_batched(model: dict, X: np.ndarray, *, mode: str, batch_size: int) -> np.ndarray:
+def kahm_regress_once(
+    model: dict,
+    X: np.ndarray,
+    *,
+    mode: str,
+    batch_size: int,
+    show_progress: bool = False,
+) -> np.ndarray:
+    """Single-call KAHM regression with internal batching (avoids repeated AE reloads)."""
     from kahm_regression import kahm_regress
 
     X = np.asarray(X, dtype=np.float32)
     if X.ndim != 2:
         raise ValueError(f"KAHM regression input must be 2D; got {X.shape}")
 
-    n = int(X.shape[0])
-    Y0 = kahm_regress(model, X[:1].T, n_jobs=1, mode=str(mode))
-    d_out = int(np.asarray(Y0).shape[0])
-
-    Y = np.zeros((n, d_out), dtype=np.float32)
-    for s in range(0, n, int(batch_size)):
-        e = min(n, s + int(batch_size))
-        Yt = kahm_regress(model, X[s:e].T, n_jobs=1, mode=str(mode))
-        Y[s:e] = np.asarray(Yt, dtype=np.float32).T
+    bs = int(batch_size) if int(batch_size) > 0 else None
+    
+    Yt = kahm_regress(
+            model,
+            X.T,
+            n_jobs=1,
+            mode=str(mode),
+            batch_size=bs,
+            # kahm_regression.py may or may not expose show_progress; keep runtime-compatible.
+            show_progress=bool(show_progress),
+        )
+  
+    Y = np.asarray(Yt, dtype=np.float32).T
     return l2_normalize_rows(Y)
 
 
@@ -371,6 +468,33 @@ class PerQuery:
     cons_frac: np.ndarray
     lift: np.ndarray
     mrr_ul: np.ndarray
+
+
+@dataclass
+class MajorityVote:
+    """Diagnostics for top-k *law voting* (independent of any predominance threshold).
+
+    maj_frac:
+        Fraction of the top-k list belonging to the most frequent law in that list.
+
+    maj_correct:
+        1.0 if the majority-vote law equals the consensus law, else 0.0.
+
+    margin:
+        maj_frac minus runner-up fraction (0 if there is only one unique law).
+
+    entropy:
+        Shannon entropy of the law distribution in the top-k list (higher = less concentrated).
+
+    n_unique:
+        Number of unique laws present in the top-k list.
+    """
+
+    maj_frac: np.ndarray
+    maj_correct: np.ndarray
+    margin: np.ndarray
+    entropy: np.ndarray
+    n_unique: np.ndarray
 
 
 def compute_per_query_metrics(
@@ -440,6 +564,68 @@ def compute_per_query_metrics(
     return PerQuery(hit=hit_v, top1=top1_v, majority=maj_v, cons_frac=cf_v, lift=lift_v, mrr_ul=mrr_v)
 
 
+def compute_majority_vote(
+    *,
+    idx: np.ndarray,
+    law_arr: np.ndarray,
+    consensus_laws: List[str],
+    k: int,
+) -> MajorityVote:
+    """Compute majority-vote *diagnostics* (not thresholded).
+
+    This is intended to highlight the "law purity" of the retrieved neighborhood.
+    """
+    k = int(k)
+
+    idx = np.asarray(idx, dtype=np.int64)
+    if idx.ndim != 2:
+        raise ValueError(f"idx must be 2D; got {idx.shape}")
+    if idx.shape[1] < k:
+        raise ValueError(f"idx has too few columns: {idx.shape[1]} < k={k}")
+    if idx.shape[1] > k:
+        idx = idx[:, :k]
+
+    n = int(idx.shape[0])
+    if len(consensus_laws) != n:
+        raise ValueError(f"consensus_laws length {len(consensus_laws)} != n_queries {n}")
+
+    maj_frac = np.zeros(n, dtype=np.float64)
+    maj_corr = np.zeros(n, dtype=np.float64)
+    margin = np.zeros(n, dtype=np.float64)
+    ent = np.zeros(n, dtype=np.float64)
+    nuniq = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        cons = str(consensus_laws[i]).strip()
+        row = [int(j) for j in idx[i].tolist() if int(j) >= 0]
+        laws = [str(law_arr[j]) for j in row]
+        if not laws:
+            continue
+
+        c = Counter(laws)
+        maj_law, maj_count = c.most_common(1)[0]
+        total = float(len(laws))
+        mf = float(maj_count) / total
+        maj_frac[i] = mf
+        maj_corr[i] = 1.0 if maj_law == cons else 0.0
+        nuniq[i] = float(len(c))
+
+        # Runner-up fraction (for a "vote margin" diagnostic)
+        if len(c) >= 2:
+            ru_count = c.most_common(2)[1][1]
+            ru_frac = float(ru_count) / total
+        else:
+            ru_frac = 0.0
+        margin[i] = mf - ru_frac
+
+        # Shannon entropy of the vote distribution in the neighborhood.
+        probs = np.asarray([float(v) / total for v in c.values()], dtype=np.float64)
+        probs = probs[probs > 0]
+        ent[i] = float(-(probs * np.log(probs)).sum())
+
+    return MajorityVote(maj_frac=maj_frac, maj_correct=maj_corr, margin=margin, entropy=ent, n_unique=nuniq)
+
+
 def summarize(pq: PerQuery, *, n_boot: int, seed: int) -> Dict[str, Tuple[float, Tuple[float, float]]]:
     return {
         "hit": _bootstrap_mean_ci(pq.hit, n_boot=n_boot, seed=seed + 1),
@@ -459,6 +645,260 @@ def print_method(name: str, s: Dict[str, Tuple[float, Tuple[float, float]]], *, 
     print(f"  majority-accuracy:   {_fmt_ci(*s['majority'])}")
     print(f"  mean cons frac:      {_fmt_ci(*s['cons_frac'])}")
     print(f"  mean lift (prior):   {_fmt_ci(*s['lift'])}")
+
+
+def _parse_float_list(spec: str) -> List[float]:
+    """Parse a comma-separated list of floats."""
+    out: List[float] = []
+    for raw in str(spec).split(","):
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            out.append(float(s))
+        except ValueError:
+            raise ValueError(f"Invalid float in list: {raw!r}")
+    if not out:
+        raise ValueError("Parsed an empty float list")
+    return out
+
+
+def print_majority_vote_profile(
+    name: str,
+    mv: MajorityVote,
+    *,
+    k: int,
+    thresholds: List[float],
+    n_boot: int,
+    seed: int,
+) -> None:
+    """Print a compact but informative majority-vote profile."""
+    print(f"\n[{name}]  (top-{k} law voting)")
+
+    pt_mf, ci_mf = _bootstrap_mean_ci(mv.maj_frac, n_boot=n_boot, seed=seed + 1)
+    pt_mm, ci_mm = _bootstrap_mean_ci(mv.margin, n_boot=n_boot, seed=seed + 2)
+    pt_ent, ci_ent = _bootstrap_mean_ci(mv.entropy, n_boot=n_boot, seed=seed + 3)
+    pt_nu, ci_nu = _bootstrap_mean_ci(mv.n_unique, n_boot=n_boot, seed=seed + 4)
+
+    # Percentiles are shown without CIs (they are descriptive diagnostics).
+    p50, p75, p90 = np.quantile(mv.maj_frac, [0.50, 0.75, 0.90])
+    all_same = (mv.maj_frac >= 1.0 - 1e-12).astype(np.float64)
+    pt_all, ci_all = _bootstrap_mean_ci(all_same, n_boot=n_boot, seed=seed + 5)
+
+    print(f"  mean top-law fraction: {_fmt_ci(pt_mf, ci_mf)}")
+    print(f"  mean vote margin      : {_fmt_ci(pt_mm, ci_mm)}")
+    print(f"  mean vote entropy     : {_fmt_ci(pt_ent, ci_ent)}")
+    print(f"  mean #unique laws     : {_fmt_ci(pt_nu, ci_nu)}")
+    print(f"  maj_frac percentiles  : p50={p50:.3f}, p75={p75:.3f}, p90={p90:.3f}")
+    print(f"  P(all {k} from one law): {_fmt_ci(pt_all, ci_all)}")
+
+    print("  Threshold sweep (coverage vs accuracy)")
+    print("    tau    coverage      majority-acc     acc | covered")
+    for t in thresholds:
+        tau = float(t)
+        covered = (mv.maj_frac >= tau).astype(np.float64)
+        acc = (mv.maj_correct * covered).astype(np.float64)
+
+        cov_pt, cov_ci = _bootstrap_mean_ci(covered, n_boot=n_boot, seed=seed + int(1000 * tau) + 10)
+        acc_pt, acc_ci = _bootstrap_mean_ci(acc, n_boot=n_boot, seed=seed + int(1000 * tau) + 20)
+        cond_pt, cond_ci = _bootstrap_ratio_ci(acc, covered, n_boot=n_boot, seed=seed + int(1000 * tau) + 30)
+
+        print(
+            f"    {tau:0.2f}  {_fmt_ci(cov_pt, cov_ci)}  {_fmt_ci(acc_pt, acc_ci)}  {_fmt_ci(cond_pt, cond_ci)}"
+        )
+
+
+def print_majority_routing_decomposition(
+    a_name: str,
+    b_name: str,
+    a_mv: MajorityVote,
+    b_mv: MajorityVote,
+    *,
+    thresholds: List[float],
+) -> None:
+    """Decompose majority-acc differences into coverage vs precision effects.
+
+    majority-acc(tau) = coverage(tau) * precision(tau)
+    where precision(tau) = P(majority correct | covered).
+
+    Using an exact symmetric (Shapley-style) decomposition:
+        Δ(ab) = 0.5*Δa*(b1+b0) + 0.5*Δb*(a1+a0)
+    which attributes the change to (i) coverage and (ii) conditional precision.
+    """
+    print(f"\nMajority-vote routing decomposition: {a_name} vs {b_name}")
+    print("  (Point estimates; Δmaj-acc = coverage-component + precision-component)")
+    print(
+        "    tau   cov(A)  prec(A)  majacc(A)   cov(B)  prec(B)  majacc(B)   Δmajacc   Δcov-part  Δprec-part"
+    )
+    for t in thresholds:
+        tau = float(t)
+        a_cov, a_acc, a_prec = _mv_point_estimates(a_mv, tau)
+        b_cov, b_acc, b_prec = _mv_point_estimates(b_mv, tau)
+
+        d = a_acc - b_acc
+        cov_part = 0.5 * (a_cov - b_cov) * (a_prec + b_prec)
+        prec_part = 0.5 * (a_prec - b_prec) * (a_cov + b_cov)
+
+        print(
+            f"    {tau:0.2f}  {a_cov:0.3f}  {a_prec:0.3f}  {a_acc:0.3f}    {b_cov:0.3f}  {b_prec:0.3f}  {b_acc:0.3f}    {d:+0.3f}    {cov_part:+0.3f}     {prec_part:+0.3f}"
+        )
+
+
+
+
+def _bootstrap_shapley_decomposition_ci(
+    a_mv: MajorityVote,
+    b_mv: MajorityVote,
+    tau: float,
+    *,
+    n_boot: int,
+    seed: int,
+) -> Dict[str, Tuple[float, Tuple[float, float]]]:
+    """Paired bootstrap CIs for Δmaj-acc and its Shapley-style components.
+
+    Δmaj-acc(tau) = majacc(A,tau) - majacc(B,tau)
+                 = Δcov-part + Δprec-part
+
+    where majacc = coverage * precision, precision = P(correct | covered).
+
+    Returns dict with keys: d, cov_part, prec_part.
+    """
+    tau = float(tau)
+    rng = np.random.default_rng(int(seed))
+
+    n = int(a_mv.maj_frac.size)
+    if n == 0 or n != int(b_mv.maj_frac.size):
+        raise ValueError("MajorityVote arrays must be non-empty and aligned for paired bootstrap.")
+
+    def _stats(ix: np.ndarray) -> Tuple[float, float, float]:
+        # Returns (cov, majacc, prec)
+        a_cov = float(np.mean((a_mv.maj_frac[ix] >= tau).astype(np.float64)))
+        b_cov = float(np.mean((b_mv.maj_frac[ix] >= tau).astype(np.float64)))
+
+        a_acc = float(np.mean((a_mv.maj_correct[ix] * (a_mv.maj_frac[ix] >= tau)).astype(np.float64)))
+        b_acc = float(np.mean((b_mv.maj_correct[ix] * (b_mv.maj_frac[ix] >= tau)).astype(np.float64)))
+
+        a_prec = _safe_ratio(a_acc, a_cov)
+        b_prec = _safe_ratio(b_acc, b_cov)
+
+        # Shapley decomposition
+        d = a_acc - b_acc
+        cov_part = 0.5 * (a_cov - b_cov) * (a_prec + b_prec)
+        prec_part = 0.5 * (a_prec - b_prec) * (a_cov + b_cov)
+        return d, cov_part, prec_part
+
+    # Point estimates on full sample
+    full_ix = np.arange(n, dtype=np.int64)
+    d_pt, cov_pt, prec_pt = _stats(full_ix)
+
+    d_bs = np.empty(int(n_boot), dtype=np.float64)
+    cov_bs = np.empty(int(n_boot), dtype=np.float64)
+    prec_bs = np.empty(int(n_boot), dtype=np.float64)
+
+    for i in range(int(n_boot)):
+        ix = rng.integers(0, n, size=n, dtype=np.int64)
+        d, c, p = _stats(ix)
+        d_bs[i] = d
+        cov_bs[i] = c
+        prec_bs[i] = p
+
+    def _ci(arr: np.ndarray) -> Tuple[float, float]:
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return (float("nan"), float("nan"))
+        lo, hi = np.quantile(arr, [0.025, 0.975])
+        return float(lo), float(hi)
+
+    return {
+        "d": (float(d_pt), _ci(d_bs)),
+        "cov_part": (float(cov_pt), _ci(cov_bs)),
+        "prec_part": (float(prec_pt), _ci(prec_bs)),
+    }
+
+
+def print_majority_routing_decomposition_ci(
+    a_name: str,
+    b_name: str,
+    a_mv: MajorityVote,
+    b_mv: MajorityVote,
+    *,
+    thresholds: List[float],
+    n_boot: int,
+    seed: int,
+) -> None:
+    """Print bootstrap CIs for the routing decomposition components."""
+    print(f"\nMajority-vote routing decomposition (with CIs): {a_name} vs {b_name}")
+    print("  Report: paired mean differences with 95% bootstrap CIs")
+    print("    tau    Δmaj-acc                 Δcov-part                Δprec-part")
+    for t in thresholds:
+        tau = float(t)
+        out = _bootstrap_shapley_decomposition_ci(a_mv, b_mv, tau, n_boot=n_boot, seed=seed + int(1000 * tau) + 1234)
+        d_pt, d_ci = out["d"]
+        c_pt, c_ci = out["cov_part"]
+        p_pt, p_ci = out["prec_part"]
+        print(
+            f"    {tau:0.2f}  {_fmt_delta(d_pt, d_ci)}    {_fmt_delta(c_pt, c_ci)}    {_fmt_delta(p_pt, p_ci)}"
+        )
+
+
+def recommend_routing_threshold_max_majacc(
+    mv: MajorityVote,
+    *,
+    thresholds: List[float],
+    min_coverage: float,
+) -> Tuple[float, float, float, float]:
+    """Pick a tau that maximizes majority-acc subject to a minimum coverage.
+
+    Returns: (tau, coverage, majority-acc, precision)
+    """
+    min_coverage = float(min_coverage)
+    if not (0.0 < min_coverage <= 1.0):
+        raise ValueError(f"min_coverage must be in (0,1]; got {min_coverage}")
+
+    rows = []
+    for t in thresholds:
+        tau = float(t)
+        cov, acc, prec = _mv_point_estimates(mv, tau)
+        rows.append((tau, cov, acc, prec))
+
+    feas = [r for r in rows if np.isfinite(r[1]) and r[1] >= min_coverage]
+    if feas:
+        tau, cov, acc, prec = sorted(feas, key=lambda r: (r[2], r[3], -r[0]), reverse=True)[0]
+        return float(tau), float(cov), float(acc), float(prec)
+
+    tau, cov, acc, prec = sorted(rows, key=lambda r: (r[2], r[3], -r[0]), reverse=True)[0]
+    return float(tau), float(cov), float(acc), float(prec)
+
+def recommend_routing_threshold(
+    mv: MajorityVote,
+    *,
+    thresholds: List[float],
+    min_coverage: float,
+) -> Tuple[float, float, float, float]:
+    """Pick a tau that maximizes precision subject to a minimum coverage.
+
+    Returns: (tau, coverage, majority-acc, precision)
+    """
+    min_coverage = float(min_coverage)
+    if not (0.0 < min_coverage <= 1.0):
+        raise ValueError(f"min_coverage must be in (0,1]; got {min_coverage}")
+
+    rows = []
+    for t in thresholds:
+        tau = float(t)
+        cov, acc, prec = _mv_point_estimates(mv, tau)
+        rows.append((tau, cov, acc, prec))
+
+    # Feasible set: coverage >= min_coverage
+    feas = [r for r in rows if np.isfinite(r[1]) and r[1] >= min_coverage]
+    if feas:
+        # Max precision, tie-break by majority-acc (more correct decisions), then lower tau (more permissive).
+        tau, cov, acc, prec = sorted(feas, key=lambda r: (r[3], r[2], -r[0]), reverse=True)[0]
+        return float(tau), float(cov), float(acc), float(prec)
+
+    # If nothing meets the coverage constraint, pick tau with max majority-acc.
+    tau, cov, acc, prec = sorted(rows, key=lambda r: (r[2], r[3], -r[0]), reverse=True)[0]
+    return float(tau), float(cov), float(acc), float(prec)
 
 
 def storyline_superiority(title: str, a_name: str, b_name: str, a: PerQuery, b: PerQuery, *, n_boot: int, seed: int) -> None:
@@ -494,7 +934,11 @@ def storyline_competitiveness(title: str, a_name: str, b_name: str, a: PerQuery,
         ("lift", "mean lift (prior)", 6),
     ]:
         pt, ci = _bootstrap_paired_delta_ci(getattr(a, key), getattr(b, key), n_boot=n_boot, seed=seed + sd)
-        print(f"  {label}: {a_name}−{b_name} = {_fmt_delta(pt, ci)}")
+        note = ""
+        if np.isfinite(ci[0]) and np.isfinite(ci[1]) and (ci[0] > 0.0 or ci[1] < 0.0):
+            # CI excludes 0 -> statistically distinguishable difference at ~95%.
+            note = "  (CI excludes 0)"
+        print(f"  {label}: {a_name}−{b_name} = {_fmt_delta(pt, ci)}{note}")
 
 
 # ----------------------------- Alignment metrics -----------------------------
@@ -563,16 +1007,37 @@ def main() -> None:
     p.add_argument("--idf_svd_model", default="idf_svd_model.joblib")
     p.add_argument("--kahm_model", default="kahm_regressor_idf_to_mixedbread.joblib")
     p.add_argument("--kahm_mode", default="soft")
-    p.add_argument("--kahm_batch", type=int, default=4096)
+    p.add_argument("--kahm_batch", type=int, default=1024)
     p.add_argument("--query_set", default="query_set.TEST_QUERY_SET")
 
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--predominance_fraction", type=float, default=0.5)
+    p.add_argument(
+        "--majority_thresholds",
+        default="0.5,0.6,0.7,0.8",
+        help="Comma-separated thresholds for majority-vote diagnostics (tau values for coverage/accuracy sweeps).",
+    )
+
+    p.add_argument(
+        "--min_routing_coverage",
+        type=float,
+        default=0.50,
+        help=(
+            "Minimum coverage constraint used when recommending a majority-vote routing threshold tau. "
+            "The script will pick tau that maximizes precision (acc|covered) subject to coverage>=this value."
+        ),
+    )
 
     p.add_argument("--mixedbread_model", default="mixedbread-ai/deepset-mxbai-embed-de-large-v1")
     p.add_argument("--device", default="cpu")
     p.add_argument("--query_prefix", default="query: ")
     p.add_argument("--mb_query_batch", type=int, default=64)
+
+    # Thread limits (macOS stability). Set to 1 to reduce OpenMP/BLAS contention.
+    # 0 means "do not override".
+    default_threads = 1 if sys.platform == "darwin" else 0
+    p.add_argument("--threads", type=int, default=default_threads, help="Cap OMP/BLAS/torch/FAISS threads (0=no override).")
+    p.add_argument("--kahm_show_progress", default=True, help="Show a KAHM progress bar (requires tqdm in env).")
 
     p.add_argument("--bootstrap_samples", type=int, default=5000)
     p.add_argument("--bootstrap_seed", type=int, default=0)
@@ -592,6 +1057,26 @@ def main() -> None:
     if n_empty_text:
         print(f"WARNING: {n_empty_text}/{n_q} queries have empty text (check query_set keys).", flush=True)
 
+    # Apply thread limits early (before importing torch/faiss) to avoid oversubscription
+    # and reduce the probability of native-library crashes under high memory pressure.
+    if int(args.threads) > 0:
+        t = str(int(args.threads))
+        os.environ.setdefault("OMP_NUM_THREADS", t)
+        os.environ.setdefault("MKL_NUM_THREADS", t)
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", t)
+        os.environ.setdefault("VECLIB_MAXIMUM_THREADS", t)
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", t)
+        try:
+            import torch  # type: ignore
+
+            torch.set_num_threads(int(args.threads))
+            try:
+                torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     df = load_corpus_parquet(args.corpus_parquet)
     mb = load_npz_bundle(args.semantic_npz)
     idf = load_npz_bundle(args.idf_svd_npz)
@@ -609,44 +1094,78 @@ def main() -> None:
     print(f"  IDF corpus:  {emb_idf.shape}")
     print(f"  KAHM corpus: {emb_k.shape}")
 
-    # Build indices
-    print("\nBuilding FAISS indices ...", flush=True)
-    index_mb = build_faiss_index(emb_mb)
-    index_idf = build_faiss_index(emb_idf)
-    index_k = build_faiss_index(emb_k)
-
-    # Embed queries
+    # Embed queries (done BEFORE building FAISS indices to reduce peak memory and
+    # to initialize torch before faiss on macOS).
     print("\nEmbedding queries with IDF–SVD ...", flush=True)
     idf_pipe = load_idf_svd_model(args.idf_svd_model)
     q_idf = embed_queries_idf_svd(idf_pipe, texts)
 
     print("Embedding queries with KAHM (IDF→MB space) ...", flush=True)
     kahm_model = load_kahm_model(args.kahm_model)
-    q_kahm = kahm_regress_batched(kahm_model, q_idf, mode=args.kahm_mode, batch_size=args.kahm_batch)
+    q_kahm = kahm_regress_once(
+        kahm_model,
+        q_idf,
+        mode=args.kahm_mode,
+        batch_size=args.kahm_batch,
+        show_progress=bool(args.kahm_show_progress),
+    )
 
     print("Embedding queries with Mixedbread ...", flush=True)
-    mb_embed = build_mixedbread_embedder(args.mixedbread_model, args.device, int(emb_mb.shape[1]), args.query_prefix)
-    q_mb = mb_embed(texts, batch_size=args.mb_query_batch)
+    q_mb = embed_queries_mixedbread(
+        model_name=args.mixedbread_model,
+        device=args.device,
+        dim=int(emb_mb.shape[1]),
+        query_prefix=args.query_prefix,
+        texts=texts,
+        batch_size=int(args.mb_query_batch),
+        show_progress_bar=True,
+    )
 
-    # Retrieval + quality metrics
+    # Build/search FAISS indices sequentially to reduce peak RSS.
     k = int(args.k)
+    print("\nBuilding FAISS indices and searching ...", flush=True)
+
+    # IDF retrieval
+    index_idf = build_faiss_index(emb_idf, n_threads=(int(args.threads) if int(args.threads) > 0 else None))
+    _, idf_idx = faiss_search(index_idf, q_idf, k)
+    del index_idf
+    gc.collect()
+    # IDF corpus embeddings no longer needed beyond this point
+    del emb_idf
+    gc.collect()
+
+    # MB retrieval + KAHM(query→MB) retrieval share the same MB corpus
+    index_mb = build_faiss_index(emb_mb, n_threads=(int(args.threads) if int(args.threads) > 0 else None))
+    _, mb_idx = faiss_search(index_mb, q_mb, k)
+    _, kahm_qmb_idx = faiss_search(index_mb, q_kahm, k)
+    del index_mb
+    gc.collect()
+
+    # Full-KAHM retrieval (search KAHM corpus)
+    index_k = build_faiss_index(emb_k, n_threads=(int(args.threads) if int(args.threads) > 0 else None))
+    _, kahm_full_idx = faiss_search(index_k, q_kahm, k)
+    del index_k
+    gc.collect()
+
     pred_frac = float(args.predominance_fraction)
     n_boot = int(args.bootstrap_samples)
     seed = int(args.bootstrap_seed)
-
-    mb_scores, mb_idx = faiss_search(index_mb, q_mb, k)
-    idf_scores, idf_idx = faiss_search(index_idf, q_idf, k)
-
-    # KAHM as a drop-in replacement for MB at query-time (search MB corpus)
-    kahm_qmb_scores, kahm_qmb_idx = faiss_search(index_mb, q_kahm, k)
-
-    # Full-KAHM retrieval (search KAHM corpus)
-    kahm_full_scores, kahm_full_idx = faiss_search(index_k, q_kahm, k)
 
     mb_pq = compute_per_query_metrics(idx=mb_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
     idf_pq = compute_per_query_metrics(idx=idf_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
     kahm_qmb_pq = compute_per_query_metrics(idx=kahm_qmb_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
     kahm_full_pq = compute_per_query_metrics(idx=kahm_full_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
+
+    # Majority-vote diagnostics (independent of predominance_fraction)
+    maj_thresholds = sorted(set(_parse_float_list(args.majority_thresholds)))
+    for t in maj_thresholds:
+        if not (0.0 < float(t) <= 1.0):
+            raise ValueError(f"majority_thresholds must be in (0,1]; got {t}")
+
+    mb_mv = compute_majority_vote(idx=mb_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
+    idf_mv = compute_majority_vote(idx=idf_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
+    kahm_qmb_mv = compute_majority_vote(idx=kahm_qmb_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
+    kahm_full_mv = compute_majority_vote(idx=kahm_full_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
 
     mb_sum = summarize(mb_pq, n_boot=n_boot, seed=seed + 10)
     idf_sum = summarize(idf_pq, n_boot=n_boot, seed=seed + 20)
@@ -658,6 +1177,90 @@ def main() -> None:
     print_method("IDF–SVD", idf_sum, k=k)
     print_method("KAHM(query→MB corpus)", kahm_qmb_sum, k=k)
     print_method("Full-KAHM (query→KAHM corpus)", kahm_full_sum, k=k)
+
+    # Majority-vote behavior (highlighted block)
+    print("\nMajority-vote behavior: law-purity and vote-based routing diagnostics")
+    print_majority_vote_profile("Mixedbread (true)", mb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 500)
+    print_majority_vote_profile("IDF–SVD", idf_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 600)
+    print_majority_vote_profile("KAHM(query→MB corpus)", kahm_qmb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 700)
+    print_majority_vote_profile("Full-KAHM (query→KAHM corpus)", kahm_full_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 800)
+
+    # Paired deltas that make the "majority-vote" story explicit (especially for Storyline B).
+    print("\nMajority-vote deltas vs Mixedbread (paired, top-k law voting)")
+    print("  Report: paired mean differences with 95% bootstrap CIs")
+    print("    tau    Δcoverage(KAHM−MB)        Δmaj-acc(KAHM−MB)")
+    for t in maj_thresholds:
+        tau = float(t)
+        cov_k = (kahm_qmb_mv.maj_frac >= tau).astype(np.float64)
+        cov_mb = (mb_mv.maj_frac >= tau).astype(np.float64)
+        acc_k = (kahm_qmb_mv.maj_correct * cov_k).astype(np.float64)
+        acc_mb = (mb_mv.maj_correct * cov_mb).astype(np.float64)
+
+        d_cov_pt, d_cov_ci = _bootstrap_paired_delta_ci(cov_k, cov_mb, n_boot=n_boot, seed=seed + int(1000 * tau) + 900)
+        d_acc_pt, d_acc_ci = _bootstrap_paired_delta_ci(acc_k, acc_mb, n_boot=n_boot, seed=seed + int(1000 * tau) + 950)
+        note = "" 
+        if np.isfinite(d_acc_ci[0]) and np.isfinite(d_acc_ci[1]) and (d_acc_ci[0] > 0.0 or d_acc_ci[1] < 0.0):
+            note = "  (Δmaj-acc CI excludes 0)"
+        print(f"    {tau:0.2f}  {_fmt_delta(d_cov_pt, d_cov_ci)}    {_fmt_delta(d_acc_pt, d_acc_ci)}{note}")
+
+    # A compact decomposition that makes clear whether the gain comes from
+    # (i) more coverage or (ii) higher precision among covered cases.
+    print_majority_routing_decomposition(
+        "KAHM(q→MB)",
+        "MB",
+        kahm_qmb_mv,
+        mb_mv,
+        thresholds=maj_thresholds,
+    )
+
+    # Same decomposition, but with paired bootstrap CIs for the components.
+    print_majority_routing_decomposition_ci(
+        "KAHM(q→MB)",
+        "MB",
+        kahm_qmb_mv,
+        mb_mv,
+        thresholds=maj_thresholds,
+        n_boot=n_boot,
+        seed=seed + 9100,
+    )
+
+    # A practical suggestion: pick a tau that maximizes majority-vote precision
+    # subject to a coverage constraint.
+    min_cov = float(args.min_routing_coverage)
+    print(
+        "\nSuggested majority-vote routing thresholds (maximize precision subject to coverage constraint)"
+    )
+    print(f"  Coverage constraint: coverage >= {min_cov:0.2f}")
+    for nm, mv in [
+        ("Mixedbread (true)", mb_mv),
+        ("KAHM(query→MB corpus)", kahm_qmb_mv),
+        ("Full-KAHM (query→KAHM corpus)", kahm_full_mv),
+        ("IDF–SVD", idf_mv),
+    ]:
+        tau_star, cov_star, acc_star, prec_star = recommend_routing_threshold(
+            mv, thresholds=maj_thresholds, min_coverage=min_cov
+        )
+        print(
+            f"  {nm}: tau*={tau_star:0.2f}  coverage={cov_star:0.3f}  acc|covered={prec_star:0.3f}  majority-acc={acc_star:0.3f}"
+        )
+    print(
+        "\nAlternative majority-vote routing thresholds (maximize majority-acc subject to coverage constraint)"
+    )
+    print(f"  Coverage constraint: coverage >= {min_cov:0.2f}")
+    for nm, mv in [
+        ("Mixedbread (true)", mb_mv),
+        ("KAHM(query→MB corpus)", kahm_qmb_mv),
+        ("Full-KAHM (query→KAHM corpus)", kahm_full_mv),
+        ("IDF–SVD", idf_mv),
+    ]:
+        tau_star, cov_star, acc_star, prec_star = recommend_routing_threshold_max_majacc(
+            mv, thresholds=maj_thresholds, min_coverage=min_cov
+        )
+        print(
+            f"  {nm}: tau*={tau_star:0.2f}  coverage={cov_star:0.3f}  acc|covered={prec_star:0.3f}  majority-acc={acc_star:0.3f}"
+        )
+
+
 
     # Storyline A/B
     storyline_superiority(

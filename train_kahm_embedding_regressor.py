@@ -848,7 +848,8 @@ def main() -> int:
         except Exception as exc:
             print("WARNING: preload_kahm_classifier failed (continuing without preload).")
             print(f"  Reason: {type(exc).__name__}: {exc}")
-    Y_pred_hard = kahm_regress(model, X_eval, mode="hard")
+    
+    Y_pred_hard = kahm_regress(model, X_eval, mode="hard",batch_size=(int(args.soft_batch_size) if int(args.soft_batch_size) > 0 else None))
     metrics_hard = compute_embedding_metrics(Y_pred_hard, Y_eval)
 
     print("Hard-mode metrics:")
@@ -861,7 +862,7 @@ def main() -> int:
     if args.eval_soft or args.tune_soft:
         try:
             bs = int(args.soft_batch_size)
-            Y_pred_soft = kahm_regress(model, X_eval, mode="soft", batch_size=(bs if bs > 0 else None))
+            Y_pred_soft = kahm_regress(model, X_eval, mode="soft",return_probabilities=False, batch_size=(bs if bs > 0 else None))
             metrics_soft = compute_embedding_metrics(Y_pred_soft, Y_eval)
             print("Soft-mode metrics:")
             print(f"  Test MSE:           {metrics_soft['mse']:.6f}")

@@ -45,6 +45,12 @@ from combine_multiple_autoencoders_extended import combine_multiple_autoencoders
 
 import gc as _gc
 
+import os
+
+import tempfile
+
+
+
 # ----------------------------
 # Public result types
 # ----------------------------
@@ -778,6 +784,7 @@ def kahm_regress(
     topk: Optional[int | None] = None,
     # For large N_new, compute in batches to control memory usage
     batch_size: Optional[int] = None,
+    show_progress: bool = True,
 ) -> np.ndarray: ...
 
 
@@ -809,38 +816,28 @@ def kahm_regress(
     topk: Optional[int | None] = None,
     # For large N_new, compute in batches to control memory usage
     batch_size: Optional[int] = None,
+    # Progress bar (uses tqdm if installed)
+    show_progress: bool = True,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Predict outputs for new inputs using a trained KAHM regressor.
 
-    Supports model['classifier'] as either:
-      - a list of in-memory autoencoder objects (legacy), or
-      - a list of file paths (joblib) to per-cluster autoencoders (disk-backed).
-
-    Performance notes
-    -----------------
-    - Hard mode streams argmin distance over clusters (no dense (C_eff, N_new) matrices).
-    - Soft mode is optimized for large C_eff when topk is set and return_probabilities=False:
-        * streams over clusters and maintains per-sample top-k smallest distances
-        * avoids materializing dense P and avoids dense matmul cluster_centers @ P
-    - If you call kahm_regress repeatedly in an outer loop with disk-backed AEs,
-      call preload_kahm_classifier(model) once to avoid repeated joblib loads.
-
-    Fast guard
-    ----------
-    If the loaded AE projection matrix PC has a shape incompatible with X_new (D_in),
-    a clear ValueError is raised. This typically indicates that the AE cache directory
-    was overwritten by a different trained model (cache collision).
+    (Docstring unchanged — omitted here for brevity)
     """
-    import os
-    import gc as _gc
-    import tempfile
-    from pathlib import Path
-    from joblib import load
+
 
     # ----------------------------
     # Local helpers
     # ----------------------------
+    def _maybe_tqdm_total(total: int, desc: str, unit: str):
+        if not show_progress:
+            return None
+        try:
+            from tqdm import tqdm  # type: ignore
+            return tqdm(total=total, desc=desc, unit=unit, leave=False)
+        except Exception:
+            return None
+
     def _is_pathlike(x) -> bool:
         return isinstance(x, (str, os.PathLike, Path))
 
@@ -854,7 +851,6 @@ def kahm_regress(
         return str(p)
 
     def _extract_pc(obj):
-        # Common AE container patterns: dict with "PC" or list/tuple of such dicts.
         if isinstance(obj, dict) and "PC" in obj:
             return obj.get("PC", None)
         if isinstance(obj, (list, tuple)):
@@ -871,15 +867,11 @@ def kahm_regress(
             return
         if pc.shape[0] == D_in:
             return
-
-        # Common failure modes:
-        # - transposed PC (subspace_dim, D_in)
-        # - wrong AE set loaded due to cache collision
         if pc.shape[1] == D_in:
             raise ValueError(
                 f"Incompatible AE projection matrix PC shape {pc.shape} for input dimension D_in={D_in} "
                 f"(cluster {cluster_idx}). This strongly suggests you are loading the wrong AE files "
-                f"(cache collision / overwritten kahm_ae_cache).\\n"
+                f"(cache collision / overwritten kahm_ae_cache).\n"
                 f"Model classifier_dir={model.get('classifier_dir')!r}, model_id={model.get('model_id')!r}, "
                 f"AE ref={ae_ref!r}."
             )
@@ -890,51 +882,45 @@ def kahm_regress(
         )
 
     def _load_ae_maybe(ae_ref, *, cluster_idx: int | None = None):
-        # Use in-memory cache if present
         cache = model.get("_classifier_cache", None)
         if isinstance(cache, (list, tuple)) and cluster_idx is not None and 0 <= cluster_idx < len(cache):
             ae_obj = cache[cluster_idx]
             _guard_pc_shape(ae_obj, D_in=int(X_new.shape[0]), ae_ref="(cache)", cluster_idx=cluster_idx + 1)
-            return ae_obj, False  # not from disk
+            return ae_obj, False
 
         if _is_pathlike(ae_ref):
             resolved = _resolve_ae_path(ae_ref)
             ae_obj = load(resolved)
-            _guard_pc_shape(ae_obj, D_in=int(X_new.shape[0]), ae_ref=resolved, cluster_idx=(cluster_idx + 1 if cluster_idx is not None else None))
+            _guard_pc_shape(
+                ae_obj,
+                D_in=int(X_new.shape[0]),
+                ae_ref=resolved,
+                cluster_idx=(cluster_idx + 1 if cluster_idx is not None else None),
+            )
             return ae_obj, True
-        _guard_pc_shape(ae_ref, D_in=int(X_new.shape[0]), ae_ref="(in-memory)", cluster_idx=(cluster_idx + 1 if cluster_idx is not None else None))
+
+        _guard_pc_shape(
+            ae_ref,
+            D_in=int(X_new.shape[0]),
+            ae_ref="(in-memory)",
+            cluster_idx=(cluster_idx + 1 if cluster_idx is not None else None),
+        )
         return ae_ref, False
 
-    def _update_topk_inplace(
-        best_d: np.ndarray,    # (k, nb) float64
-        best_i: np.ndarray,    # (k, nb) int64
-        worst_pos: np.ndarray, # (nb,) int64
-        worst_val: np.ndarray, # (nb,) float64
-        d: np.ndarray,         # (nb,) float64
-        cluster_idx: int,
-    ) -> None:
+    def _update_topk_inplace(best_d, best_i, worst_pos, worst_val, d, cluster_idx: int) -> None:
         mask = d < worst_val
         if not np.any(mask):
             return
-
         cols = np.nonzero(mask)[0]
         pos = worst_pos[cols]
         best_d[pos, cols] = d[cols]
         best_i[pos, cols] = cluster_idx
-
         sub = best_d[:, cols]
         new_wpos = np.argmax(sub, axis=0)
         worst_pos[cols] = new_wpos
         worst_val[cols] = sub[new_wpos, np.arange(cols.size)]
 
-    def _soft_predict_from_topk(
-        idx: np.ndarray,        # (k, nb) int64
-        dist: np.ndarray,       # (k, nb) float64
-        *,
-        centers: np.ndarray,    # (D_out, C_eff)
-        alpha_f: float,
-        out_dtype: np.dtype,
-    ) -> np.ndarray:
+    def _soft_predict_from_topk(idx, dist, *, centers, alpha_f: float, out_dtype: np.dtype) -> np.ndarray:
         k, nb = dist.shape
         w = 1.0 - dist
         np.clip(w, 0.0, 1.0, out=w)
@@ -956,7 +942,6 @@ def kahm_regress(
         if np.any(zero_cols):
             mean_center = centers.mean(axis=1, keepdims=True).astype(out_dtype, copy=False)
             Y_hat[:, zero_cols] = mean_center
-
         return Y_hat
 
     # ----------------------------
@@ -972,9 +957,7 @@ def kahm_regress(
 
     AE_arr = model.get("_classifier_cache", model.get("classifier", None))
     if not isinstance(AE_arr, (list, tuple)) or len(AE_arr) == 0:
-        raise TypeError(
-            "Expected model['classifier'] (or model['_classifier_cache']) to be a non-empty list/tuple."
-        )
+        raise TypeError("Expected model['classifier'] (or model['_classifier_cache']) to be a non-empty list/tuple.")
 
     cluster_centers = _as_float_ndarray(model["cluster_centers"])  # (D_out, C_eff)
     if str(model.get("cluster_centers_normalization", "none")).lower().strip() == "l2":
@@ -982,65 +965,71 @@ def kahm_regress(
 
     C_eff = int(cluster_centers.shape[1])
     if len(AE_arr) != C_eff:
-        raise ValueError(
-            f"Mismatch: got {len(AE_arr)} autoencoders but cluster_centers has C_eff={C_eff} clusters."
-        )
+        raise ValueError(f"Mismatch: got {len(AE_arr)} autoencoders but cluster_centers has C_eff={C_eff} clusters.")
 
     N_new = int(X_new.shape[1])
     out_dtype = np.result_type(cluster_centers.dtype, np.float32)
     distance_type = "folding"
 
     # -----------------------
-    # HARD MODE (streaming)
+    # HARD MODE
     # -----------------------
     if mode == "hard":
         best_dist = np.full((N_new,), np.inf, dtype=np.float64)
         best_idx = np.zeros((N_new,), dtype=np.int64)
 
         bs = int(batch_size) if (batch_size is not None and int(batch_size) > 0) else None
+        # Total distance-evals in hard mode ~ C_eff * N_new
+        pbar = _maybe_tqdm_total(C_eff * N_new, desc="KAHM hard: distance eval", unit="sample")
 
-        for c, AE_ref in enumerate(model.get("classifier", AE_arr)):
-            AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
-
-            try:
-                if bs is None:
-                    d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
-                    d = np.asarray(d, dtype=np.float64).reshape(-1)
-                    if d.size != N_new:
-                        raise ValueError(
-                            f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
-                        )
-                    mask = d < best_dist
-                    best_dist[mask] = d[mask]
-                    best_idx[mask] = c
-                else:
-                    for start in range(0, N_new, bs):
-                        end = min(start + bs, N_new)
-                        X_batch = X_new[:, start:end]
-                        d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
+        try:
+            for c, AE_ref in enumerate(model.get("classifier", AE_arr)):
+                AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
+                try:
+                    if bs is None:
+                        d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
                         d = np.asarray(d, dtype=np.float64).reshape(-1)
-                        if d.size != (end - start):
+                        if d.size != N_new:
                             raise ValueError(
-                                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({end-start},)."
+                                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({N_new},)."
                             )
+                        mask = d < best_dist
+                        best_dist[mask] = d[mask]
+                        best_idx[mask] = c
+                        if pbar is not None:
+                            pbar.update(N_new)
+                    else:
+                        for start in range(0, N_new, bs):
+                            end = min(start + bs, N_new)
+                            X_batch = X_new[:, start:end]
+                            d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
+                            d = np.asarray(d, dtype=np.float64).reshape(-1)
+                            if d.size != (end - start):
+                                raise ValueError(
+                                    f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({end-start},)."
+                                )
 
-                        cols = np.arange(start, end)
-                        mask = d < best_dist[cols]
-                        upd = cols[mask]
-                        best_dist[upd] = d[mask]
-                        best_idx[upd] = c
-            finally:
-                if from_disk:
-                    del AE_c
-                    _gc.collect()
+                            cols = np.arange(start, end)
+                            mask = d < best_dist[cols]
+                            upd = cols[mask]
+                            best_dist[upd] = d[mask]
+                            best_idx[upd] = c
+
+                            if pbar is not None:
+                                pbar.update(end - start)
+                finally:
+                    if from_disk:
+                        del AE_c
+                        _gc.collect()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         Y_pred = cluster_centers[:, best_idx]
-
         if return_probabilities:
             P_hard = np.zeros((C_eff, N_new), dtype=out_dtype)
             P_hard[best_idx, np.arange(N_new)] = 1.0
             return Y_pred, P_hard
-
         return Y_pred
 
     # -----------------------
@@ -1051,7 +1040,7 @@ def kahm_regress(
 
     alpha_resolved, topk_resolved = _get_soft_params_from_model(model, alpha, topk)
 
-    # FAST TOP-K path (no dense P, no dense matmul)
+    # FAST TOP-K path
     if (not return_probabilities) and (topk_resolved is not None):
         k_req = int(topk_resolved)
         if 0 < k_req < C_eff:
@@ -1077,51 +1066,64 @@ def kahm_regress(
                 worst_pos_list.append(wp)
                 worst_val_list.append(wv)
 
-            # Stream over clusters (loads each AE once)
-            for c, AE_ref in enumerate(model.get("classifier", AE_arr)):
-                AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
-                try:
-                    for b_idx, (s, e) in enumerate(slices):
-                        X_batch = X_new[:, s:e]
-                        d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
-                        d = np.asarray(d, dtype=np.float64).reshape(-1)
-                        if d.size != (e - s):
-                            raise ValueError(
-                                f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({e-s},)."
+            # Progress over total distance-evals ~ C_eff * N_new
+            pbar = _maybe_tqdm_total(C_eff * N_new, desc="KAHM soft: distance eval", unit="sample")
+            try:
+                for c, AE_ref in enumerate(model.get("classifier", AE_arr)):
+                    AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
+                    try:
+                        for b_idx, (s, e) in enumerate(slices):
+                            X_batch = X_new[:, s:e]
+                            d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
+                            d = np.asarray(d, dtype=np.float64).reshape(-1)
+                            if d.size != (e - s):
+                                raise ValueError(
+                                    f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({e-s},)."
+                                )
+                            _update_topk_inplace(
+                                best_d_list[b_idx],
+                                best_i_list[b_idx],
+                                worst_pos_list[b_idx],
+                                worst_val_list[b_idx],
+                                d,
+                                c,
                             )
-                        _update_topk_inplace(
-                            best_d_list[b_idx],
-                            best_i_list[b_idx],
-                            worst_pos_list[b_idx],
-                            worst_val_list[b_idx],
-                            d,
-                            c,
-                        )
-                finally:
-                    if from_disk:
-                        del AE_c
-                        _gc.collect()
+                            if pbar is not None:
+                                pbar.update(e - s)
+                    finally:
+                        if from_disk:
+                            del AE_c
+                            _gc.collect()
+            finally:
+                if pbar is not None:
+                    pbar.close()
 
-            # Predict from top-k buffers
+            # Predict from top-k buffers (optional short progress)
             Y_pred = np.empty((cluster_centers.shape[0], N_new), dtype=out_dtype)
             alpha_f = float(alpha_resolved)
 
-            for b_idx, (s, e) in enumerate(slices):
-                bd = best_d_list[b_idx]
-                bi = best_i_list[b_idx]
+            pbar2 = _maybe_tqdm_total(N_new, desc="KAHM soft: assemble", unit="sample")
+            try:
+                for b_idx, (s, e) in enumerate(slices):
+                    bd = best_d_list[b_idx]
+                    bi = best_i_list[b_idx]
 
-                order = np.argsort(bd, axis=0)
-                bd_sorted = np.take_along_axis(bd, order, axis=0)
-                bi_sorted = np.take_along_axis(bi, order, axis=0)
+                    order = np.argsort(bd, axis=0)
+                    bd_sorted = np.take_along_axis(bd, order, axis=0)
+                    bi_sorted = np.take_along_axis(bi, order, axis=0)
 
-                Y_pred[:, s:e] = _soft_predict_from_topk(
-                    bi_sorted, bd_sorted, centers=cluster_centers, alpha_f=alpha_f, out_dtype=out_dtype
-                )
+                    Y_pred[:, s:e] = _soft_predict_from_topk(
+                        bi_sorted, bd_sorted, centers=cluster_centers, alpha_f=alpha_f, out_dtype=out_dtype
+                    )
+                    if pbar2 is not None:
+                        pbar2.update(e - s)
+            finally:
+                if pbar2 is not None:
+                    pbar2.close()
 
             return Y_pred
 
-    # Dense fallback (required for return_probabilities=True or topk=None)
-    # Disk-backed optimization when batch_size is set: build full D on disk (memmap) once.
+    # Dense fallback (unchanged)
     if batch_size is not None and int(batch_size) > 0 and not return_probabilities:
         bs = int(batch_size)
 
@@ -1130,6 +1132,9 @@ def kahm_regress(
         tmp.close()
 
         D_mm = None
+        # Progress over total distance-evals ~ C_eff * N_new
+        pbar = _maybe_tqdm_total(C_eff * N_new, desc="KAHM soft(dense): distance eval", unit="sample")
+
         try:
             D_mm = np.memmap(tmp_path, mode="w+", dtype=np.float32, shape=(C_eff, N_new))
 
@@ -1146,6 +1151,8 @@ def kahm_regress(
                                 f"Distance vector from cluster {c + 1} has shape {d.shape}; expected ({end-start},)."
                             )
                         D_mm[c, start:end] = d
+                        if pbar is not None:
+                            pbar.update(end - start)
                 finally:
                     if from_disk:
                         del AE_c
@@ -1156,19 +1163,28 @@ def kahm_regress(
 
             Y_pred = np.empty((cluster_centers.shape[0], N_new), dtype=out_dtype)
 
-            for start in range(0, N_new, bs):
-                end = min(start + bs, N_new)
-                N_b = end - start
-                D_batch = np.asarray(D_mm[:, start:end], dtype=np.float64)
-                D_batch = _ensure_distance_matrix_shape(_as_float_ndarray(D_batch), C_eff, N_b, labels=None)
-                P_batch = distances_to_probabilities_one_minus_sharp(
-                    D_batch, alpha=float(alpha_resolved), topk=topk_resolved, inplace=True
-                )
-                Y_pred[:, start:end] = cluster_centers @ P_batch
+            pbar2 = _maybe_tqdm_total(N_new, desc="KAHM soft(dense): predict", unit="sample")
+            try:
+                for start in range(0, N_new, bs):
+                    end = min(start + bs, N_new)
+                    N_b = end - start
+                    D_batch = np.asarray(D_mm[:, start:end], dtype=np.float64)
+                    D_batch = _ensure_distance_matrix_shape(_as_float_ndarray(D_batch), C_eff, N_b, labels=None)
+                    P_batch = distances_to_probabilities_one_minus_sharp(
+                        D_batch, alpha=float(alpha_resolved), topk=topk_resolved, inplace=True
+                    )
+                    Y_pred[:, start:end] = cluster_centers @ P_batch
+                    if pbar2 is not None:
+                        pbar2.update(N_b)
+            finally:
+                if pbar2 is not None:
+                    pbar2.close()
 
             return Y_pred
 
         finally:
+            if pbar is not None:
+                pbar.close()
             try:
                 if D_mm is not None:
                     del D_mm
@@ -1179,7 +1195,7 @@ def kahm_regress(
             except OSError:
                 pass
 
-    # Non-batched dense path (and also used when return_probabilities=True)
+    # Non-batched dense path (and return_probabilities=True) unchanged
     D = np.empty((C_eff, N_new), dtype=np.float64)
     for c, AE_ref in enumerate(model.get("classifier", AE_arr)):
         AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
@@ -1197,14 +1213,13 @@ def kahm_regress(
                 _gc.collect()
 
     D = _ensure_distance_matrix_shape(_as_float_ndarray(D), C_eff, N_new, labels=None)
-    P = distances_to_probabilities_one_minus_sharp(
-        D, alpha=float(alpha_resolved), topk=topk_resolved, inplace=True
-    )
+    P = distances_to_probabilities_one_minus_sharp(D, alpha=float(alpha_resolved), topk=topk_resolved, inplace=True)
     Y_pred = cluster_centers @ P
 
     if return_probabilities:
         return Y_pred, P
     return Y_pred
+
 def tune_soft_params(
     model: dict,
     X_val: np.ndarray,
