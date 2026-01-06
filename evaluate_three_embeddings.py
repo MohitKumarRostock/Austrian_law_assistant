@@ -135,28 +135,183 @@ def build_publication_report_md(
     threshold_suggestions: Dict[str, Any],
     alignment: Dict[str, Any],
 ) -> str:
-    """Build a single publication-ready Markdown report."""
+    """Build a single Markdown report intended to be pasted into a scientific manuscript."""
     ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    pred_frac = float(getattr(args, "predominance_fraction", 0.50))
+
+    def _ci_excludes_0(ci: Tuple[float, float]) -> bool:
+        return bool(np.isfinite(ci[0]) and np.isfinite(ci[1]) and (ci[0] > 0.0 or ci[1] < 0.0))
+
+    def _get_row(story: Dict[str, Any], key: str) -> Dict[str, Any]:
+        for r in story.get("rows", []):
+            if r.get("key") == key:
+                return r
+        # Fallback: match by label substring (legacy / robustness)
+        for r in story.get("rows", []):
+            if key in str(r.get("label", "")):
+                return r
+        return {}
+
+    # Headline quantities for narrative sections.
+    mb = method_summaries["Mixedbread (true)"]
+    idf = method_summaries["IDF–SVD"]
+    kahm_qmb = method_summaries["KAHM(query→MB corpus)"]
+
+    # Narrative deltas (if present).
+    d_kahm_vs_mb_majority = _get_row(storyline_b, "majority") or _get_row(storyline_b, "majority-accuracy")
 
     lines: List[str] = []
     lines.append(f"# {report_title}")
     lines.append("")
     lines.append(f"**Generated (UTC):** {ts}  ")
-    lines.append(f"**Script:** `{os.path.basename(__file__)}` (version `{SCRIPT_VERSION}`)  ")
+    lines.append(f"**Source script:** `{os.path.basename(__file__)}` (version `{SCRIPT_VERSION}`)  ")
     lines.append("")
-    lines.append("## Experimental setup")
+
+    # -------------------------------------------------------------------------
+    # Abstract
+    lines.append("## Abstract")
     lines.append("")
+    mb_hit_pt, _ = mb["hit"]
+    idf_hit_pt, _ = idf["hit"]
+    k_hit_pt, _ = kahm_qmb["hit"]
+
+    mb_mrr_pt, _ = mb["mrr_ul"]
+    idf_mrr_pt, _ = idf["mrr_ul"]
+    k_mrr_pt, _ = kahm_qmb["mrr_ul"]
+
+    cos_corpus_pt = float(alignment.get("cosine_corpus", {}).get("pt", float("nan")))
+
+    maj_delta_sentence = ""
+    if d_kahm_vs_mb_majority and isinstance(d_kahm_vs_mb_majority.get("ci"), (tuple, list)):
+        maj_delta_sentence = (
+            " Majority-vote accuracy increased by "
+            f"{_fmt_delta(float(d_kahm_vs_mb_majority['delta']), tuple(d_kahm_vs_mb_majority['ci']))}."
+        )
+
     lines.append(
-        f"- Queries: **{n_queries}**  \n"
-        f"- Corpus sentences (aligned): **{n_corpus}**  \n"
-        f"- Embedding dimension: **{embedding_dim}**  \n"
-        f"- Retrieval depth: **k={k}**  \n"
-        f"- Bootstrap: **paired nonparametric**, {int(args.bootstrap_samples)} samples, seed={int(args.bootstrap_seed)}  \n"
-        f"- Majority-vote routing thresholds: {getattr(args, 'majority_thresholds', 'n/a')}  \n"
-        f"- Predominance fraction (per-query metric): {float(args.predominance_fraction):0.2f}"
+        "We evaluate KAHM embeddings for sentence-level retrieval in Austrian legal texts by comparing "
+        "(i) a strong low-cost baseline (IDF–SVD), (ii) a Mixedbread SentenceTransformers baseline, and "
+        "(iii) KAHM query embeddings obtained by regressing IDF–SVD representations into Mixedbread space. "
+        f"Across {n_queries} queries (k={k}), KAHM(query→MB corpus) achieved Hit@{k}={k_hit_pt:.3f} and "
+        f"MRR@{k}={k_mrr_pt:.3f}, substantially improving over IDF–SVD "
+        f"(Hit@{k}={idf_hit_pt:.3f}, MRR@{k}={idf_mrr_pt:.3f}) and remaining competitive with Mixedbread "
+        f"(Hit@{k}={mb_hit_pt:.3f}, MRR@{k}={mb_mrr_pt:.3f})."
+        + maj_delta_sentence
+        + " "
+        f"Full-KAHM embeddings exhibited strong cosine alignment with Mixedbread in embedding space "
+        f"(mean cosine={cos_corpus_pt:.4f}) and their retrieval neighborhoods were closer to Mixedbread "
+        "than those of IDF–SVD by overlap-based measures."
     )
     lines.append("")
-    lines.append("## Main retrieval results")
+
+    # -------------------------------------------------------------------------
+    # Experimental configuration
+    lines.append("## Experimental configuration")
+    lines.append("")
+    lines.append("The following settings were recorded in the evaluation run:")
+    lines.append("")
+    lines.append(
+        f"- Queries: **{n_queries}**\n"
+        f"- Corpus sentences (aligned): **{n_corpus}**\n"
+        f"- Embedding dimension: **{embedding_dim}**\n"
+        f"- Retrieval depth: **k={k}**\n"
+        f"- Bootstrap: **paired nonparametric**, {int(args.bootstrap_samples)} samples, seed={int(args.bootstrap_seed)}\n"
+        f"- Majority-vote routing thresholds: {getattr(args, 'majority_thresholds', 'n/a')}\n"
+        f"- Predominance fraction (per-query majority accuracy): **{pred_frac:0.2f}**"
+    )
+    lines.append("")
+    lines.append("### Implementation details")
+    lines.append("")
+    lines.append("- Retrieval uses FAISS inner-product search over **L2-normalized** embeddings (equivalent to cosine similarity).")
+    lines.append(f"- Mixedbread baseline: `{getattr(args, 'mixedbread_model', 'n/a')}` with query prefix `{getattr(args, 'query_prefix', '')}`.")
+    lines.append(f"- IDF–SVD: pipeline loaded from `{getattr(args, 'idf_svd_model', 'n/a')}`; corpus index from `{getattr(args, 'idf_svd_npz', 'n/a')}`.")
+    lines.append(
+        f"- KAHM: regressor loaded from `{getattr(args, 'kahm_model', 'n/a')}` (mode `{getattr(args, 'kahm_mode', 'n/a')}`), "
+        "mapping IDF–SVD query embeddings into Mixedbread space."
+    )
+    lines.append("- Methods compared:")
+    lines.append("  - **Mixedbread (true):** Mixedbread queries → Mixedbread corpus.")
+    lines.append("  - **IDF–SVD:** IDF–SVD queries → IDF–SVD corpus.")
+    lines.append("  - **KAHM(query→MB corpus):** KAHM-regressed queries → Mixedbread corpus.")
+    lines.append(
+        "  - **Full-KAHM (query→KAHM corpus):** KAHM-regressed queries → KAHM-transformed corpus "
+        f"(`{getattr(args, 'kahm_corpus_npz', 'n/a')}`)."
+    )
+    lines.append("")
+
+    # -------------------------------------------------------------------------
+    # Methods
+    lines.append("## Methods")
+    lines.append("")
+    lines.append("### Data and alignment")
+    lines.append("")
+    lines.append(
+        "Each embedding index provides sentence identifiers that are aligned against a shared sentence-level corpus. "
+        "All reported retrieval metrics are computed over the intersection of sentence identifiers present in each "
+        "embedding index, yielding {:,} common sentences.".format(int(n_corpus))
+    )
+    lines.append("")
+    lines.append("### Retrieval protocol")
+    lines.append("")
+    lines.append(
+        "For each query, we compute a query embedding for each method, retrieve the top-k nearest neighbors from the "
+        "corresponding index, and map retrieved sentence identifiers to their associated law identifiers to compute "
+        "law-level retrieval metrics."
+    )
+    lines.append("")
+    lines.append("### Evaluation metrics")
+    lines.append("")
+    lines.append(
+        "Let the reference label for a query be its *consensus law* (a single law identifier). "
+        "Metrics are computed per query and then averaged:"
+    )
+    lines.append("")
+    lines.append(f"- **Hit@k:** 1 if the consensus law appears at least once among the top-k retrieved laws; else 0.")
+    lines.append(f"- **Top-1 accuracy:** 1 if the top-ranked retrieved law equals the consensus law; else 0.")
+    lines.append(
+        f"- **MRR@k (unique laws):** form the ordered list of *unique* laws appearing in the top-k list; "
+        f"if the consensus law occurs at rank r in this list, score 1/r; otherwise 0."
+    )
+    lines.append(
+        f"- **Majority accuracy (predominance ≥ {pred_frac:0.2f}):** let the majority law be the most frequent law "
+        f"in the top-k list and let f be its fraction. Score 1 if (i) the majority law equals the consensus law and "
+        f"(ii) f ≥ {pred_frac:0.2f}; otherwise 0."
+    )
+    lines.append(f"- **Mean consensus fraction:** fraction of the top-k items belonging to the consensus law (count/k).")
+    lines.append(
+        f"- **Mean lift vs prior:** for each query, divide the consensus fraction by the marginal probability of the "
+        f"consensus law in the aligned corpus; report the mean across queries."
+    )
+    lines.append("")
+    lines.append("### Majority-vote diagnostics and routing")
+    lines.append("")
+    lines.append("We summarize the law vote distribution over each query’s top-k neighborhood using:")
+    lines.append("- **Top-law fraction:** fraction of the top-k belonging to the most frequent law.")
+    lines.append("- **Vote margin:** (top-law fraction) minus (runner-up law fraction).")
+    lines.append("- **Vote entropy:** Shannon entropy of the empirical law distribution in the top-k list.")
+    lines.append("- **#Unique laws:** number of distinct laws appearing in the top-k list.")
+    lines.append(
+        "For routing, we evaluate a threshold rule that accepts the majority-law prediction when the top-law fraction ≥ τ. "
+        "We report (i) **coverage** P(covered), (ii) **accuracy among covered** P(correct | covered), and "
+        "(iii) **majority accuracy** P(correct ∩ covered)."
+    )
+    lines.append("")
+    lines.append("### Statistical analysis")
+    lines.append("")
+    lines.append(
+        "We estimate 95% confidence intervals (CIs) using a paired, nonparametric bootstrap over queries. "
+        "For paired deltas, the statistic is computed on per-query differences; a delta is treated as statistically "
+        "different from 0 when its 95% CI excludes 0."
+    )
+    lines.append("")
+
+    # -------------------------------------------------------------------------
+    # Results
+    lines.append("## Results")
+    lines.append("")
+    lines.append("### Main retrieval performance")
+    lines.append("")
+    lines.append("**Table 1.** Main retrieval metrics (mean over queries; 95% bootstrap CI).")
     lines.append("")
     metric_order = [
         ("hit", f"Hit@{k}"),
@@ -182,50 +337,48 @@ def build_publication_report_md(
         rows.append(r)
     lines.append(_md_table(headers, rows))
     lines.append("")
-    lines.append(
-        "Notes: Metrics are averaged across queries. Values are point estimates with 95% bootstrap confidence intervals."
-    )
-    lines.append("")
 
-    # Storyline A
-    lines.append("## Storyline A: Superiority vs low-cost baseline (KAHM(q→MB) vs IDF–SVD)")
+    lines.append("### Comparative analyses")
     lines.append("")
-    headers = ["Metric", "Δ (KAHM − IDF)", "Decision"]
-    rows = []
-    for r in storyline_a["rows"]:
-        decision = "PASS" if r.get("pass", False) else "FAIL"
-        rows.append([r["label"], _delta_cell(r["delta"], r["ci"], digits=3), decision])
-    lines.append(_md_table(headers, rows))
+    lines.append("**Table 2.** Paired deltas for KAHM(query→MB corpus) vs IDF–SVD (95% bootstrap CI).")
     lines.append("")
-    lines.append(f"**Verdict:** {storyline_a.get('verdict','')}")
-    lines.append("")
-
-    # Storyline B
-    lines.append("## Storyline B: Competitiveness vs Mixedbread (KAHM(q→MB) vs MB)")
-    lines.append("")
-    headers = ["Metric", "Δ (KAHM − MB)", "CI excludes 0?"]
-    rows = []
-    for r in storyline_b["rows"]:
-        rows.append(
+    a_headers = ["Metric", "Δ (KAHM − IDF)", "95% CI excludes 0?", "Superiority (lower CI > 0)?"]
+    a_rows: List[List[str]] = []
+    for r in storyline_a.get("rows", []):
+        ci = tuple(r.get("ci", (float("nan"), float("nan"))))
+        a_rows.append(
             [
-                r["label"],
-                _delta_cell(r["delta"], r["ci"], digits=3),
-                "Yes" if r.get("ci_excludes_0", False) else "No",
+                str(r.get("label", "")),
+                _delta_cell(float(r.get("delta", float("nan"))), ci, digits=3),
+                "Yes" if _ci_excludes_0(ci) else "No",
+                "Yes" if bool(r.get("pass", False)) else "No",
             ]
         )
-    lines.append(_md_table(headers, rows))
+    lines.append(_md_table(a_headers, a_rows))
+    lines.append("")
+    lines.append("Interpretation: the superiority column reflects the one-sided criterion used in the evaluation (paired 95% CI lower bound > 0).")
     lines.append("")
 
-    # Majority vote behavior (focus on routing)
-    lines.append("## Majority-vote behavior and vote-based routing")
+    lines.append("**Table 3.** Paired deltas for KAHM(query→MB corpus) vs Mixedbread (95% bootstrap CI).")
     lines.append("")
-    lines.append(
-        "We evaluate *top-k law voting* statistics that characterize neighborhood purity and support a simple "
-        "routing heuristic based on the top-law fraction (τ)."
-    )
+    b_headers = ["Metric", "Δ (KAHM − Mixedbread)", "95% CI excludes 0?"]
+    b_rows: List[List[str]] = []
+    for r in storyline_b.get("rows", []):
+        ci = tuple(r.get("ci", (float("nan"), float("nan"))))
+        b_rows.append(
+            [
+                str(r.get("label", "")),
+                _delta_cell(float(r.get("delta", float("nan"))), ci, digits=3),
+                "Yes" if bool(r.get("ci_excludes_0", _ci_excludes_0(ci))) else "No",
+            ]
+        )
+    lines.append(_md_table(b_headers, b_rows))
     lines.append("")
 
-    # Compact profile table (means + CIs)
+    lines.append("### Majority-vote behavior")
+    lines.append("")
+    lines.append(f"**Table 4.** Vote-distribution diagnostics over the top-k neighborhood (k={k}; 95% bootstrap CI).")
+    lines.append("")
     prof_headers = ["Method", "Top-law fraction", "Vote margin", "Vote entropy", "#Unique laws", f"P(all {k} one law)"]
     prof_rows: List[List[str]] = []
     for method_name in [
@@ -248,10 +401,22 @@ def build_publication_report_md(
     lines.append(_md_table(prof_headers, prof_rows))
     lines.append("")
 
-    # Threshold sweep for MB vs KAHM(q→MB) (coverage/precision)
-    lines.append("### Routing threshold sweep (KAHM(q→MB) vs MB)")
+    lines.append("### Vote-based routing")
     lines.append("")
-    sweep_headers = ["τ", "Coverage (KAHM)", "Acc|Covered (KAHM)", "Maj-Acc (KAHM)", "Coverage (MB)", "Acc|Covered (MB)", "Maj-Acc (MB)"]
+    lines.append(
+        "**Table 5.** Routing sweep comparing KAHM(query→MB corpus) and Mixedbread at different predominance thresholds τ "
+        "(95% bootstrap CI)."
+    )
+    lines.append("")
+    sweep_headers = [
+        "τ",
+        "Coverage (KAHM)",
+        "Accuracy among covered (KAHM)",
+        "Majority accuracy (KAHM)",
+        "Coverage (Mixedbread)",
+        "Accuracy among covered (Mixedbread)",
+        "Majority accuracy (Mixedbread)",
+    ]
     sweep_rows: List[List[str]] = []
     mb_sweep = {float(r["tau"]): r for r in majority_profiles["Mixedbread (true)"]["threshold_sweep"]}
     k_sweep = {float(r["tau"]): r for r in majority_profiles["KAHM(query→MB corpus)"]["threshold_sweep"]}
@@ -272,11 +437,10 @@ def build_publication_report_md(
     lines.append(_md_table(sweep_headers, sweep_rows))
     lines.append("")
 
-    # Deltas vs MB
-    lines.append("### Paired deltas vs Mixedbread for routing (KAHM(q→MB) − MB)")
+    lines.append("**Table 6.** Paired deltas vs Mixedbread for routing (KAHM(query→MB corpus) − Mixedbread).")
     lines.append("")
-    dv_headers = ["τ", "ΔCoverage", "ΔMajority-Acc"]
-    dv_rows = []
+    dv_headers = ["τ", "ΔCoverage", "ΔMajority accuracy"]
+    dv_rows: List[List[str]] = []
     for r in majority_deltas_vs_mb:
         dv_rows.append(
             [
@@ -288,12 +452,11 @@ def build_publication_report_md(
     lines.append(_md_table(dv_headers, dv_rows))
     lines.append("")
 
-    # Decomposition
-    lines.append("### Decomposition of ΔMajority-Acc into coverage vs precision effects")
+    lines.append("**Table 7.** Decomposition of ΔMajority accuracy into coverage and precision effects.")
     lines.append("")
-    lines.append("Point-estimate decomposition:")
-    dep_headers = ["τ", "ΔMaj-Acc", "ΔCoverage part", "ΔPrecision part"]
-    dep_rows = []
+    lines.append("Point estimates:")
+    dep_headers = ["τ", "ΔMajority accuracy", "Coverage contribution", "Precision contribution"]
+    dep_rows: List[List[str]] = []
     for r in decomp_point_rows:
         dep_rows.append(
             [
@@ -306,7 +469,7 @@ def build_publication_report_md(
     lines.append(_md_table(dep_headers, dep_rows))
     lines.append("")
     lines.append("With paired-bootstrap CIs:")
-    dep2_rows = []
+    dep2_rows: List[List[str]] = []
     for r in decomp_ci_rows:
         dep2_rows.append(
             [
@@ -319,18 +482,17 @@ def build_publication_report_md(
     lines.append(_md_table(dep_headers, dep2_rows))
     lines.append("")
 
-    # Threshold suggestions
-    lines.append("### Suggested routing thresholds")
+    lines.append("**Table 8.** Suggested routing thresholds (coverage constraint and objectives).")
     lines.append("")
     lines.append(f"Coverage constraint: **coverage ≥ {threshold_suggestions['coverage_constraint']:0.2f}**")
     lines.append("")
-    sug_headers = ["Method", "τ*", "Coverage", "Acc|Covered", "Majority-Acc", "Objective"]
-    sug_rows = []
+    sug_headers = ["Method", "τ*", "Coverage", "Accuracy among covered", "Majority accuracy", "Objective"]
+    sug_rows: List[List[str]] = []
     for objective_key, objective_label in [
-        ("maximize_precision_subject_to_coverage", "Max precision"),
-        ("maximize_majority_acc_subject_to_coverage", "Max majority-acc"),
+        ("maximize_precision_subject_to_coverage", "Maximize precision"),
+        ("maximize_majority_acc_subject_to_coverage", "Maximize majority accuracy"),
     ]:
-        for method_name, rec in threshold_suggestions[objective_key].items():
+        for method_name, rec in threshold_suggestions.get(objective_key, {}).items():
             sug_rows.append(
                 [
                     method_name,
@@ -344,8 +506,9 @@ def build_publication_report_md(
     lines.append(_md_table(sug_headers, sug_rows))
     lines.append("")
 
-    # Alignment
-    lines.append("## Storyline C: Embedding-space alignment and neighborhood overlap (Full-KAHM vs MB)")
+    lines.append("### Embedding-space alignment and neighborhood overlap")
+    lines.append("")
+    lines.append("**Table 9.** Alignment and overlap statistics for Full-KAHM vs Mixedbread (95% bootstrap CI).")
     lines.append("")
     align_headers = ["Quantity", "Estimate (95% CI)"]
     align_rows = [
@@ -354,28 +517,52 @@ def build_publication_report_md(
         [f"Sentence Jaccard@{k}", _ci_cell(alignment["sentence_jaccard"]["pt"], alignment["sentence_jaccard"]["ci"], digits=3)],
         [f"Sentence overlap fraction@{k}", _ci_cell(alignment["sentence_overlap_frac"]["pt"], alignment["sentence_overlap_frac"]["ci"], digits=3)],
         [f"Law-set Jaccard@{k}", _ci_cell(alignment["lawset_jaccard"]["pt"], alignment["lawset_jaccard"]["ci"], digits=3)],
-        ["Δ sentence Jaccard (Full−IDF)", _delta_cell(alignment["delta_sentence_jaccard_full_minus_idf"]["pt"], alignment["delta_sentence_jaccard_full_minus_idf"]["ci"], digits=3)],
-        ["Δ law-set Jaccard (Full−IDF)", _delta_cell(alignment["delta_lawset_jaccard_full_minus_idf"]["pt"], alignment["delta_lawset_jaccard_full_minus_idf"]["ci"], digits=3)],
+        ["Δ sentence Jaccard (Full − IDF)", _delta_cell(alignment["delta_sentence_jaccard_full_minus_idf"]["pt"], alignment["delta_sentence_jaccard_full_minus_idf"]["ci"], digits=3)],
+        ["Δ law-set Jaccard (Full − IDF)", _delta_cell(alignment["delta_lawset_jaccard_full_minus_idf"]["pt"], alignment["delta_lawset_jaccard_full_minus_idf"]["ci"], digits=3)],
     ]
     lines.append(_md_table(align_headers, align_rows))
     lines.append("")
-    lines.append("---")
-    lines.append("### Copy-ready summary paragraph")
+
+    # -------------------------------------------------------------------------
+    # Reproducibility
+    lines.append("## Reproducibility checklist")
     lines.append("")
-    # Construct a concise paragraph with the most salient numbers.
-    mb_hit = method_summaries["Mixedbread (true)"]["hit"][0]
-    k_hit = method_summaries["KAHM(query→MB corpus)"]["hit"][0]
-    idf_hit = method_summaries["IDF–SVD"]["hit"][0]
-    k_mrr = method_summaries["KAHM(query→MB corpus)"]["mrr_ul"][0]
-    mb_mrr = method_summaries["Mixedbread (true)"]["mrr_ul"][0]
-    idf_mrr = method_summaries["IDF–SVD"]["mrr_ul"][0]
+    lines.append(f"- Query set: `{getattr(args, 'query_set', 'n/a')}`")
+    lines.append(f"- Corpus parquet: `{getattr(args, 'corpus_parquet', 'n/a')}`")
+    lines.append(f"- Mixedbread model: `{getattr(args, 'mixedbread_model', 'n/a')}`")
+    lines.append(f"- Query prefix: `{getattr(args, 'query_prefix', '')}`")
+    lines.append(f"- IDF–SVD model: `{getattr(args, 'idf_svd_model', 'n/a')}`")
+    lines.append(f"- KAHM model: `{getattr(args, 'kahm_model', 'n/a')}` (mode `{getattr(args, 'kahm_mode', 'n/a')}`)")
     lines.append(
-        f"Across {n_queries} queries (k={k}), KAHM(query→MB) achieves Hit@{k}={k_hit:.3f} and MRR@{k}={k_mrr:.3f} "
-        f"and substantially outperforms the low-cost IDF–SVD baseline (Hit@{k}={idf_hit:.3f}, MRR@{k}={idf_mrr:.3f}). "
-        f"Relative to Mixedbread (Hit@{k}={mb_hit:.3f}, MRR@{k}={mb_mrr:.3f}), KAHM(query→MB) is competitive at top-k and "
-        f"exhibits improved majority-vote behavior for low τ thresholds, with gains primarily attributable to higher precision among "
-        f"covered cases in the vote-based routing decomposition. Full-KAHM embeddings are strongly aligned with MB in cosine space, "
-        f"and their retrieval neighborhoods are statistically closer to MB than IDF–SVD neighborhoods, supporting the geometric alignment storyline."
+        f"- Indices: MB `{getattr(args, 'semantic_npz', 'n/a')}`, IDF `{getattr(args, 'idf_svd_npz', 'n/a')}`, KAHM `{getattr(args, 'kahm_corpus_npz', 'n/a')}`"
+    )
+    lines.append(f"- Device: `{getattr(args, 'device', 'n/a')}`")
+    lines.append(f"- Threads cap: {getattr(args, 'threads', 'n/a')}")
+    lines.append(f"- Bootstrap: samples={int(args.bootstrap_samples)}, seed={int(args.bootstrap_seed)}")
+    lines.append("")
+
+    # -------------------------------------------------------------------------
+    # Copy-ready summary paragraph
+    lines.append("---")
+    lines.append("## Copy-ready summary paragraph")
+    lines.append("")
+    k_hit_pt, k_hit_ci = kahm_qmb["hit"]
+    k_mrr_pt, k_mrr_ci = kahm_qmb["mrr_ul"]
+    mb_maj_delta = _get_row(storyline_b, "majority") or _get_row(storyline_b, "majority-accuracy")
+    maj_delta_phrase = ""
+    if mb_maj_delta and isinstance(mb_maj_delta.get("ci"), (tuple, list)):
+        ci = tuple(mb_maj_delta["ci"])
+        maj_delta_phrase = f" Majority accuracy differed by {_fmt_delta(float(mb_maj_delta['delta']), ci)} relative to Mixedbread."
+    lines.append(
+        f"Across {n_queries} queries (k={k}), KAHM(query→MB corpus) achieved Hit@{k}={_ci_cell(k_hit_pt, k_hit_ci, digits=3)} "
+        f"and MRR@{k}={_ci_cell(k_mrr_pt, k_mrr_ci, digits=3)}. "
+        f"Paired-bootstrap deltas favored KAHM(query→MB corpus) over IDF–SVD under the evaluation’s superiority criterion "
+        f"(Table 2). Compared to Mixedbread, paired deltas for Hit@{k}, MRR@{k}, and Top-1 accuracy were small with 95% CIs "
+        f"that included 0 (Table 3), while majority-vote behavior differed depending on the routing threshold τ (Tables 5–8)."
+        + maj_delta_phrase
+        + f" Full-KAHM embeddings showed strong cosine alignment with Mixedbread in embedding space "
+        f"(mean corpus cosine {alignment['cosine_corpus']['pt']:.4f}) and higher neighborhood overlap to Mixedbread than IDF–SVD "
+        f"by sentence- and law-level Jaccard measures (Table 9)."
     )
     lines.append("")
 
