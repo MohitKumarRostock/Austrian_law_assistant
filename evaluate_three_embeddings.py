@@ -16,13 +16,7 @@ It prints three storylines (A/B/C) from the *same* run:
   C) Alignment / "right direction" evidence:
      Full-KAHM corpus embeddings are aligned with MB embeddings (cosine alignment), and
      full-KAHM retrieval neighborhoods overlap strongly with MB neighborhoods.
-
-Why this version
-----------------
-This v4 replaces that with an alignment storyline that directly supports the argument:
-
-  "KAHM approximates MB embedding geometry well enough that nearest-neighbor retrieval
-   behaves similarly." 
+ 
 
 All confidence intervals use nonparametric *paired* bootstrap (default 5000).
 

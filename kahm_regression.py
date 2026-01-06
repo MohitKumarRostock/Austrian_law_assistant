@@ -493,7 +493,6 @@ def train_kahm_regressor(
         clf = AE_arr
 
     # 4) Downcast model arrays to reduce RAM footprint
-    #    NOTE: We keep this conservative: float32 for all numeric arrays.
     #    If you need even more savings, you can change PC to float16,
     #    but that may affect numerical stability in some OTFL implementations.
     md = str(model_dtype).lower().strip()
