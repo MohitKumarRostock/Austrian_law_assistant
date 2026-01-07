@@ -59,10 +59,11 @@ try:
         save_kahm_regressor,
         train_kahm_regressor,
         tune_soft_params,
+        tune_cluster_centers_nlms
     )
 except ImportError:  # pragma: no cover
     # Fallback to the baseline implementation.
-    from kahm_regression import kahm_regress, save_kahm_regressor, train_kahm_regressor, tune_soft_params
+    from kahm_regression import kahm_regress, save_kahm_regressor, train_kahm_regressor, tune_soft_params, tune_cluster_centers_nlms
     preload_kahm_classifier = None  # type: ignore
 
 
@@ -129,6 +130,7 @@ DEFAULT_OVERWRITE_AE_DIR = False
 # Soft-mode tuning defaults
 DEFAULT_EVAL_SOFT = True
 DEFAULT_TUNE_SOFT = True
+DEFAULT_TUNE_NLMS = True
 DEFAULT_VAL_FRACTION = 0.01
 DEFAULT_VAL_MAX_SAMPLES = 5000
 DEFAULT_SOFT_ALPHAS = (2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 18.0, 20.0, 25.0, 50.0)
@@ -589,6 +591,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Soft-mode tuning / evaluation
     p.add_argument("--eval_soft", action="store_true", default=DEFAULT_EVAL_SOFT, help="Also evaluate 'soft' prediction mode on the test set")
     p.add_argument("--tune_soft", action="store_true", default=DEFAULT_TUNE_SOFT, help="Tune (alpha, topk) for soft mode on a validation split")
+    p.add_argument("--tune_nlms", action="store_true", default=DEFAULT_TUNE_NLMS, help="Refine cluster centers with NLMS")
     p.add_argument("--val_fraction", type=float, default=DEFAULT_VAL_FRACTION, help="Validation fraction from training sentences (only if --tune_soft)")
     p.add_argument("--val_max_samples", type=int, default=DEFAULT_VAL_MAX_SAMPLES, help="Max validation samples used for tuning (subsample if larger)")
     p.add_argument("--soft_alphas", default=",".join(str(x) for x in DEFAULT_SOFT_ALPHAS), help="Comma-separated alphas for tuning grid")
@@ -835,6 +838,28 @@ def main() -> int:
                 n_jobs=1,
                 verbose=True
             )
+    
+    nlms_results = None
+    if args.tune_nlms:
+        print("\nRefining cluster centers with NLMS on training set ...")
+        nlms_results = tune_cluster_centers_nlms(
+            model,
+            X_train,
+            Y_train,
+            mu=0.1,
+            epsilon=1,
+            epochs=10,
+            batch_size=1024,
+            shuffle=True,
+            random_state=0,
+            anchor_lambda=0.0,   # set e.g. 1e-3 to pull gently toward initial KMeans centers
+            n_jobs=1,
+            preload_classifier=True,
+            verbose=True,
+            alpha=tuning_result.best_alpha if tuning_result is not None else None,
+            topk=tuning_result.best_topk if tuning_result is not None else None,
+        )
+
 
     # Evaluate on validation (if present) or test (fallback)
     print(f"\nEvaluating on {eval_name} set (sentences only) ...")

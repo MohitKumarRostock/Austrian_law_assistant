@@ -65,6 +65,19 @@ class SoftTuningResult:
     best_mse: float
 
 
+
+
+@dataclass(frozen=True)
+class NLMSCenterTuningResult:
+    """Return type for tune_cluster_centers_nlms."""
+
+    mu: float
+    epsilon: float
+    epochs: int
+    batch_size: int
+    final_mse: float
+    mse_history: Tuple[float, ...]
+
 # ----------------------------
 # Precision helpers
 # ----------------------------
@@ -120,6 +133,25 @@ def _ae_as_list(ae: Any) -> list:
             return list(ae[0])
         return list(ae)
     return [ae]
+    
+
+def _call_combine_multiple_autoencoders_extended(
+    X: np.ndarray,
+    AE_list: Sequence[Any],
+    distance_type: str,
+    *,
+    n_jobs: int | None = None,
+):
+    """Call `combine_multiple_autoencoders_extended` with best-effort support for `n_jobs`.
+
+    The upstream OTFL helper signature can vary by version. We attempt to pass `n_jobs`
+    if available; otherwise we fall back to the 3-argument call.
+    """
+    fn: Any = combine_multiple_autoencoders_extended  # `Any` silences Pylance for version-dependent signatures
+    try:
+        return fn(X, AE_list, distance_type, n_jobs=n_jobs)
+    except TypeError:
+        return fn(X, AE_list, distance_type)
 
 def l2_normalize_columns(M: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """L2-normalize columns of a 2D matrix (D, N). Safe for non-directional data when not used."""
@@ -340,7 +372,8 @@ def train_kahm_regressor(
         if do_norm:
             cluster_centers = l2_normalize_columns(cluster_centers)
             cc_applied = "l2"
-    print(f"cluster center normaization: {cc_applied}")
+    if verbose:
+        print(f"cluster center normalization: {cc_applied}")
 
     final_counts = np.bincount(labels_mapped_zero, minlength=n_clusters_eff)
     if verbose:
@@ -437,7 +470,9 @@ def train_kahm_regressor(
                 )
 
             X_c = X_clf[:, idx_c]
-            print(f" Cluster {c + 1}/{n_clusters_eff}: training autoencoder on {X_c.shape[1]} samples ...")
+            if verbose:
+
+                print(f" Cluster {c + 1}/{n_clusters_eff}: training autoencoder on {X_c.shape[1]} samples ...")
             AE_c_list = parallel_autoencoders(
                 X_c,
                 subspace_dim=subspace_dim,
@@ -480,7 +515,9 @@ def train_kahm_regressor(
                 )
 
             X_c = X_clf[:, idx_c]
-            print(f" Cluster {c + 1}/{n_clusters_eff}: training autoencoder on {X_c.shape[1]} samples ...")
+            if verbose:
+
+                print(f" Cluster {c + 1}/{n_clusters_eff}: training autoencoder on {X_c.shape[1]} samples ...")
             AE_c_list = parallel_autoencoders(
                 X_c,
                 subspace_dim=subspace_dim,
@@ -530,7 +567,8 @@ def train_kahm_regressor(
         "classifier": clf,
         "classifier_dir": classifier_dir_for_model,
         "model_id": model_id_for_model,
-        "cluster_centers": np.asarray(cluster_centers, dtype=_dtype),  # (D_out, C_eff)
+        "cluster_centers_init": cluster_centers.copy(),  # (D_out, C_eff) initial centers
+        "cluster_centers": cluster_centers,  # (D_out, C_eff) tuned/current centers
         "n_clusters": int(n_clusters_eff),
         "input_scale": float(input_scale),
         # soft params (optional; filled by tune_soft_params)
@@ -539,7 +577,6 @@ def train_kahm_regressor(
         "cluster_centers_normalization_requested": cc_req,
         "cluster_centers_normalization": cc_applied,
     }
-
 
 # ----------------------------
 # Soft probability mapping
@@ -712,14 +749,37 @@ def _get_soft_params_from_model(
     alpha: Optional[float],
     topk: Optional[int | None],
 ) -> Tuple[float, int | None]:
-    """Resolve soft parameters: prefer explicit args, else model values, else defaults."""
+    """Resolve soft parameters.
+
+    Resolution order:
+      - If an explicit argument is provided, use it.
+      - Otherwise, use the value stored in the model (if present).
+      - Otherwise, fall back to sensible defaults.
+
+    Important semantics
+    -------------------
+    - `topk=None` means "use the model setting".
+    - To *disable* top-k truncation, either:
+        * set `model['soft_topk'] = None`, or
+        * pass `topk=0` (or any non-positive value).
+    """
     if alpha is None:
         alpha = model.get("soft_alpha", None)
+
+    # Distinguish: unspecified vs. model explicitly storing None (meaning "disable top-k").
+    topk_from_model = False
     if topk is None:
-        topk = model.get("soft_topk", None)
+        if "soft_topk" in model:
+            topk = model.get("soft_topk", None)
+            topk_from_model = True
 
     alpha_resolved = float(alpha) if alpha is not None else 10.0
-    topk_resolved = topk if topk is not None else 10
+
+    if topk is None and not topk_from_model:
+        topk_resolved: int | None = 10
+    else:
+        topk_resolved = topk
+
     return alpha_resolved, topk_resolved
 
 
@@ -986,7 +1046,7 @@ def kahm_regress(
                 AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
                 try:
                     if bs is None:
-                        d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
+                        d = _call_combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type, n_jobs=n_jobs)
                         d = np.asarray(d, dtype=np.float64).reshape(-1)
                         if d.size != N_new:
                             raise ValueError(
@@ -1001,7 +1061,7 @@ def kahm_regress(
                         for start in range(0, N_new, bs):
                             end = min(start + bs, N_new)
                             X_batch = X_new[:, start:end]
-                            d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
+                            d = _call_combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type, n_jobs=n_jobs)
                             d = np.asarray(d, dtype=np.float64).reshape(-1)
                             if d.size != (end - start):
                                 raise ValueError(
@@ -1073,7 +1133,7 @@ def kahm_regress(
                     try:
                         for b_idx, (s, e) in enumerate(slices):
                             X_batch = X_new[:, s:e]
-                            d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
+                            d = _call_combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type, n_jobs=n_jobs)
                             d = np.asarray(d, dtype=np.float64).reshape(-1)
                             if d.size != (e - s):
                                 raise ValueError(
@@ -1143,7 +1203,7 @@ def kahm_regress(
                     for start in range(0, N_new, bs):
                         end = min(start + bs, N_new)
                         X_batch = X_new[:, start:end]
-                        d = combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type)
+                        d = _call_combine_multiple_autoencoders_extended(X_batch, _ae_as_list(AE_c), distance_type, n_jobs=n_jobs)
                         d = np.asarray(d, dtype=np.float32).reshape(-1)
                         if d.size != (end - start):
                             raise ValueError(
@@ -1199,7 +1259,7 @@ def kahm_regress(
     for c, AE_ref in enumerate(model.get("classifier", AE_arr)):
         AE_c, from_disk = _load_ae_maybe(AE_ref, cluster_idx=c)
         try:
-            d = combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type)
+            d = _call_combine_multiple_autoencoders_extended(X_new, _ae_as_list(AE_c), distance_type, n_jobs=n_jobs)
             d = np.asarray(d, dtype=np.float64).reshape(-1)
             if d.size != N_new:
                 raise ValueError(
@@ -1359,7 +1419,7 @@ def tune_soft_params(
             _guard_pc(AE_c, D_in=int(Xv.shape[0]), ae_ref=str(ref) if isinstance(ref, (str, os.PathLike, Path)) else "(in-memory)", cluster_idx=c + 1)
 
             try:
-                d = combine_multiple_autoencoders_extended(Xv, _ae_as_list(AE_c), "folding")
+                d = _call_combine_multiple_autoencoders_extended(Xv, _ae_as_list(AE_c), "folding", n_jobs=n_jobs)
                 d = np.asarray(d).reshape(-1)
                 if d.size != N_val:
                     raise ValueError(
@@ -1375,12 +1435,12 @@ def tune_soft_params(
                     _gc.collect()
 
         if isinstance(D_val, np.memmap):
+            # Ensure data is written to disk; keep memmap dtype (typically float32) to avoid
+            # materializing the full distance matrix into RAM.
             D_val.flush()
-            D_val_f64 = np.asarray(D_val, dtype=np.float64)
-        else:
-            D_val_f64 = D_val
 
-        D_val_f64 = _ensure_distance_matrix_shape(_as_float_ndarray(D_val_f64), C_eff, N_val, labels=None)
+        # Keep D_val in its existing dtype; downstream tuning streams over columns to control peak RAM.
+        D_val_mat = _ensure_distance_matrix_shape(_as_float_ndarray(D_val), C_eff, N_val, labels=None)
 
         alphas = tuple(alphas)
         topks = tuple(topks)
@@ -1398,8 +1458,18 @@ def tune_soft_params(
             print(f"Grid: alphas={list(alphas)}, topks={list(topks)}")
             print(f"Validation samples: {N_val}, clusters: {C_eff}")
 
-        # Work buffer to avoid reallocations
-        work = np.empty_like(D_val_f64, dtype=np.float64)
+        # Stream evaluation in column batches to avoid allocating a full (C_eff, N_val) work buffer.
+        work_max_bytes = int(model.get("tune_eval_work_max_bytes", 256 * 1024 * 1024))
+        bs_cfg = int(model.get("tune_eval_batch_cols", 4096))
+        bs_mem = max(1, int(work_max_bytes // (max(1, C_eff) * 8)))  # float64 work buffer
+        bs = max(1, min(int(N_val), int(bs_cfg), int(bs_mem)))
+
+        if verbose and N_val > bs:
+            print(f"Evaluation batch size: {bs} (streaming)")
+
+        work = np.empty((C_eff, bs), dtype=np.float64)
+        denom = np.empty((bs,), dtype=np.float64)
+
         one = 1.0
         zero = 0.0
         eps = 1e-12
@@ -1407,30 +1477,41 @@ def tune_soft_params(
         for a in alphas:
             a_f = float(a)
             for k in topks:
-                # work = (1 - D_val) ** alpha
-                np.subtract(one, D_val_f64, out=work)
-                np.clip(work, zero, one, out=work)
-                if a_f != 1.0:
-                    np.power(work, a_f, out=work)
+                sse = 0.0
+                count = 0
 
-                if k is not None:
-                    kk = int(k)
-                    if 0 < kk < C_eff:
-                        _topk_truncate_inplace(work, kk)
+                for start_col in range(0, N_val, bs):
+                    end_col = min(N_val, start_col + bs)
+                    B = end_col - start_col
 
-                denom = work.sum(axis=0, dtype=np.float64)
-                zero_cols = denom <= eps
-                if np.any(zero_cols):
-                    denom = denom.copy()
-                    denom[zero_cols] = one
+                    w = work[:, :B]
+                    np.subtract(one, D_val_mat[:, start_col:end_col], out=w)
+                    np.clip(w, zero, one, out=w)
+                    if a_f != 1.0:
+                        np.power(w, a_f, out=w)
 
-                np.divide(work, denom, out=work)
+                    if k is not None:
+                        kk = int(k)
+                        if 0 < kk < C_eff:
+                            _topk_truncate_inplace(w, kk)
 
-                if np.any(zero_cols):
-                    work[:, zero_cols] = 1.0 / C_eff
+                    dcol = denom[:B]
+                    dcol[:] = w.sum(axis=0, dtype=np.float64)
+                    zero_cols = dcol <= eps
+                    if np.any(zero_cols):
+                        dcol[zero_cols] = one
 
-                Y_hat = cluster_centers @ work
-                mse = float(np.mean((Y_hat - Y_val) ** 2))
+                    np.divide(w, dcol, out=w)
+
+                    if np.any(zero_cols):
+                        w[:, zero_cols] = 1.0 / C_eff
+
+                    Y_hat_b = cluster_centers @ w
+                    diff = Y_hat_b - Y_val[:, start_col:end_col]
+                    sse += float(np.sum(diff * diff))
+                    count += int(diff.size)
+
+                mse = float(sse / max(1, count))
 
                 if verbose:
                     print(f"  alpha={a_f:g}, topk={k}: MSE={mse:.6f}")
@@ -1439,6 +1520,7 @@ def tune_soft_params(
                     best_mse = mse
                     best_alpha = a_f
                     best_topk = k
+
 
         model["soft_alpha"] = best_alpha
         model["soft_topk"] = best_topk
@@ -1459,21 +1541,263 @@ def tune_soft_params(
                 os.remove(tmp_path)
             except OSError:
                 pass
-def save_kahm_regressor(model: dict, path: str) -> None:
+def tune_cluster_centers_nlms(
+    model: dict,
+    X: np.ndarray,
+    Y: np.ndarray,
+    *,
+    mu: float = 0.1,
+    epsilon: float | None = None,
+    epochs: int = 1,
+    batch_size: int = 1024,
+    shuffle: bool = True,
+    random_state: int | None = 0,
+    # Soft-mode parameters (None => use model['soft_*'] if set)
+    alpha: Optional[float] = None,
+    topk: Optional[int | None] = None,
+    # Optional anchoring: pull centers toward the initial KMeans centroids
+    anchor_lambda: float = 0.0,
+    # Performance
+    n_jobs: int = -1,
+    preload_classifier: bool = False,
+    verbose: bool = True,
+) -> NLMSCenterTuningResult:
+    """Tune (refine) cluster centers via Normalized LMS (NLMS).
+
+    Model structure
+    ---------------
+    The regressor predicts: Y_hat = C @ p(x),
+    where C is model['cluster_centers'] (D_out, K) and p(x) are soft assignment
+    probabilities computed from AE distances (independent of C).
+
+    This function refines C by minimizing mean-squared error using an online,
+    per-sample (or per-mini-batch) NLMS update:
+
+        C <- C + (mu / (epsilon + ||p||^2)) * (y - C p) p^T
+
+    Parameters
+    ----------
+    mu:
+        Step size. Typical range for NLMS is (0, 1]. Start with 0.1..0.5.
+    epsilon:
+        Small positive constant to prevent division by zero when ||p||^2 is tiny.
+        If None, a dtype-aware default is chosen (good general default: 1e-8).
+    epochs:
+        Number of passes over the dataset.
+    batch_size:
+        Number of samples per mini-batch. NLMS is defined per sample; mini-batching
+        applies the same per-sample normalization but accumulates updates efficiently.
+    anchor_lambda:
+        If > 0, applies a light "pull" toward model['cluster_centers_init'] (if present),
+        which stabilizes tuning when data are noisy.
+
+    Returns
+    -------
+    NLMSCenterTuningResult with MSE history.
     """
-    Save a KAHM regressor to disk.
+    X = _as_float_ndarray(X)
+    Y = _as_float_ndarray(Y)
+
+    if X.ndim != 2 or Y.ndim != 2:
+        raise ValueError("X and Y must both be 2D matrices shaped (D, N).")
+    if X.shape[1] != Y.shape[1]:
+        raise ValueError(f"X and Y must have the same number of samples; got X.shape={X.shape}, Y.shape={Y.shape}.")
+
+    C = model.get("cluster_centers", None)
+    if C is None:
+        raise KeyError("model must contain 'cluster_centers' to tune.")
+    C = _as_float_ndarray(C)
+    if C.ndim != 2:
+        raise ValueError(f"model['cluster_centers'] must be 2D; got shape={C.shape}")
+    if C.shape[0] != Y.shape[0]:
+        raise ValueError(
+            f"Output dimension mismatch: model centers have D_out={C.shape[0]} but Y has D_out={Y.shape[0]}."
+        )
+
+    if epochs <= 0:
+        raise ValueError("epochs must be >= 1.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be >= 1.")
+    mu = float(mu)
+    if not (mu > 0.0):
+        raise ValueError("mu must be > 0.")
+
+    # Choose epsilon: it should be much smaller than typical ||p||^2.
+    # With probability vectors, ||p||^2 is in [1/K, 1]. For K up to 1e5, 1/K = 1e-5.
+    if epsilon is None:
+        epsilon = 1
+    epsilon = float(epsilon)
+    if not (epsilon > 0.0):
+        raise ValueError("epsilon must be > 0.")
+
+    N = X.shape[1]
+    rng = np.random.default_rng(random_state) if random_state is not None else np.random.default_rng()
+
+    # Preserve initial centers for optional anchoring.
+    if "cluster_centers_init" not in model or model.get("cluster_centers_init") is None:
+        model["cluster_centers_init"] = np.asarray(model["cluster_centers"], dtype=np.float64).copy()
+
+    C0 = None
+    if anchor_lambda and anchor_lambda > 0.0:
+        C0 = _as_float_ndarray(model.get("cluster_centers_init")).astype(np.float64, copy=False)
+
+    # Work in float64 for stability; assign back later.
+    orig_dtype = C.dtype
+    C_work = np.asarray(C, dtype=np.float64).copy()
+    model["cluster_centers"] = C_work
+
+    # Optional preload (can be very RAM-heavy when K is large).
+    if preload_classifier:
+        try:
+            preload_kahm_classifier(model, n_jobs=max(1, int(abs(n_jobs) if n_jobs != 0 else 1)))
+        except Exception:
+            # Preload is a performance optimization; proceed without it.
+            pass
+
+    mse_history: list[float] = []
+
+    for ep in range(int(epochs)):
+        idx = np.arange(N)
+        if shuffle:
+            rng.shuffle(idx)
+
+        sse = 0.0
+        count = 0
+
+        for start in range(0, N, int(batch_size)):
+            end = min(N, start + int(batch_size))
+            sel = idx[start:end]
+            Xb = X[:, sel]
+            Yb = Y[:, sel]
+
+            # Compute probabilities p(x) using the model's classifier + soft mapping.
+            # Note: p(x) is independent of the cluster centers, so this is well-defined.
+            Yhat_b, P_b = kahm_regress(
+                model,
+                Xb,
+                n_jobs=int(n_jobs),
+                mode="soft",
+                return_probabilities=True,
+                alpha=alpha,
+                topk=topk,
+                batch_size=None,
+            )
+
+            # Ensure shapes
+            if P_b.ndim != 2 or P_b.shape[1] != (end - start):
+                raise RuntimeError(f"Unexpected probability matrix shape: {P_b.shape}")
+            if Yhat_b.ndim != 2 or Yhat_b.shape != Yb.shape:
+                raise RuntimeError(f"Unexpected prediction shape: {Yhat_b.shape} vs Yb {Yb.shape}")
+
+            E = (Yb - Yhat_b).astype(np.float64, copy=False)  # (D_out, B)
+            P64 = np.asarray(P_b, dtype=np.float64)
+
+            # Per-sample normalization term ||p||^2 (B,)
+            p_norm2 = np.sum(P64 * P64, axis=0)
+            step = mu / (epsilon + (mu*p_norm2))  # (B,)
+
+            # Accumulate update: sum_i step_i * e_i p_i^T
+            E_scaled = E * step[None, :]
+            C_work += E_scaled @ P64.T
+
+            # Optional anchoring toward initial centers
+            if C0 is not None:
+                C_work -= (mu * float(anchor_lambda)) * (C_work - C0)
+
+            # Track MSE on the fly
+            sse += float(np.sum(E * E))
+            count += int(E.size)
+
+        mse = sse / max(1, count)
+        mse_history.append(float(mse))
+
+        if verbose:
+            print(f"[NLMS] epoch {ep+1}/{epochs} | MSE={mse:.6g} | mu={mu:g} | eps={epsilon:g}")
+
+    # If the user requested/auto-applied L2 normalization for targets, preserve it after tuning.
+    if model.get("cluster_centers_normalization") == "l2":
+        norms = np.linalg.norm(C_work, axis=0, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        C_work /= norms
+
+    # Restore dtype if needed
+    if orig_dtype != C_work.dtype:
+        model["cluster_centers"] = C_work.astype(orig_dtype, copy=False)
+
+    return NLMSCenterTuningResult(
+        mu=float(mu),
+        epsilon=float(epsilon),
+        epochs=int(epochs),
+        batch_size=int(batch_size),
+        final_mse=float(mse_history[-1] if mse_history else np.nan),
+        mse_history=tuple(mse_history),
+    )
+
+
+def save_kahm_regressor(model: dict, path: str) -> None:
+    """Save a KAHM regressor to disk.
 
     Notes
     -----
     - Runtime-only keys starting with "_" (e.g., _classifier_cache) are stripped.
+    - If `model['classifier_dir']` is an absolute path, it is saved *relative* to the model
+      file directory whenever possible, improving portability when moving the saved artifact
+      together with its classifier directory.
     """
+    import os
+    from pathlib import Path
+
     model_to_save = {k: v for k, v in model.items() if not str(k).startswith("_")}
+
+    # Make classifier_dir portable (relative to the model file) if feasible.
+    clf_dir = model_to_save.get("classifier_dir", None)
+    if isinstance(clf_dir, (str, os.PathLike)):
+        try:
+            model_dir = Path(path).resolve().parent
+            clf_dir_p = Path(clf_dir)
+            # Store a relative path if classifier_dir is absolute or explicitly resolved.
+            if clf_dir_p.is_absolute():
+                model_to_save["classifier_dir"] = os.path.relpath(str(clf_dir_p), str(model_dir))
+        except Exception:
+            # Best-effort only; keep as-is on any failure.
+            pass
+
     dump(model_to_save, path)
     print(f"KAHM regressor saved to {path}")
 
 
-def load_kahm_regressor(path: str) -> dict:
+def load_kahm_regressor(path: str, *, base_dir: str | None = None) -> dict:
+    """Load a KAHM regressor from disk.
+
+    Parameters
+    ----------
+    path:
+        Path to the saved regressor (joblib).
+    base_dir:
+        Optional override for `model['classifier_dir']`. Use this when relocating the model
+        or when the classifier directory is stored separately.
+
+    Portability behavior
+    --------------------
+    - If `base_dir` is provided, it takes precedence.
+    - Otherwise, if the stored `classifier_dir` is relative, it is resolved relative to the
+      directory containing `path`.
+    """
+    import os
+    from pathlib import Path
+
     model = load(path)
+
+    if base_dir is not None:
+        model["classifier_dir"] = str(base_dir)
+    else:
+        clf_dir = model.get("classifier_dir", None)
+        if isinstance(clf_dir, (str, os.PathLike)):
+            p = Path(clf_dir)
+            if not p.is_absolute():
+                model_dir = Path(path).resolve().parent
+                model["classifier_dir"] = str((model_dir / p).resolve())
+
     print(f"KAHM regressor loaded from {path}")
     return model
 # ----------------------------
@@ -1515,30 +1839,10 @@ if __name__ == "__main__":
         subspace_dim=20,
         Nb=50,
         random_state=0,
-        verbose=False,
-        input_scale=0.5,
-        cluster_center_normalization="none"
-    )
-
-    # Tune alpha/topk on validation and store into model
-    tune_soft_params(
-        model,
-        X_val,
-        Y_val,
-        alphas=(2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 18.0, 20.0, 25.0, 50.0),
-        topks=(2, 5, 10, 11, 12, 13, 14, 15, 20, 25, 50),
-        n_jobs=-1,
         verbose=True,
+        input_scale=0.5,
+        cluster_center_normalization="none",
     )
-
-    save_kahm_regressor(model, MODEL_PATH)
-    loaded_model = load_kahm_regressor(MODEL_PATH)
-
-    # Hard prediction
-    Y_pred_hard = kahm_regress(loaded_model, X_test, mode="hard",batch_size=1024)
-
-    # Soft prediction: uses stored (soft_alpha, soft_topk) automatically
-    Y_pred_soft = kahm_regress(loaded_model, X_test, mode="soft", return_probabilities=False,batch_size=1024)
 
     def _mse(yhat: np.ndarray, ytrue: np.ndarray) -> float:
         return float(np.mean((yhat - ytrue) ** 2))
@@ -1548,8 +1852,68 @@ if __name__ == "__main__":
         total_ss = float(np.sum((ytrue - ytrue.mean(axis=1, keepdims=True)) ** 2))
         return 1.0 - residual_ss / total_ss
 
+    # ------------------------------------------------------------
+    # 1) Tune alpha/topk on validation and store into model
+    # ------------------------------------------------------------
+    tune_res = tune_soft_params(
+        model,
+        X_val,
+        Y_val,
+        alphas=(2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 18.0, 20.0, 25.0, 50.0),
+        topks=(2, 5, 10, 11, 12, 13, 14, 15, 20, 25, 50, None),
+        n_jobs=-1,
+        verbose=True,
+    )
+
+    # Baseline (before center refinement)
+    Y_val_pred_soft_before = kahm_regress(model, X_val, mode="soft", batch_size=1024)
+    mse_val_before = _mse(Y_val_pred_soft_before, Y_val)
+
+    print(
+        f"\nSoft-params chosen on val: alpha={tune_res.best_alpha}, topk={tune_res.best_topk} | "
+        f"Val MSE (soft, before NLMS centers): {mse_val_before:.6f}"
+    )
+
+    # ------------------------------------------------------------
+    # 2) Refine cluster centers with NLMS (linear-parameter tuning)
+    # ------------------------------------------------------------
+    # This tunes model['cluster_centers'] while keeping AE gating fixed.
+    # Start with mu in [0.1, 0.5].
+    nlms_res = tune_cluster_centers_nlms(
+        model,
+        X_train,
+        Y_train,
+        mu=0.1,
+        epsilon=1,
+        epochs=10,
+        batch_size=1024,
+        shuffle=True,
+        random_state=0,
+        anchor_lambda=0.0,   # set e.g. 1e-3 to pull gently toward initial KMeans centers
+        n_jobs=-1,
+        preload_classifier=True,
+        verbose=True,
+        alpha = tune_res.best_alpha,
+        topk = tune_res.best_topk
+    )
+
+    Y_val_pred_soft_after = kahm_regress(model, X_val, mode="soft", batch_size=1024)
+    mse_val_after = _mse(Y_val_pred_soft_after, Y_val)
+
+    print(
+        f"NLMS center tuning: final train MSE (reported)={nlms_res.final_mse:.6f} | "
+        f"Val MSE (soft, after NLMS centers): {mse_val_after:.6f}"
+    )
+
+    # Save/load
+    save_kahm_regressor(model, MODEL_PATH)
+    loaded_model = load_kahm_regressor(MODEL_PATH)
+
+    # Hard prediction
+    Y_pred_hard = kahm_regress(loaded_model, X_test, mode="hard", batch_size=1024)
+
+    # Soft prediction: uses stored (soft_alpha, soft_topk) automatically
+    Y_pred_soft = kahm_regress(loaded_model, X_test, mode="soft", return_probabilities=False, batch_size=1024)
     print(f"\nStored soft_alpha={loaded_model.get('soft_alpha')}, soft_topk={loaded_model.get('soft_topk')}")
     print(f"Test MSE (hard): {_mse(Y_pred_hard, Y_test):.6f} | R^2 (hard): {_r2_overall(Y_pred_hard, Y_test):.4f}")
     print(f"Test MSE (soft): {_mse(Y_pred_soft, Y_test):.6f} | R^2 (soft): {_r2_overall(Y_pred_soft, Y_test):.4f}")
-
-
