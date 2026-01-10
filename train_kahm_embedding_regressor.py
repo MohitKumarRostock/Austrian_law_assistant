@@ -106,7 +106,7 @@ DEFAULT_MODEL_ID = None
 DEFAULT_INCLUDE_QUERIES = True
 DEFAULT_QUERIES_NPZ = "queries_embedding_index.npz"
 
-DEFAULT_N_CLUSTERS = 20000
+DEFAULT_N_CLUSTERS = 5000
 DEFAULT_SUBSPACE_DIM = 20
 DEFAULT_NB = 100  # IMPORTANT: as requested
 DEFAULT_TRAIN_FRACTION = 1.0
@@ -120,8 +120,6 @@ DEFAULT_MAX_TRAIN_PER_CLUSTER = None
 DEFAULT_MODEL_DTYPE = "float32"
 DEFAULT_CLUSTER_CENTER_NORMALIZATION = "none"  # none|l2|auto_l2
 
-# Soft-mode memory controls
-DEFAULT_SOFT_BATCH_SIZE = 1024
 
 # AE persistence / collision-avoidance defaults
 DEFAULT_AE_CACHE_ROOT = "kahm_ae_cache"
@@ -131,10 +129,10 @@ DEFAULT_OVERWRITE_AE_DIR = False
 DEFAULT_EVAL_SOFT = True
 DEFAULT_TUNE_SOFT = True
 DEFAULT_TUNE_NLMS = True
-DEFAULT_VAL_FRACTION = 0.01
-DEFAULT_VAL_MAX_SAMPLES = 5000
-DEFAULT_SOFT_ALPHAS = (2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 18.0, 20.0, 25.0, 50.0)
-DEFAULT_SOFT_TOPKS = (2, 5, 10, 11, 12, 13, 14, 15, 20, 25, 50)
+DEFAULT_VAL_FRACTION = 0.5
+DEFAULT_VAL_MAX_SAMPLES = 50000
+DEFAULT_SOFT_ALPHAS = (2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0)
+DEFAULT_SOFT_TOPKS = (2, 5, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 25, 50, 75, 100, 125, 150, 175, 200)
 
 # BlockSafe defaults
 DEFAULT_BLOCKSAFE_ENABLED = True
@@ -579,13 +577,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Normalize output cluster centroids: none (general), l2 (directional/unit embeddings), auto_l2 (detect unit-norm Y).",
     )
 
-    p.add_argument(
-        "--soft_batch_size",
-        type=int,
-        default=DEFAULT_SOFT_BATCH_SIZE,
-        help="Batch size for soft-mode inference/eval to avoid allocating C×N distance/probability matrices.",
-    )
-
     p.add_argument("--no_degeneracy_check", action="store_true", default=DEFAULT_NO_DEGENERACY_CHECK, help="Disable OTFL degeneracy probing of clusters")
 
     # Soft-mode tuning / evaluation
@@ -649,7 +640,7 @@ def main() -> int:
     print(f"Train sentence samples: {train_idx_sent.size}")
     print(f"Test  sentence samples: {test_idx_sent.size}")
 
-    # Optional validation split for soft tuning (sentences only)
+    # validation split for soft tuning (sentences only)
     train_core_idx_sent = train_idx_sent
     val_idx_sent = np.array([], dtype=np.int64)
     if args.tune_soft:
@@ -675,9 +666,11 @@ def main() -> int:
         del X, Y, common_ids
     except Exception:
         pass
-
+    
 
     # Optional query augmentation
+    X_q: Optional[np.ndarray] = None
+    Y_q: Optional[np.ndarray] = None
     if args.include_queries:
         if not args.idf_svd_model or not os.path.exists(args.idf_svd_model):
             raise ValueError("--include_queries requires a valid --idf_svd_model path (idf_svd_model.joblib).")
@@ -686,7 +679,6 @@ def main() -> int:
         X_q = embed_queries_idf_svd(args.idf_svd_model, D_in_expected=D_in)
 
         # Prefer precomputed Mixedbread queries NPZ to keep training torch-free
-        Y_q: np.ndarray
         if args.queries_npz and os.path.exists(args.queries_npz):
             Y_q = load_precomputed_mixedbread_queries_npz(args.queries_npz, D_out_expected=D_out)
         else:
@@ -719,13 +711,13 @@ def main() -> int:
     Y_test = Y_test_sent.T
 
 
-        # Validation tensors (sentences only). Used for soft tuning when available and as evaluation split when present.
+    # Validation tensors. Used for soft tuning when available and as evaluation split when present.
     X_val: Optional[np.ndarray] = None
     Y_val: Optional[np.ndarray] = None
     if X_val_sent is not None and Y_val_sent is not None and X_val_sent.shape[0] > 0:
-        X_val = X_val_sent.T
-        Y_val = Y_val_sent.T
-
+        X_val = np.hstack([X_val_sent.T, X_q.T]) if (args.include_queries and X_q is not None) else X_val_sent.T
+        Y_val = np.hstack([Y_val_sent.T, Y_q.T]) if (args.include_queries and Y_q is not None) else Y_val_sent.T
+        print(f"Validation set: samples={X_val.shape[1]}")
         val_max = int(args.val_max_samples)
         if val_max > 0 and X_val.shape[1] > val_max:
             rng = np.random.RandomState(int(args.random_state) + 4242)
@@ -740,7 +732,7 @@ def main() -> int:
         except Exception:
             pass
 
-# Choose evaluation split: validation if present, else the held-out test set.
+    # Choose evaluation split: validation if present, else the held-out test set.
     X_eval = X_test
     Y_eval = Y_test
     eval_name = "test"
@@ -748,7 +740,7 @@ def main() -> int:
         X_eval = X_val
         Y_eval = Y_val
         eval_name = "validation"
-    
+    print(f"Evaluation set: {eval_name} samples={X_eval.shape[1]}")
     # Enable BlockSafe and force threading backend
     ctx = nullcontext()
     blocksafe_info = {"enabled": False}
@@ -801,7 +793,7 @@ def main() -> int:
             model_dtype=str(args.model_dtype),
             cluster_center_normalization=str(args.cluster_center_normalization),
             # Disk-backed classifier + collision avoidance (kahm_regression.py v4)
-            save_ae_to_disk=True,
+            save_ae_to_disk=False,
             ae_cache_root=str(args.ae_cache_root),
             ae_dir=(None if args.ae_dir is None else str(args.ae_dir)),
             overwrite_ae_dir=bool(args.overwrite_ae_dir),
@@ -831,8 +823,8 @@ def main() -> int:
             assert X_val is not None and Y_val is not None
             tuning_result = tune_soft_params(
                 model,
-                X_val,
-                Y_val,
+                X_val[:,1:3500],
+                Y_val[:,1:3500],
                 alphas=alphas,
                 topks=topks,
                 n_jobs=1,
@@ -841,15 +833,16 @@ def main() -> int:
     
     nlms_results = None
     if args.tune_nlms:
-        print("\nRefining cluster centers with NLMS on training set ...")
+        print("\nRefining cluster centers with NLMS on validation set ...")
+        assert X_val is not None and Y_val is not None
         nlms_results = tune_cluster_centers_nlms(
             model,
-            X_train,
-            Y_train,
+            X_val,
+            Y_val,
             mu=0.1,
             epsilon=1,
-            epochs=10,
-            batch_size=1024,
+            epochs=20,
+            batch_size=512,
             shuffle=True,
             random_state=0,
             anchor_lambda=0.0,   # set e.g. 1e-3 to pull gently toward initial KMeans centers
@@ -862,7 +855,7 @@ def main() -> int:
 
 
     # Evaluate on validation (if present) or test (fallback)
-    print(f"\nEvaluating on {eval_name} set (sentences only) ...")
+    print(f"\nEvaluating on {eval_name} set ...")
 
     # Optional: preload classifier into RAM once (speeds up repeated kahm_regress calls).
     # Use only if you have sufficient RAM; otherwise leave disabled.
@@ -874,20 +867,11 @@ def main() -> int:
             print("WARNING: preload_kahm_classifier failed (continuing without preload).")
             print(f"  Reason: {type(exc).__name__}: {exc}")
     
-    Y_pred_hard = kahm_regress(model, X_eval, mode="hard",batch_size=(int(args.soft_batch_size) if int(args.soft_batch_size) > 0 else None))
-    metrics_hard = compute_embedding_metrics(Y_pred_hard, Y_eval)
-
-    print("Hard-mode metrics:")
-    print(f"  Test MSE:           {metrics_hard['mse']:.6f}")
-    print(f"  Overall R^2:        {metrics_hard['r2_overall']:.4f}")
-    print(f"  Cosine mean:        {metrics_hard['cos_mean']:.4f}")
-    print(f"  Cosine p10/p50/p90: {metrics_hard['cos_p10']:.4f} / {metrics_hard['cos_p50']:.4f} / {metrics_hard['cos_p90']:.4f}")
 
     metrics_soft = None
     if args.eval_soft or args.tune_soft:
         try:
-            bs = int(args.soft_batch_size)
-            Y_pred_soft = kahm_regress(model, X_eval, mode="soft",return_probabilities=False, batch_size=(bs if bs > 0 else None))
+            Y_pred_soft = kahm_regress(model, X_eval, mode="soft",return_probabilities=False, batch_size=1024)
             metrics_soft = compute_embedding_metrics(Y_pred_soft, Y_eval)
             print("Soft-mode metrics:")
             print(f"  Test MSE:           {metrics_soft['mse']:.6f}")
@@ -954,7 +938,7 @@ def main() -> int:
             "model_soft_alpha": model.get("soft_alpha"),
             "model_soft_topk": model.get("soft_topk"),
         },
-        "metrics": {"hard": metrics_hard, "soft": metrics_soft},
+        "metrics": {"soft": metrics_soft},
     }
 
     if args.blocksafe and _BLOCKSAFE_STATS is not None:
