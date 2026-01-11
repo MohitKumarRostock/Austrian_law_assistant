@@ -197,6 +197,6 @@ Coverage constraint: **coverage ≥ 0.50**
 - Bootstrap: samples=5000, seed=0
 
 ---
-## Copy-ready summary paragraph
+## Summary paragraph
 
 Across 200 queries (k=10), KAHM(query→MB corpus) achieved Hit@10=0.890 (0.845, 0.930) and MRR@10=0.738 (0.687, 0.788). Paired-bootstrap deltas favored KAHM(query→MB corpus) over IDF–SVD under the evaluation’s superiority criterion (Table 2). Compared to Mixedbread, paired deltas for Hit@10, MRR@10, and Top-1 accuracy were small with 95% CIs that included 0 (Table 3), while majority-vote behavior differed depending on the routing threshold τ (Tables 5–8). Majority-vote accuracy was numerically higher by +0.055 (+0.000, +0.110) relative to Mixedbread (CI touches 0). Full-KAHM embeddings showed high cosine alignment with Mixedbread in embedding space (mean corpus cosine 0.9068) and recovered similar law-level neighborhoods (law-set Jaccard@10=0.501 (0.464, 0.540); Δ vs IDF=+0.114 (+0.074, +0.157); Table 9), while sentence-level neighbor identity remained modest (sentence Jaccard@10=0.063 (0.054, 0.073); Δ vs IDF includes 0; Table 9).

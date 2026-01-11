@@ -14,7 +14,8 @@ What it does
      - entering an arbitrary Austrian-law-related query and retrieving Top-K results.
    The dashboard emphasizes *sentence-level evidence* (possibly spanning multiple law topics),
    not single-label classification.
-3) Provides a short "Science behind KAHM" explanation with citations (see References tab).
+3) Provides a short "Science behind KAHM" explanation with citations (see KAHM science tab).
+4) Presents a management-ready funding pitch (see Funding pitch tab).
 
 How to run
 ----------
@@ -620,30 +621,173 @@ def ui_retrieve_custom(
 
 
 # ----------------------------- KAHM science narrative (dashboard tab) -----------------------------
+
 SCIENCE_MD = r"""
-# Science behind KAHM (high level)
+# Embeddings and methods used in this dashboard
 
-KAHM (Kernel Affine Hull Machine) is a *geometrically inspired* kernel method that represents a class (or task) by the **affine hull** of its examples in a reproducing kernel Hilbert space (RKHS). This yields kernelized distance measures to these hulls and supports learning and inference using *closed-form, convex* computations rather than multi-epoch stochastic gradient descent.
+This dashboard compares and operationalizes three representations of Austrian-law sentences:
 
-In the cited line of work, KAHM-style models are used as **gradient-free alternatives** (or complements) to deep models in settings such as collaborative / federated learning and learning under constraints (e.g., differential privacy).
+1. **MB embeddings (Mixedbread baseline)** — a high-quality *neural* sentence embedding model used as a strong retrieval baseline and as a “teacher space”.
+2. **IDF–SVD embeddings** — a lightweight, *non-neural* dense representation derived from TF‑IDF and latent semantic analysis (LSA).
+3. **KAHM embeddings (MB-approx)** — a KAHM regressor that maps IDF–SVD vectors into the MB embedding space via *geometric topic modeling*.
 
-## Why KAHM is suitable for "embedding approximation"
+The evaluation report focuses on **sentence-level evidence retrieval** (Top‑K), not single-label classification.
 
-In this project, KAHM is used as a lightweight mapping that learns to approximate a target embedding space (Mixedbread `deepset-mxbai-embed-de-large-v1`) *for a specific domain* (Austrian laws):
+---
 
-- **Input features:** a strong, low-cost IDF–SVD representation.
-- **Target space:** the 1024-D Mixedbread embedding space.
-- **Learned mapping:** a KAHM regressor (kernel machine) trained to map IDF–SVD vectors into the Mixedbread space.
+## 1) MB embeddings (Mixedbread)
 
-Because KAHM training/inference is kernel-based and does not require backpropagation through a transformer, it can be trained and executed on standard CPU-class hardware (e.g., Apple M1 with 8 GB RAM), subject to corpus size and your chosen training setup.
+**What they are**  
+The “MB” index is built with a SentenceTransformer model:
 
-## References (as requested)
+- **Model:** `mixedbread-ai/deepset-mxbai-embed-de-large-v1` (default in `build_embedding_index_npz.py`)
+- **Granularity:** sentence-level (each RIS sentence becomes one vector)
+- **Role in this project:** *reference embedding space* for retrieval quality; also the **regression target** for KAHM training.
 
-a) JAIR article view: https://jair.org/index.php/jair/article/view/16821  
-b) JAIR article view: https://jair.org/index.php/jair/article/view/15071  
-c) arXiv: https://arxiv.org/abs/2512.01025
+**Why this model / why MB at all**  
+For Austrian laws, the corpus is predominantly German and includes legal phrasing, citations, and domain-specific vocabulary. A strong German-capable semantic embedding model is an appropriate *upper baseline* for retrieval quality and a useful “teacher space” when we want to approximate neural embeddings with cheaper features.
 
-(If your environment cannot open the JAIR view pages programmatically, use the PDF links from your browser; the dashboard itself does not depend on programmatic access to those pages.)
+**Where it is produced**  
+`build_embedding_index_npz.py` builds `embedding_index.npz` from `ris_sentences.parquet` using SentenceTransformer encoding and stores metadata such as `model_name`, `created_at_utc`, and a dataset fingerprint alongside the embedding matrix.
+
+---
+
+## 2) IDF–SVD embeddings (TF‑IDF → SVD / LSA)
+
+**What they are**  
+“IDF–SVD” is a classic, compute-efficient embedding pipeline:
+
+- **TF‑IDF features** (inverse document frequency weighted term features)
+  - word n‑grams: **(1, 3)**
+  - optional character n‑grams (“char_wb”): **(3, 6)**
+  - large feature budgets (defaults): **600k word features**, **300k char features**
+- **TruncatedSVD** (randomized) to obtain a dense vector (default **dim=1024**)
+- optional **L2 normalization** (disabled by default)
+
+This is implemented in `build_embedding_index_idf_svd_npz.py` as a scikit‑learn `Pipeline`:
+`PreprocessTransformer → FeatureUnion(TF‑IDF word + TF‑IDF char) → AdaptiveTruncatedSVD → (optional) Normalizer`.
+
+**Why it was considered**  
+IDF–SVD is attractive as a “no-neural-training” baseline and as an input representation for KAHM because it is:
+
+- **cheap to compute** (CPU-friendly; no GPU required),
+- **deterministic and auditable** (important in legal/regulated settings),
+- **strong on lexical signals** (citations, terminology, statute references),
+- a solid bridge between purely lexical retrieval and fully neural embeddings.
+
+**Where it is produced**  
+`build_embedding_index_idf_svd_npz.py` writes both:
+- `embedding_index_idf_svd.npz` (dense vectors keyed by `sentence_id`), and
+- `idf_svd_model.joblib` (portable pipeline for generating query vectors the same way).
+
+---
+
+## 3) KAHM embeddings (geometric topic modeling in embedding space)
+
+**What they are**  
+“KAHM embeddings” in this repo are **MB-approx embeddings**: vectors predicted by a KAHM regressor that maps
+IDF–SVD inputs into the MB target space.
+
+Training is described in `train_kahm_embedding_regressor.py`:
+
+- **Inputs (X):** L2-normalized IDF–SVD vectors
+- **Targets (Y):** L2-normalized MB vectors
+- **Objective:** approximate Y from X with a KAHM-style, geometry-driven model.
+
+**Geometrical modeling of topics**  
+KAHM operationalizes “topics” as **regions in the target embedding space**:
+
+1. **Cluster the target embeddings (Y)** into `n_clusters` (KMeans / MiniBatchKMeans).  
+   Each cluster corresponds to a coherent region of semantic space (a “topic region” in practice).
+2. **Learn a geometric descriptor per region** by training one autoencoder per cluster on the *input* vectors that map to that cluster.  
+   At inference time, each autoencoder yields a **reconstruction-distance** for the query/input vector, i.e., “how well does this input fit region c?”.
+3. **Convert distances into routing weights** (hard or soft routing) and **reconstruct an output embedding** as a weighted combination of cluster centers in the MB space.
+
+This yields an MB-like embedding without running a large neural encoder at query time.
+
+**Two retrieval modes in the dashboard**  
+
+- **KAHM(query→MB corpus):** regress the query into MB space and search the **MB corpus index**.  
+  This isolates the benefit of the *query-side* KAHM mapping while keeping the corpus in the original MB space.
+- **Full‑KAHM (query→KAHM corpus):** regress the query and search a **KAHM-transformed corpus index**.  
+  This evaluates the fully “compressed” pipeline where neither queries nor corpus require MB encoding at runtime.
+
+---
+
+## Practical interpretation
+
+- If **MB > KAHM(query→MB corpus)**, the gap is mostly due to *approximation quality of the query mapping*.
+- If **KAHM(query→MB corpus) ≈ Full‑KAHM**, then the corpus transformation is not the limiting factor.
+- If **IDF–SVD** is competitive on a subset of queries, those are likely **lexically dominated** information needs (citations, exact phrases).
+
+---
+
+## References
+
+- arXiv: 2512.01025 (advantages motivating KAHM-driven language models)
+- See the project report tab for empirical retrieval results on Austrian-law queries.
+"""
+
+
+
+EMBEDDINGS_QUICKREF_MD = r"""
+### Embeddings in this dashboard (quick reference)
+
+- **MB (Mixedbread) embeddings:** SentenceTransformer model `mixedbread-ai/deepset-mxbai-embed-de-large-v1` (strong neural baseline; also the **target** space for KAHM).
+- **IDF–SVD embeddings:** TF‑IDF (word 1–3 grams + optional char 3–6 grams) → TruncatedSVD/LSA (**dim=1024** by default). Fast, deterministic, audit-friendly baseline and KAHM input.
+- **KAHM embeddings:** KAHM regressor that maps IDF–SVD → MB space via **output-space clustering (“topic regions”)** and **distance-based routing** (hard/soft) to reconstruct MB-like vectors.
+"""
+
+
+
+# ----------------------------- Management pitch (dashboard tab) -----------------------------
+PITCH_MD = r"""
+# Management pitch: funding KAHM-driven language models
+
+## Executive summary
+KAHM has already demonstrated strong practical value in our Austrian-law retrieval prototype. In the latest evaluation (200 human-labeled queries, k=10), **KAHM(query→MB corpus)** achieves **Hit@10=0.890** and **MRR@10=0.738** (unique-law MRR), i.e., the correct law is almost always present in the top results and is typically ranked highly. This is achieved with a lightweight, mathematically grounded kernel mapping that runs efficiently on CPU-class hardware.
+
+**Proposal:** fund a focused, time-boxed R&D program to extend KAHM from *embedding approximation* into **KAHM-driven language-model components** (gradient-free heads, retrieval routing, and domain-tuned solutions). The goal is a first-of-its-kind capability that reduces reliance on large-scale gradient-descent training while preserving the practical advantages demonstrated in the current system and in the recent KAHM literature (arXiv:2512.01025).
+
+## Strategic rationale for the company
+- **Differentiation and IP:** KAHM is a mathematically principled alternative to gradient-descent-heavy learning. A successful KAHM-driven LM stack would be highly differentiating and likely patentable (routing, gradient-free heads, and deployment patterns).
+- **Compute and cost discipline:** large-model training is capital intensive. KAHM emphasizes closed-form/convex computations and domain-specific mappings that are compatible with constrained compute and energy budgets.
+- **Governance-friendly engineering:** kernel-based components are comparatively easier to analyze, bound, and audit than end-to-end deep models—beneficial for regulated or high-stakes domains.
+
+## Evidence of traction: Austrian-law retrieval
+The current dashboard and evaluation demonstrate that KAHM can replace transformer query embedding at retrieval time while maintaining strong quality:
+- **Performance:** Hit@10=0.890; MRR@10=0.738; Top‑1 accuracy=0.625 (k=10; 200 queries).
+- **Clear lift over the low-cost baseline:** vs IDF–SVD, KAHM improves Hit@10 by **+0.215** and MRR@10 by **+0.274** (paired bootstrap).
+- **Operational simplicity:** query embeddings are produced via a lightweight mapping into a fixed corpus embedding space, enabling reuse of an existing index.
+
+## Why it makes sense to invest beyond retrieval embeddings
+Recent KAHM work (arXiv:2512.01025) supports the broader thesis that KAHM-style models can underpin **gradient-free learning systems** with advantages that map directly to company constraints:
+- reduced communication via low-dimensional “space folding” summaries,
+- privacy/security-friendly structure (differential privacy mechanisms and secure inference compatibility),
+- operator-theoretic and complexity-based analysis that strengthens the theoretical and auditability story.
+
+This motivates a logical next step: investigate KAHM-driven language-model components that combine (i) frozen feature extractors where appropriate and (ii) gradient-free/closed-form heads and routing policies that deliver competitive outcomes at materially lower training cost.
+
+## Proposed funded pilot (12–16 weeks) and deliverables
+1) **KAHM-driven LM head prototype (Weeks 1–6):**
+   - Train and evaluate a gradient-free prediction head (ranking/classification) on top of frozen text features for legal-domain tasks.
+   - Quantify compute, latency, and quality trade-offs against gradient-based baselines.
+
+2) **KAHM-native routing and reliability (Weeks 4–10):**
+   - Extend the dashboard prototype into a “reliable assistant” architecture: KAHM-based evidence retrieval + confidence/routing to decide when to answer, abstain, or escalate to a heavier model.
+   - Target measurable reduction in expensive model calls without quality regression.
+
+3) **IP package and product roadmap (Weeks 10–16):**
+   - Identify patentable components and produce a productization roadmap (data, evaluation, governance, and deployment assumptions).
+
+## Lean resource request
+- **Staffing:** 1 research engineer (FT) + 0.2–0.4 legal/domain SME (PT) + minimal security/compliance review.
+- **Compute:** CPU-first; optional small GPU budget only for baseline comparisons and reporting.
+
+## Decision criteria (what “success” looks like)
+- A demonstrable prototype with competitive task performance at significantly lower compute/training requirements than gradient-descent-heavy alternatives.
+- A quantified business case (cost, latency, compliance) plus a clear go/no-go recommendation for productization.
+- Defensible technical assets: evaluation suite, benchmarks, and prototype code that can be leveraged as IP.
 """
 
 
@@ -693,10 +837,15 @@ def build_app() -> gr.Blocks:
                     query_set = gr.Textbox(value="query_set.TEST_QUERY_SET", label="Query set (module.attr)")
                     btn_load_report = gr.Button("Load/refresh report visuals", variant="primary")
 
+                    with gr.Accordion("Embeddings & methods (overview)", open=False):
+                        gr.Markdown(EMBEDDINGS_QUICKREF_MD)
+
             with gr.Column(scale=4, min_width=780, elem_classes=['results-col']):
                 with gr.Tabs():
                     with gr.Tab("Results (from report)"):
                         gr.Markdown("## Report highlights")
+                        gr.Markdown(EMBEDDINGS_QUICKREF_MD, elem_classes=["small-note"])
+
                         table1 = gr.Dataframe(label="Table 1: Main retrieval metrics", interactive=False, wrap=True)
                         with gr.Row():
                             plot_main = gr.Plot(label="Main metrics")
@@ -715,6 +864,8 @@ def build_app() -> gr.Blocks:
                             "**Interpretation note:** the goal is to surface *relevant evidence sentences*, which may span multiple law topics; "
                             "this is not a single-label classification task."
                         )
+                        gr.Markdown(EMBEDDINGS_QUICKREF_MD, elem_classes=["small-note"])
+
 
                         with gr.Accordion("Select from the 200 test queries", open=True):
                             # We'll populate choices on load
@@ -740,6 +891,9 @@ def build_app() -> gr.Blocks:
                             gr.Markdown("### Full-KAHM (query→KAHM corpus)")
                             out_full2 = gr.Dataframe(interactive=False, wrap=True, elem_classes=['kahm-table','retrieval-table'])
                             plot_full2 = gr.Plot()
+
+                    with gr.Tab("Funding pitch"):
+                        gr.Markdown(PITCH_MD)
 
                     with gr.Tab("KAHM science"):
                         gr.Markdown(SCIENCE_MD)
