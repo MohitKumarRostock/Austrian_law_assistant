@@ -745,48 +745,61 @@ PITCH_MD = r"""
 # Management pitch: funding KAHM-driven language models
 
 ## Executive summary
-KAHM has already demonstrated strong practical value in our Austrian-law retrieval prototype. In the latest evaluation (200 human-labeled queries, k=10), **KAHM(query→MB corpus)** achieves **Hit@10=0.890** and **MRR@10=0.738** (unique-law MRR), i.e., the correct law is almost always present in the top results and is typically ranked highly. This is achieved with a lightweight, mathematically grounded kernel mapping that runs efficiently on CPU-class hardware.
+KAHM has already demonstrated strong practical value in our Austrian‑law retrieval prototype. In our latest evaluation (see **Results** tab; 200 human‑labeled test queries, k=10), **KAHM(query→MB corpus)** achieves high Top‑K evidence retrieval quality (Hit@10 and MRR@10 typically in the ~0.89–0.92 and ~0.73–0.75 range across recent runs). This is achieved with a lightweight, mathematically grounded kernel mapping that runs efficiently on CPU‑class hardware.
 
-**Proposal:** fund a focused, time-boxed R&D program to extend KAHM from *embedding approximation* into **KAHM-driven language-model components** (gradient-free heads, retrieval routing, and domain-tuned solutions). The goal is a first-of-its-kind capability that reduces reliance on large-scale gradient-descent training while preserving the practical advantages demonstrated in the current system and in the recent KAHM literature (arXiv:2512.01025).
+**Proposal:** fund a focused, time‑boxed R&D program to extend KAHM from *embedding approximation* into **KAHM‑driven language‑model (LM) components**—specifically: gradient‑free heads, routing policies, and decoding‑adjacent modules that reduce reliance on expensive end‑to‑end training and large‑model inference while preserving practical quality.
 
 ## Strategic rationale for the company
-- **Differentiation and IP:** KAHM is a mathematically principled alternative to gradient-descent-heavy learning. A successful KAHM-driven LM stack would be highly differentiating and likely patentable (routing, gradient-free heads, and deployment patterns).
-- **Compute and cost discipline:** large-model training is capital intensive. KAHM emphasizes closed-form/convex computations and domain-specific mappings that are compatible with constrained compute and energy budgets.
-- **Governance-friendly engineering:** kernel-based components are comparatively easier to analyze, bound, and audit than end-to-end deep models—beneficial for regulated or high-stakes domains.
+- **Differentiation and IP:** KAHM is a mathematically principled alternative to gradient‑descent‑heavy learning. A successful KAHM‑driven LM stack would be highly differentiating and likely patentable (routing, gradient‑free heads, and deployment patterns).
+- **Compute and cost discipline:** large‑model training and high‑QPS inference are capital intensive. KAHM emphasizes closed‑form / convex computations and domain‑specific mappings that are compatible with constrained compute and energy budgets.
+- **Governance‑friendly engineering:** kernel‑based components are comparatively easier to analyze, bound, and audit than end‑to‑end deep models—beneficial for regulated or high‑stakes domains.
 
-## Evidence of traction: Austrian-law retrieval
-The current dashboard and evaluation demonstrate that KAHM can replace transformer query embedding at retrieval time while maintaining strong quality:
-- **Performance:** Hit@10=0.890; MRR@10=0.738; Top‑1 accuracy=0.625 (k=10; 200 queries).
-- **Clear lift over the low-cost baseline:** vs IDF–SVD, KAHM improves Hit@10 by **+0.215** and MRR@10 by **+0.274** (paired bootstrap).
-- **Operational simplicity:** query embeddings are produced via a lightweight mapping into a fixed corpus embedding space, enabling reuse of an existing index.
+## Evidence of traction: Austrian‑law evidence retrieval
+The current dashboard and evaluation demonstrate that KAHM can approximate transformer query embeddings at retrieval time while maintaining strong quality:
+- **Performance:** see Table 1 in the report (Results tab) for Hit@10, MRR@10, Top‑1 accuracy, and vote‑based routing metrics with bootstrap CIs.
+- **Clear lift over the low‑cost baseline:** KAHM consistently outperforms IDF–SVD under paired evaluation.
+- **Operational simplicity:** queries are mapped into a fixed corpus embedding space, enabling reuse of an existing index and minimizing production complexity.
 
-## Why it makes sense to invest beyond retrieval embeddings
-Recent KAHM work (arXiv:2512.01025) supports the broader thesis that KAHM-style models can underpin **gradient-free learning systems** with advantages that map directly to company constraints:
-- reduced communication via low-dimensional “space folding” summaries,
-- privacy/security-friendly structure (differential privacy mechanisms and secure inference compatibility),
-- operator-theoretic and complexity-based analysis that strengthens the theoretical and auditability story.
+## How this extends to LM components (beyond retrieval)
+KAHM should not be framed as a standalone autoregressive decoder. Instead, it is a **latent‑space adapter and geometry‑based scoring head** that can become a practical LM component in a modern generation stack:
 
-This motivates a logical next step: investigate KAHM-driven language-model components that combine (i) frozen feature extractors where appropriate and (ii) gradient-free/closed-form heads and routing policies that deliver competitive outcomes at materially lower training cost.
+- **Reranker / head (decoding‑adjacent):** the base LLM proposes a small Top‑M candidate set (tokens, actions, templates). KAHM scores and reranks only those candidates using a lightweight geometry‑based criterion. This improves control and reliability without requiring KAHM to score the full vocabulary.
+- **Constrained decoding controller:** when the output set is naturally small (tool/action selection, template choice, controlled language), KAHM can act as the primary decision head—high leverage, low risk, production‑friendly.
+- **Hierarchical / token‑cluster decoding (research extension):** KAHM predicts a coarse bucket (semantic token cluster) conditioned on the LLM state; the LLM then generates within that bucket or KAHM reranks within the bucket. This offers a credible path to broader decoding influence while keeping class‑scaling tractable.
+
+This roadmap turns today’s “embedding approximation” capability into reusable LM infrastructure: **routing, control, and reliability components** that sit alongside a frozen or lightly tuned LLM.
+
+## Why it makes sense to invest now
+Recent KAHM work (arXiv:2512.01025) supports the broader thesis that KAHM‑style models can underpin **gradient‑free learning systems** with advantages that map directly to company constraints:
+- reduced communication via low‑dimensional “space folding” summaries,
+- privacy/security‑friendly structure (differential privacy mechanisms and secure inference compatibility),
+- operator‑theoretic and complexity‑based analysis that strengthens the theoretical and auditability story.
+
+Our retrieval results provide an internal “green light”: the core adapter mechanism works in a real domain and is already integrated into an interactive dashboard.
 
 ## Proposed funded pilot (12–16 weeks) and deliverables
-1) **KAHM-driven LM head prototype (Weeks 1–6):**
-   - Train and evaluate a gradient-free prediction head (ranking/classification) on top of frozen text features for legal-domain tasks.
-   - Quantify compute, latency, and quality trade-offs against gradient-based baselines.
+1) **LM component Phase 1 — KAHM reranker/head (Weeks 1–6):**
+   - Implement KAHM as a lightweight scoring head over Top‑M candidates produced by a frozen LLM (or over action/template candidates in an agent).
+   - Evaluate quality, controllability, and reliability gains at fixed latency/cost (ablation against baseline decoding/prompt routing).
 
-2) **KAHM-native routing and reliability (Weeks 4–10):**
-   - Extend the dashboard prototype into a “reliable assistant” architecture: KAHM-based evidence retrieval + confidence/routing to decide when to answer, abstain, or escalate to a heavier model.
-   - Target measurable reduction in expensive model calls without quality regression.
+2) **LM component Phase 2 — constrained decoding controller (Weeks 4–10):**
+   - Deploy KAHM for small‑alphabet generation tasks (tool routing, template selection, controlled outputs).
+   - Validate measurable reductions in expensive model calls and improved “abstain/escalate” behavior.
 
-3) **IP package and product roadmap (Weeks 10–16):**
-   - Identify patentable components and produce a productization roadmap (data, evaluation, governance, and deployment assumptions).
+3) **LM component Phase 3 — hierarchical/token‑cluster decoding (Weeks 8–16):**
+   - Research prototype: cluster vocabulary into semantic buckets; use KAHM to select buckets, then decode within‑bucket.
+   - Deliver a feasibility assessment with clear go/no‑go criteria (quality impact vs complexity).
+
+4) **IP package and product roadmap (Weeks 10–16):**
+   - Identify patentable components and produce a productization roadmap (data, evaluation, governance, deployment assumptions).
 
 ## Lean resource request
 - **Staffing:** 1 research engineer (FT) + 0.2–0.4 legal/domain SME (PT) + minimal security/compliance review.
-- **Compute:** CPU-first; optional small GPU budget only for baseline comparisons and reporting.
+- **Compute:** CPU‑first for KAHM; small GPU budget only for baseline LLM comparisons and reporting.
 
 ## Decision criteria (what “success” looks like)
-- A demonstrable prototype with competitive task performance at significantly lower compute/training requirements than gradient-descent-heavy alternatives.
-- A quantified business case (cost, latency, compliance) plus a clear go/no-go recommendation for productization.
+- A demonstrable LM‑component prototype (reranker/router/controller) with competitive task performance at materially lower incremental compute/training requirements than gradient‑descent‑heavy alternatives.
+- A quantified business case (cost, latency, compliance) plus a clear go/no‑go recommendation for productization.
 - Defensible technical assets: evaluation suite, benchmarks, and prototype code that can be leveraged as IP.
 """
 
