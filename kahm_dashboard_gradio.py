@@ -620,6 +620,243 @@ def ui_retrieve_custom(
     return out1, fig1, out2, fig2
 
 
+
+
+# ----------------------------- Private document (BYO) helpers -----------------------------
+# The dashboard can optionally accept a user-uploaded document (txt/md/docx/pdf), extract sentences,
+# and use a selected sentence as a query for the same retrieval methods.
+try:  # python-docx
+    import docx  # type: ignore
+except Exception:  # pragma: no cover
+    docx = None  # type: ignore
+
+
+def _read_text_from_path(path: str) -> str:
+    """
+    Read text from a local file path (txt/md/docx/pdf).
+    Returns extracted text as a single string.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    ext = p.suffix.lower()
+
+    if ext in {".txt", ".md", ".csv", ".log"}:
+        data = p.read_bytes()
+        for enc in ("utf-8", "utf-16", "cp1252", "latin-1"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        # last resort
+        return data.decode("utf-8", errors="replace")
+
+    if ext == ".docx":
+        if docx is None:
+            raise ImportError("python-docx is not installed; cannot read .docx files.")
+        d = docx.Document(str(p))
+        parts = []
+        for para in d.paragraphs:
+            t = (para.text or "").strip()
+            if t:
+                parts.append(t)
+        # also include table text (common in policies/contracts)
+        for tbl in d.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    t = (cell.text or "").strip()
+                    if t:
+                        parts.append(t)
+        return "\n".join(parts)
+
+    if ext == ".pdf":
+        # Prefer PyMuPDF (fitz); fallback to pypdf if needed.
+        try:
+            import fitz  # type: ignore
+            doc = fitz.open(str(p))
+            pages = []
+            for i in range(len(doc)):
+                pages.append(doc.load_page(i).get_text("text"))
+            doc.close()
+            return "\n".join(pages)
+        except Exception:
+            try:
+                from pypdf import PdfReader  # type: ignore
+                reader = PdfReader(str(p))
+                pages = []
+                for page in reader.pages:
+                    pages.append(page.extract_text() or "")
+                return "\n".join(pages)
+            except Exception as e:
+                raise ImportError(f"Could not read PDF. Install PyMuPDF (fitz) or pypdf. Details: {e}")
+
+    raise ValueError(f"Unsupported document type: {ext}. Please upload a .txt, .md, .docx, or .pdf file.")
+
+
+_ABBREV_RE = re.compile(
+    r"(?:\b(?:z\.B|u\.a|u\.U|bzw|vgl|ggf|usw|etc|e\.g|i\.e|Dr|Prof|Abs|Art|Nr|No|Stk|Zl)\.)$",
+    re.IGNORECASE,
+)
+
+
+def _split_sentences(text: str, *, max_sentences: int = 5000) -> List[str]:
+    """
+    Heuristic sentence splitter (German/English friendly).
+    Returns a list of sentences; caps output to max_sentences for UI stability.
+    """
+    if not text:
+        return []
+    # normalize whitespace
+    t = re.sub(r"\s+", " ", text.replace("\u00ad", " ")).strip()
+    if not t:
+        return []
+
+    # Candidate split on punctuation followed by whitespace + a likely sentence start.
+    parts = re.split(r'(?<=[\.\!\?])["\')\]]*\s+(?=(?:[A-ZÄÖÜ0-9„"\'\(\[]))', t)
+
+    # Post-process: merge obvious false splits (abbreviations, tiny fragments)
+    merged: List[str] = []
+    for seg in parts:
+        seg = seg.strip()
+        if not seg:
+            continue
+        if merged:
+            prev = merged[-1]
+            if _ABBREV_RE.search(prev) or len(prev) < 25:
+                merged[-1] = (prev + " " + seg).strip()
+                continue
+        merged.append(seg)
+
+    # Fallback: if we failed to split, try line-ish splitting
+    if len(merged) <= 1:
+        merged = [s.strip() for s in re.split(r"(?:\s*[\n\r]\s*|;\s+)", text) if s.strip()]
+
+    # Cap for UI
+    if len(merged) > int(max_sentences):
+        merged = merged[: int(max_sentences)]
+    return merged
+
+
+def _build_sentence_choices(sentences: List[str]) -> List[str]:
+    out: List[str] = []
+    for i, s in enumerate(sentences):
+        s0 = (s or "").replace("\n", " ").strip()
+        if len(s0) > 120:
+            s0 = s0[:120] + "…"
+        out.append(f"{i:04d}: {s0}")
+    return out
+
+
+def _empty_retrieval_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["rank", "score", "law_type", "page_no", "sentence"])
+
+
+def ui_parse_private_document(
+    file_path: Optional[str],
+) -> Tuple[Dict[str, Any], Any, str, str, str, pd.DataFrame, go.Figure, pd.DataFrame, go.Figure]:
+    """
+    Parse an uploaded private document, extract sentences, and prepare UI elements.
+    Returns:
+      - state dict (filename, sentences)
+      - dropdown update (choices + default)
+      - info markdown
+      - initial selected sentence preview
+      - cleared header markdown
+      - empty result table + plot (KAHM->MB)
+      - empty result table + plot (Full-KAHM)
+    """
+    empty_df = _empty_retrieval_df()
+    empty_fig = go.Figure()
+
+    if not file_path:
+        info = "Upload a document to begin. Supported: **.txt, .md, .docx, .pdf**."
+        return {"filename": "", "sentences": []}, gr.update(choices=[], value=None), info, "", "", empty_df, empty_fig, empty_df, empty_fig
+
+    try:
+        text = _read_text_from_path(str(file_path))
+        sentences = _split_sentences(text, max_sentences=5000)
+        fname = Path(str(file_path)).name
+        if not sentences:
+            info = f"Loaded **{fname}**, but could not extract any sentences. Try a different file format or a text-based PDF."
+            return {"filename": fname, "sentences": []}, gr.update(choices=[], value=None), info, "", "", empty_df, empty_fig, empty_df, empty_fig
+
+        choices = _build_sentence_choices(sentences)
+        default = choices[0] if choices else None
+        preview = sentences[0] if sentences else ""
+        info = (
+            f"**Loaded:** {fname}\n\n"
+            f"- Extracted characters: {len(text):,}\n"
+            f"- Extracted sentences: {len(sentences):,} (UI cap: 5,000)\n\n"
+            "Select a sentence below and run retrieval."
+        )
+        state = {"filename": fname, "sentences": sentences}
+        return state, gr.update(choices=choices, value=default), info, preview, "", empty_df, empty_fig, empty_df, empty_fig
+    except Exception as e:
+        info = f"Could not read the uploaded document. Details: {type(e).__name__}: {e}"
+        return {"filename": "", "sentences": []}, gr.update(choices=[], value=None), info, "", "", empty_df, empty_fig, empty_df, empty_fig
+
+
+def ui_private_sentence_preview(selection: str, state: Dict[str, Any]) -> str:
+    if not selection or not state or not state.get("sentences"):
+        return ""
+    m = re.match(r"^\s*(\d+)\s*:", str(selection))
+    if not m:
+        return ""
+    idx = int(m.group(1))
+    sents = state.get("sentences", [])
+    if idx < 0 or idx >= len(sents):
+        return ""
+    return str(sents[idx])
+
+
+def ui_retrieve_private_sentence(
+    selection: str,
+    state: Dict[str, Any],
+    *,
+    base_dir: str,
+    corpus_parquet: str,
+    mb_npz: str,
+    kahm_npz: str,
+    idf_svd_model: str,
+    kahm_model: str,
+    kahm_mode: str,
+    kahm_batch: int,
+    top_k: int,
+) -> Tuple[str, pd.DataFrame, go.Figure, pd.DataFrame, go.Figure]:
+    if not state or not state.get("sentences"):
+        raise ValueError("Please upload a document and select a sentence first.")
+    m = re.match(r"^\s*(\d+)\s*:", str(selection))
+    if not m:
+        raise ValueError("Please select a sentence from the dropdown.")
+    idx = int(m.group(1))
+    sents: List[str] = state.get("sentences", [])
+    if idx < 0 or idx >= len(sents):
+        raise IndexError("Selected sentence index out of range.")
+    query_text = str(sents[idx]).strip()
+    if not query_text:
+        raise ValueError("Selected sentence is empty.")
+
+    header = (
+        f"**Document:** {state.get('filename', '')}  \n"
+        f"**Selected sentence #{idx:04d}:** {query_text}"
+    )
+
+    out1, fig1, out2, fig2 = ui_retrieve_custom(
+        query_text,
+        base_dir=base_dir,
+        corpus_parquet=corpus_parquet,
+        mb_npz=mb_npz,
+        kahm_npz=kahm_npz,
+        idf_svd_model=idf_svd_model,
+        kahm_model=kahm_model,
+        kahm_mode=kahm_mode,
+        kahm_batch=int(kahm_batch),
+        top_k=int(top_k),
+    )
+    return header, out1, fig1, out2, fig2
+
+
+
 # ----------------------------- KAHM science narrative (dashboard tab) -----------------------------
 
 SCIENCE_MD = r"""
@@ -905,6 +1142,63 @@ def build_app() -> gr.Blocks:
                             out_full2 = gr.Dataframe(interactive=False, wrap=True, elem_classes=['kahm-table','retrieval-table'])
                             plot_full2 = gr.Plot()
 
+
+                    with gr.Tab("Private document"):
+                        gr.Markdown(
+                            "## Private document retrieval\n"
+                            "Upload an internal document, select a sentence, and retrieve related Austrian‑law evidence sentences "
+                            "using the same methods as the other retrieval views."
+                        )
+                        gr.Markdown(
+                            "**Privacy note:** the uploaded file is processed by this dashboard instance (your local runtime) and is not "
+                            "sent to external services by this code.",
+                            elem_classes=["small-note"],
+                        )
+
+                        private_doc_state = gr.State({"filename": "", "sentences": []})
+
+                        with gr.Row():
+                            with gr.Column(scale=1, min_width=360):
+                                private_file = gr.File(
+                                    label="1) Upload your document",
+                                    file_types=[".txt", ".md", ".docx", ".pdf"],
+                                    type="filepath",
+                                )
+                                private_info = gr.Markdown(elem_classes=["small-note"])
+                                private_sentence_dropdown = gr.Dropdown(
+                                    choices=[],
+                                    value=None,
+                                    label="2) Select a sentence from your document",
+                                )
+                                private_sentence_preview = gr.Textbox(
+                                    label="Selected sentence (used as query)",
+                                    lines=3,
+                                    interactive=False,
+                                )
+                                private_btn_retrieve = gr.Button(
+                                    "3) Retrieve related Austrian‑law sentences",
+                                    variant="primary",
+                                )
+
+                            with gr.Column(scale=2, min_width=560):
+                                private_header = gr.Markdown()
+
+                                gr.Markdown("### KAHM(query→MB corpus)")
+                                private_out_kahm = gr.Dataframe(
+                                    interactive=False,
+                                    wrap=True,
+                                    elem_classes=["kahm-table", "retrieval-table"],
+                                )
+                                private_plot_kahm = gr.Plot()
+
+                                gr.Markdown("### Full-KAHM (query→KAHM corpus)")
+                                private_out_full_doc = gr.Dataframe(
+                                    interactive=False,
+                                    wrap=True,
+                                    elem_classes=["kahm-table", "retrieval-table"],
+                                )
+                                private_plot_full_doc = gr.Plot()
+
                     with gr.Tab("Funding pitch"):
                         gr.Markdown(PITCH_MD)
 
@@ -1028,6 +1322,79 @@ def build_app() -> gr.Blocks:
             ],
             outputs=[out_kahm_mb2, plot_kahm_mb2, out_full2, plot_full2],
         )
+
+        # ---------- Private document tab ----------
+        def _parse_private_doc(fp: str):
+            return ui_parse_private_document(fp)
+
+        private_file.change(
+            fn=_parse_private_doc,
+            inputs=[private_file],
+            outputs=[
+                private_doc_state,
+                private_sentence_dropdown,
+                private_info,
+                private_sentence_preview,
+                private_header,
+                private_out_kahm,
+                private_plot_kahm,
+                private_out_full_doc,
+                private_plot_full_doc,
+            ],
+        )
+
+        private_sentence_dropdown.change(
+            fn=ui_private_sentence_preview,
+            inputs=[private_sentence_dropdown, private_doc_state],
+            outputs=[private_sentence_preview],
+        )
+
+        def _retrieve_private(
+            sel: str,
+            st: Dict[str, Any],
+            base: str,
+            corpus_pq: str,
+            mb: str,
+            kahm_npz_p: str,
+            idf_model: str,
+            kahm_model_p: str,
+            mode: str,
+            batch: float,
+            k: int,
+        ):
+            return ui_retrieve_private_sentence(
+                sel,
+                st,
+                base_dir=base,
+                corpus_parquet=corpus_pq,
+                mb_npz=mb,
+                kahm_npz=kahm_npz_p,
+                idf_svd_model=idf_model,
+                kahm_model=kahm_model_p,
+                kahm_mode=mode,
+                kahm_batch=int(batch),
+                top_k=int(k),
+            )
+
+        private_btn_retrieve.click(
+            fn=_retrieve_private,
+            inputs=[
+                private_sentence_dropdown,
+                private_doc_state,
+                base_dir,
+                corpus_parquet,
+                mb_npz,
+                kahm_npz,
+                idf_svd_model,
+                kahm_model,
+                kahm_mode,
+                kahm_batch,
+                top_k,
+            ],
+            outputs=[private_header, private_out_kahm, private_plot_kahm, private_out_full_doc, private_plot_full_doc],
+        )
+
+
 
     return demo
 
