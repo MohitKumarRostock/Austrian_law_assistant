@@ -106,7 +106,7 @@ DEFAULT_MODEL_ID = None
 DEFAULT_INCLUDE_QUERIES = True
 DEFAULT_QUERIES_NPZ = "queries_embedding_index.npz"
 
-DEFAULT_N_CLUSTERS = 5000
+DEFAULT_N_CLUSTERS = 10000
 DEFAULT_SUBSPACE_DIM = 20
 DEFAULT_NB = 100  # IMPORTANT: as requested
 DEFAULT_TRAIN_FRACTION = 1.0
@@ -129,9 +129,9 @@ DEFAULT_OVERWRITE_AE_DIR = False
 DEFAULT_EVAL_SOFT = True
 DEFAULT_TUNE_SOFT = True
 DEFAULT_TUNE_NLMS = True
-DEFAULT_VAL_FRACTION = 0.5
+DEFAULT_VAL_FRACTION = 0.05
 DEFAULT_VAL_MAX_SAMPLES = 50000
-DEFAULT_SOFT_ALPHAS = (2.0, 5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0)
+DEFAULT_SOFT_ALPHAS = (5.0, 8.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0)
 DEFAULT_SOFT_TOPKS = (2, 5, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 25, 50, 75, 100, 125, 150, 175, 200)
 
 # BlockSafe defaults
@@ -703,7 +703,11 @@ def main() -> int:
             f"Not enough training samples ({N_train_total}) for n_clusters={args.n_clusters}. "
             f"Need N_train_total >= 2 * n_clusters."
         )
-
+    try:
+        del X_train_sent, Y_train_sent
+    except Exception:
+        pass
+    
     # KAHM expects (D, N)
     X_train = X_train_all.T
     Y_train = Y_train_all.T
@@ -819,12 +823,12 @@ def main() -> int:
         else:
             alphas = tuple(parse_float_list(args.soft_alphas))
             topks = tuple(parse_topk_list(args.soft_topks))
-            print("\nTuning soft parameters on validation set (sentences only) ...")
+            print("\nTuning soft parameters on validation set...")
             assert X_val is not None and Y_val is not None
             tuning_result = tune_soft_params(
                 model,
-                X_val[:,1:3500],
-                Y_val[:,1:3500],
+                X_val,
+                Y_val,
                 alphas=alphas,
                 topks=topks,
                 n_jobs=1,
@@ -833,15 +837,15 @@ def main() -> int:
     
     nlms_results = None
     if args.tune_nlms:
-        print("\nRefining cluster centers with NLMS on validation set ...")
+        print("\nRefining cluster centers with NLMS...")
         assert X_val is not None and Y_val is not None
         nlms_results = tune_cluster_centers_nlms(
             model,
-            X_val,
-            Y_val,
+            np.hstack([X_val, X_train]),
+            np.hstack([Y_val, Y_train]),
             mu=0.1,
             epsilon=1,
-            epochs=20,
+            epochs=10,
             batch_size=512,
             shuffle=True,
             random_state=0,

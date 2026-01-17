@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2026-01-10-pubreport-v6-final3"
+SCRIPT_VERSION = "2026-01-17-pubreport-v7"
 
 
 def _safe_ratio(num: float, denom: float) -> float:
@@ -110,6 +110,17 @@ def _write_text(path: str, text: str, *, overwrite: bool = False) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(text)
 
+def _str2bool(v: object) -> bool:
+    """Argparse-friendly boolean parser. Accepts typical truthy/falsey strings."""
+    if isinstance(v, bool):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v!r}")
+
 
 def build_publication_report_md(
     *,
@@ -135,6 +146,18 @@ def build_publication_report_md(
 
     def _ci_excludes_0(ci: Tuple[float, float]) -> bool:
         return bool(np.isfinite(ci[0]) and np.isfinite(ci[1]) and (ci[0] > 0.0 or ci[1] < 0.0))
+
+    def _metric_label(raw: str) -> str:
+        s = str(raw)
+        mapping = {
+            "hit@k": f"Hit@{k}",
+            "MRR@k (unique laws)": f"MRR@{k} (unique laws)",
+            "top1-accuracy": "Top-1 accuracy",
+            "majority-accuracy": f"Majority-vote accuracy (predominance ≥ {pred_frac:0.2f})",
+            "mean consensus fraction": "Mean consensus fraction",
+            "mean lift (prior)": "Mean lift vs prior",
+        }
+        return mapping.get(s, s)
 
     def _get_row(story: Dict[str, Any], key: str) -> Dict[str, Any]:
         for r in story.get("rows", []):
@@ -204,22 +227,57 @@ def build_publication_report_md(
     sent_j_pt, sent_j_ci = alignment["sentence_jaccard"]["pt"], alignment["sentence_jaccard"]["ci"]
     d_sent_pt, d_sent_ci = alignment["delta_sentence_jaccard_full_minus_idf"]["pt"], alignment["delta_sentence_jaccard_full_minus_idf"]["ci"]
 
-    lines.append(
+    # Headline CI status vs Mixedbread for key retrieval metrics (derived, not templated).
+    mb_excl: List[str] = []
+    mb_incl: List[str] = []
+    for key, label in [("hit", f"Hit@{k}"), ("mrr_ul", f"MRR@{k}"), ("top1", "Top-1 accuracy")]:
+        rr = _get_row(storyline_b, key) or {}
+        ci = rr.get("ci", (float("nan"), float("nan")))
+        if isinstance(ci, (tuple, list)) and len(ci) >= 2 and np.isfinite(float(ci[0])) and np.isfinite(float(ci[1])):
+            if _ci_excludes_0((float(ci[0]), float(ci[1]))):
+                mb_excl.append(label)
+            else:
+                mb_incl.append(label)
+
+    if mb_excl and mb_incl:
+        mb_clause = (
+            f"Against Mixedbread, paired deltas for {', '.join(mb_excl)} had 95% CIs excluding 0, whereas "
+            f"{', '.join(mb_incl)} had 95% CIs that included 0 (differences not resolved under this bootstrap; not a formal equivalence claim). "
+        )
+    elif mb_incl:
+        mb_clause = (
+            f"Against Mixedbread, paired deltas for {', '.join(mb_incl)} had 95% CIs that included 0 "
+            "(differences not resolved under this bootstrap; not a formal equivalence claim). "
+        )
+    elif mb_excl:
+        mb_clause = f"Against Mixedbread, paired deltas for {', '.join(mb_excl)} had 95% CIs excluding 0. "
+    else:
+        mb_clause = "Against Mixedbread, paired deltas are summarized in Table 3. "
+
+    # Lift vs Mixedbread clause (directionally neutral).
+    lift_clause = ""
+    if isinstance(b_lift.get("ci"), (tuple, list)):
+        ci = b_lift.get("ci", (float("nan"), float("nan")))
+        delta = float(b_lift.get("delta", float("nan")))
+        if np.isfinite(delta) and len(ci) >= 2 and np.isfinite(float(ci[0])) and np.isfinite(float(ci[1])):
+            lift_clause = f"Mean lift vs prior changed by {_delta_cell(delta, (float(ci[0]), float(ci[1])), digits=3)}. "
+
+    abstract_text = (
         "We study whether KAHM can replace transformer-based query embedding at retrieval time by learning a lightweight mapping "
         "from an IDF–SVD representation into Mixedbread embedding space, enabling search against a fixed Mixedbread corpus index. "
         f"On {n_queries} human-labeled queries over {n_corpus:,} aligned sentences (k={k}), KAHM(query→MB corpus) achieved "
         f"Hit@{k}={_ci_cell(k_hit_pt, k_hit_ci)} and MRR@{k}={_ci_cell(k_mrr_pt, k_mrr_ci)}. "
-        f"Compared with IDF–SVD, KAHM improved Hit@{k} by {_delta_cell(float(a_hit.get('delta', float('nan'))), a_hit.get('ci', (float('nan'), float('nan'))))} and "
+        f"Compared with IDF–SVD, KAHM changed Hit@{k} by {_delta_cell(float(a_hit.get('delta', float('nan'))), a_hit.get('ci', (float('nan'), float('nan'))))} and "
         f"MRR@{k} by {_delta_cell(float(a_mrr.get('delta', float('nan'))), a_mrr.get('ci', (float('nan'), float('nan'))))} under paired bootstrap. "
-        f"Against Mixedbread, paired deltas for Hit@{k}, MRR@{k}, and Top-1 accuracy have 95% CIs including 0 (differences not resolved at n={n_queries} under this bootstrap; not a formal equivalence claim), "
-        "while mean lift vs prior increased "
-        f"by {_delta_cell(float(b_lift.get('delta', float('nan'))), b_lift.get('ci', (float('nan'), float('nan'))))}."
+        + mb_clause
+        + lift_clause
         + maj_sentence
-        + " Finally, Full-KAHM embeddings showed high cosine alignment with Mixedbread geometry "
+        + "Finally, Full-KAHM embeddings showed high cosine alignment with Mixedbread geometry "
         f"(corpus cosine={_ci_cell(cos_corpus_pt, cos_corpus_ci, digits=4)}, query cosine={_ci_cell(cos_query_pt, cos_query_ci, digits=4)}) and "
         f"recovered similar law-level neighborhoods (law-set Jaccard@{k}={_ci_cell(lawset_j_pt, lawset_j_ci, digits=3)}; Δ vs IDF={_delta_cell(d_lawset_pt, d_lawset_ci, digits=3)}), "
         f"while sentence-level neighbor identity remained modest (sentence Jaccard@{k}={_ci_cell(sent_j_pt, sent_j_ci, digits=3)}; Δ vs IDF={_delta_cell(d_sent_pt, d_sent_ci, digits=3)})."
     )
+    lines.append(abstract_text)
     lines.append("")
 
     # -------------------------------------------------------------------------
@@ -358,18 +416,6 @@ def build_publication_report_md(
         rows.append(r)
     lines.append(_md_table(headers, rows))
     lines.append("")
-
-    def _metric_label(raw: str) -> str:
-        s = str(raw)
-        mapping = {
-            'hit@k': f'Hit@{k}',
-            'MRR@k (unique laws)': f'MRR@{k} (unique laws)',
-            'top1-accuracy': 'Top-1 accuracy',
-            'majority-accuracy': f'Majority-vote accuracy (predominance ≥ {pred_frac:0.2f})',
-            'mean consensus fraction': 'Mean consensus fraction',
-            'mean lift (prior)': 'Mean lift vs prior',
-        }
-        return mapping.get(s, s)
 
     lines.append("### Comparative analyses")
     lines.append("")
@@ -575,9 +621,9 @@ def build_publication_report_md(
     lines.append("")
 
     # -------------------------------------------------------------------------
-    # Copy-ready summary paragraph
+    # Summary paragraph
     lines.append("---")
-    lines.append("## Copy-ready summary paragraph")
+    lines.append("## Summary paragraph")
     lines.append("")
     k_hit_pt, k_hit_ci = kahm_qmb["hit"]
     k_mrr_pt, k_mrr_ci = kahm_qmb["mrr_ul"]
@@ -596,12 +642,57 @@ def build_publication_report_md(
                 f" Majority-vote accuracy was{numerically} {direction} by {_delta_cell(delta, ci, digits=3)} "
                 f"relative to Mixedbread{ci_note}."
             )
+    # Derive narrative statements from the actual paired CIs (avoid templated conclusions).
+    a_pass: List[str] = []
+    a_fail: List[str] = []
+    for key, label in [("hit", f"Hit@{k}"), ("mrr_ul", f"MRR@{k}"), ("top1", "Top-1 accuracy")]:
+        rr = _get_row(storyline_a, key) or {}
+        if rr.get("pass") is True:
+            a_pass.append(label)
+        elif rr:
+            a_fail.append(label)
+
+    if a_pass and not a_fail:
+        superiority_clause = f"Paired-bootstrap deltas supported KAHM(query→MB corpus) superiority over IDF–SVD on {', '.join(a_pass)} (Table 2)."
+    elif a_pass:
+        superiority_clause = f"Under the one-sided superiority criterion, KAHM(query→MB corpus) improved {', '.join(a_pass)} versus IDF–SVD, while other headline metrics were not resolved (Table 2)."
+    else:
+        superiority_clause = "Under the one-sided superiority criterion, KAHM(query→MB corpus) did not show a resolved improvement over IDF–SVD on Hit/MRR/Top-1 (Table 2)."
+
+    mb_excl: List[str] = []
+    mb_incl: List[str] = []
+    for key, label in [("hit", f"Hit@{k}"), ("mrr_ul", f"MRR@{k}"), ("top1", "Top-1 accuracy")]:
+        rr = _get_row(storyline_b, key) or {}
+        ci = rr.get("ci", (float("nan"), float("nan")))
+        if isinstance(ci, (tuple, list)) and len(ci) >= 2 and np.isfinite(float(ci[0])) and np.isfinite(float(ci[1])):
+            if _ci_excludes_0((float(ci[0]), float(ci[1]))):
+                mb_excl.append(label)
+            else:
+                mb_incl.append(label)
+
+    if mb_excl and mb_incl:
+        mb_clause_short = (
+            f"Compared to Mixedbread, paired deltas indicated differences for {', '.join(mb_excl)} (95% CIs exclude 0), "
+            f"while {', '.join(mb_incl)} were not resolved (95% CIs include 0; Table 3)."
+        )
+    elif mb_incl:
+        mb_clause_short = f"Compared to Mixedbread, paired deltas for {', '.join(mb_incl)} were small with 95% CIs that included 0 (Table 3)."
+    elif mb_excl:
+        mb_clause_short = f"Compared to Mixedbread, paired deltas indicated differences for {', '.join(mb_excl)} with 95% CIs excluding 0 (Table 3)."
+    else:
+        mb_clause_short = "Compared to Mixedbread, paired deltas were summarized in Table 3."
+
+    sent_delta_note = ""
+    dci = alignment["delta_sentence_jaccard_full_minus_idf"]["ci"]
+    if isinstance(dci, (tuple, list)) and len(dci) >= 2 and (not _ci_excludes_0((float(dci[0]), float(dci[1])))):
+        sent_delta_note = " (CI includes 0)"
+
     lines.append(
         f"Across {n_queries} queries (k={k}), KAHM(query→MB corpus) achieved Hit@{k}={_ci_cell(k_hit_pt, k_hit_ci, digits=3)} "
         f"and MRR@{k}={_ci_cell(k_mrr_pt, k_mrr_ci, digits=3)}. "
-        f"Paired-bootstrap deltas favored KAHM(query→MB corpus) over IDF–SVD under the evaluation’s superiority criterion "
-        f"(Table 2). Compared to Mixedbread, paired deltas for Hit@{k}, MRR@{k}, and Top-1 accuracy were small with 95% CIs "
-        f"that included 0 (Table 3), while majority-vote behavior differed depending on the routing threshold τ (Tables 5–8)."
+        + superiority_clause + " "
+        + mb_clause_short + " "
+        + f"Majority-vote behavior differed depending on the routing threshold τ (Tables 5–8)."
         + maj_delta_phrase
         + f" Full-KAHM embeddings showed high cosine alignment with Mixedbread in embedding space "
         f"(mean corpus cosine {alignment['cosine_corpus']['pt']:.4f}) and recovered similar law-level neighborhoods "
@@ -609,7 +700,7 @@ def build_publication_report_md(
         f"Δ vs IDF={_delta_cell(alignment['delta_lawset_jaccard_full_minus_idf']['pt'], alignment['delta_lawset_jaccard_full_minus_idf']['ci'], digits=3)}; Table 9), "
         f"while sentence-level neighbor identity remained modest "
         f"(sentence Jaccard@{k}={_ci_cell(alignment['sentence_jaccard']['pt'], alignment['sentence_jaccard']['ci'], digits=3)}; "
-        f"Δ vs IDF includes 0; Table 9)."
+        f"Δ vs IDF={_delta_cell(alignment['delta_sentence_jaccard_full_minus_idf']['pt'], alignment['delta_sentence_jaccard_full_minus_idf']['ci'], digits=3)}{sent_delta_note}; Table 9)."
     )
     lines.append("")
 
@@ -724,6 +815,8 @@ def load_npz_bundle(path: str) -> Dict[str, np.ndarray]:
         )
 
     sentence_ids = np.asarray(data[sid_key], dtype=np.int64)
+    if np.unique(sentence_ids).size != sentence_ids.size:
+        raise ValueError(f"NPZ bundle has duplicate sentence_ids; must be unique for safe alignment: {path}")
     emb = np.asarray(data[emb_key], dtype=np.float32)
     if emb.ndim != 2:
         raise ValueError(f"Embeddings must be 2D; got {emb.shape} in {path}")
@@ -958,7 +1051,11 @@ def kahm_regress_once(
     batch_size: int,
     show_progress: bool = False,
 ) -> np.ndarray:
-    """Single-call KAHM regression with internal batching (avoids repeated AE reloads)."""
+    """Single-call KAHM regression with internal batching.
+
+    Some versions of kahm_regression expose a show_progress kwarg and some do not.
+    We attempt the call with show_progress first and fall back cleanly if unsupported.
+    """
     from kahm_regression import kahm_regress
 
     X = np.asarray(X, dtype=np.float32)
@@ -966,17 +1063,19 @@ def kahm_regress_once(
         raise ValueError(f"KAHM regression input must be 2D; got {X.shape}")
 
     bs = int(batch_size) if int(batch_size) > 0 else None
-    
-    Yt = kahm_regress(
-            model,
-            X.T,
-            n_jobs=1,
-            mode=str(mode),
-            batch_size=bs,
-            # kahm_regression.py may or may not expose show_progress; keep runtime-compatible.
-            show_progress=bool(show_progress),
-        )
-  
+
+    kwargs = {
+        "n_jobs": 1,
+        "mode": str(mode),
+        "batch_size": bs,
+    }
+
+    try:
+        Yt = kahm_regress(model, X.T, show_progress=bool(show_progress), **kwargs)
+    except TypeError:
+        # Older kahm_regression versions may not accept show_progress.
+        Yt = kahm_regress(model, X.T, **kwargs)
+
     Y = np.asarray(Yt, dtype=np.float32).T
     return l2_normalize_rows(Y)
 
@@ -1017,6 +1116,29 @@ class MajorityVote:
     margin: np.ndarray
     entropy: np.ndarray
     n_unique: np.ndarray
+
+
+def _majority_law_tiebreak(laws: List[str], counts: Counter) -> tuple[str, int]:
+    """Pick the majority law deterministically.
+
+    When multiple laws are tied for max count, we break ties by the earliest occurrence
+    in the ranked top-k list (stable and retrieval-order consistent).
+    """
+    if not laws:
+        return "", 0
+    if not counts:
+        return "", 0
+    max_count = max(int(v) for v in counts.values())
+    candidates = [str(lw) for lw, cnt in counts.items() if int(cnt) == max_count]
+    if len(candidates) == 1:
+        return candidates[0], max_count
+
+    first_pos: dict[str, int] = {}
+    for pos, lw in enumerate(laws):
+        if lw not in first_pos:
+            first_pos[lw] = int(pos)
+    chosen = min(candidates, key=lambda lw: first_pos.get(lw, 10**9))
+    return chosen, max_count
 
 
 def compute_per_query_metrics(
@@ -1062,7 +1184,7 @@ def compute_per_query_metrics(
         top1_v[i] = 1.0 if (laws and laws[0] == cons) else 0.0
 
         c = Counter(laws)
-        maj_law, maj_count = c.most_common(1)[0]
+        maj_law, maj_count = _majority_law_tiebreak(laws, c)
         maj_frac = float(maj_count) / float(max(1, len(laws)))
         maj_v[i] = 1.0 if (maj_law == cons and maj_frac >= pred_frac) else 0.0
 
@@ -1125,7 +1247,7 @@ def compute_majority_vote(
             continue
 
         c = Counter(laws)
-        maj_law, maj_count = c.most_common(1)[0]
+        maj_law, maj_count = _majority_law_tiebreak(laws, c)
         total = float(len(laws))
         mf = float(maj_count) / total
         maj_frac[i] = mf
@@ -1660,7 +1782,13 @@ def main() -> None:
     # 0 means "do not override".
     default_threads = 1 if sys.platform == "darwin" else 0
     p.add_argument("--threads", type=int, default=default_threads, help="Cap OMP/BLAS/torch/FAISS threads (0=no override).")
-    p.add_argument("--kahm_show_progress", default=True, help="Show a KAHM progress bar (requires tqdm in env).")
+    # Proper boolean flag (supports --kahm_show_progress / --no-kahm_show_progress on py>=3.9, or string values otherwise)
+    if hasattr(argparse, "BooleanOptionalAction"):
+        p.add_argument("--kahm_show_progress", action=argparse.BooleanOptionalAction, default=True,
+                       help="Show a KAHM progress bar (requires tqdm in env).")
+    else:
+        p.add_argument("--kahm_show_progress", type=_str2bool, default=True,
+                       help="Show a KAHM progress bar (requires tqdm in env).")
 
     p.add_argument("--bootstrap_samples", type=int, default=5000)
     p.add_argument("--bootstrap_seed", type=int, default=0)
@@ -1689,11 +1817,11 @@ def main() -> None:
     # and reduce the probability of native-library crashes under high memory pressure.
     if int(args.threads) > 0:
         t = str(int(args.threads))
-        os.environ.setdefault("OMP_NUM_THREADS", t)
-        os.environ.setdefault("MKL_NUM_THREADS", t)
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", t)
-        os.environ.setdefault("VECLIB_MAXIMUM_THREADS", t)
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", t)
+        os.environ["OMP_NUM_THREADS"] = t
+        os.environ["MKL_NUM_THREADS"] = t
+        os.environ["OPENBLAS_NUM_THREADS"] = t
+        os.environ["VECLIB_MAXIMUM_THREADS"] = t
+        os.environ["NUMEXPR_NUM_THREADS"] = t
         try:
             import torch  # type: ignore
 
@@ -1721,6 +1849,23 @@ def main() -> None:
     print(f"  MB corpus:   {emb_mb.shape}")
     print(f"  IDF corpus:  {emb_idf.shape}")
     print(f"  KAHM corpus: {emb_k.shape}")
+
+
+    # Validate query labels against the aligned corpus to avoid silently meaningless metrics.
+    cons_clean = [str(x).strip() for x in consensus]
+    n_empty_cons = sum(1 for x in cons_clean if not x)
+    if n_empty_cons:
+        raise ValueError(f"{n_empty_cons}/{len(cons_clean)} queries have empty consensus law labels.")
+
+    law_set = set(str(x) for x in law_arr.tolist())
+    missing = sorted({x for x in cons_clean if x} - law_set)
+    if missing:
+        preview = ", ".join(missing[:10])
+        more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
+        raise ValueError(
+            "Some consensus law labels are not present in the aligned corpus law set. "
+            f"Missing={len(missing)}: {preview}{more}"
+        )
 
     # Embed queries (done BEFORE building FAISS indices to reduce peak memory and
     # to initialize torch before faiss on macOS).

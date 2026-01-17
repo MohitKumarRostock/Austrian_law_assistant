@@ -32,7 +32,6 @@ Notes
 """
 from __future__ import annotations
 
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -88,28 +87,27 @@ class MeanCI:
         return MeanCI(float(m.group(1)), float(m.group(2)), float(m.group(3)))
 
 
-def _extract_md_table(md: str, header_prefix: str) -> Optional[List[str]]:
+def _extract_all_md_tables(md: str, header_prefix: str) -> List[List[str]]:
     """
-    Extract a markdown table (as list of lines) whose header line begins with `header_prefix`.
-    Returns None if not found.
+    Extract all markdown tables whose header row begins with `header_prefix`.
+    Each table is returned as a list of lines (including header + separator + rows).
     """
     lines = md.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip().startswith(header_prefix):
-            start = i
-            break
-    if start is None:
-        return None
-
-    # Collect consecutive table lines.
-    out: List[str] = []
-    for j in range(start, len(lines)):
-        line = lines[j]
-        if not line.strip().startswith("|"):
-            break
-        out.append(line.rstrip())
-    return out if len(out) >= 3 else None
+    tables: List[List[str]] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().startswith(header_prefix):
+            out: List[str] = []
+            j = i
+            while j < len(lines) and lines[j].strip().startswith('|'):
+                out.append(lines[j].rstrip())
+                j += 1
+            if len(out) >= 3:
+                tables.append(out)
+            i = j
+            continue
+        i += 1
+    return tables
 
 
 def _md_table_to_df(table_lines: Sequence[str]) -> pd.DataFrame:
@@ -134,7 +132,16 @@ def _md_table_to_df(table_lines: Sequence[str]) -> pd.DataFrame:
 def parse_report_tables(report_path: str) -> Dict[str, pd.DataFrame]:
     """
     Parse key tables from the markdown report produced by evaluate_three_embeddings.py.
-    Returns a dict of DataFrames keyed by table id.
+
+    Notes
+    -----
+    The report contains multiple markdown tables with similar headers (e.g., paired-delta tables).
+    We therefore extract *all* matching tables and then map them to expected ids by order.
+
+    Returns
+    -------
+    Dict[str, DataFrame]
+        Keys: table1, table2, table3, table5, table9 (when found).
     """
     p = Path(report_path)
     if not p.exists():
@@ -144,37 +151,26 @@ def parse_report_tables(report_path: str) -> Dict[str, pd.DataFrame]:
     tables: Dict[str, pd.DataFrame] = {}
 
     # Table 1 (main metrics)
-    t1 = _extract_md_table(md, "| Method | Hit@")
-    if t1:
-        tables["table1"] = _md_table_to_df(t1)
+    t1_all = _extract_all_md_tables(md, "| Method | Hit@")
+    if t1_all:
+        tables["table1"] = _md_table_to_df(t1_all[0])
 
-    # Table 2 (KAHM vs IDF)
-    t2 = _extract_md_table(md, "| Metric | Δ (KAHM")
-    # There are two delta tables: vs IDF and vs Mixedbread. We'll capture both by scanning.
-    # We'll pick by title proximity if possible; otherwise parse sequentially.
-    if t2:
-        tables["table2"] = _md_table_to_df(t2)
-
-    # Table 3 (KAHM vs Mixedbread) - find the *next* delta table after Table 2.
-    if t2:
-        # locate index in md and search after
-        anchor = "\n".join(t2)
-        pos = md.find(anchor)
-        if pos >= 0:
-            md_after = md[pos + len(anchor) :]
-            t3 = _extract_md_table(md_after, "| Metric | Δ (KAHM")
-            if t3:
-                tables["table3"] = _md_table_to_df(t3)
+    # Paired delta tables (Table 2 and Table 3 share the same header prefix)
+    delta_all = _extract_all_md_tables(md, "| Metric | Δ (KAHM")
+    if len(delta_all) >= 1:
+        tables["table2"] = _md_table_to_df(delta_all[0])
+    if len(delta_all) >= 2:
+        tables["table3"] = _md_table_to_df(delta_all[1])
 
     # Table 5 (routing sweep)
-    t5 = _extract_md_table(md, "| τ | Coverage (KAHM)")
-    if t5:
-        tables["table5"] = _md_table_to_df(t5)
+    t5_all = _extract_all_md_tables(md, "| τ | Coverage (KAHM)")
+    if t5_all:
+        tables["table5"] = _md_table_to_df(t5_all[0])
 
     # Table 9 (alignment)
-    t9 = _extract_md_table(md, "| Quantity | Estimate")
-    if t9:
-        tables["table9"] = _md_table_to_df(t9)
+    t9_all = _extract_all_md_tables(md, "| Quantity | Estimate")
+    if t9_all:
+        tables["table9"] = _md_table_to_df(t9_all[0])
 
     return tables
 
@@ -212,21 +208,30 @@ def fig_main_metrics(df_table1: pd.DataFrame) -> go.Figure:
     ]
     long = _metric_table_long(df_table1, metrics)
     fig = go.Figure()
+
     for method in long["Method"].unique():
         sub = long[long["Method"] == method]
+        y = sub["Mean"].to_numpy(dtype=float)
+        hi = sub["CI_hi"].to_numpy(dtype=float)
+        lo = sub["CI_lo"].to_numpy(dtype=float)
+        arr = np.maximum(0.0, hi - y)
+        arrm = np.maximum(0.0, y - lo)
+        finite = np.isfinite(arr).all() and np.isfinite(arrm).all()
+
         fig.add_trace(
             go.Bar(
                 name=method,
                 x=sub["Metric"],
-                y=sub["Mean"],
+                y=y,
                 error_y=dict(
                     type="data",
-                    array=(sub["CI_hi"] - sub["Mean"]).to_numpy(),
-                    arrayminus=(sub["Mean"] - sub["CI_lo"]).to_numpy(),
-                    visible=True,
+                    array=arr,
+                    arrayminus=arrm,
+                    visible=bool(finite),
                 ),
             )
         )
+
     fig.update_layout(
         barmode="group",
         height=420,
@@ -241,21 +246,30 @@ def fig_main_metrics(df_table1: pd.DataFrame) -> go.Figure:
 def _bar_metric(df_table1: pd.DataFrame, metric: str, *, title: str, yaxis_title: str) -> go.Figure:
     long = _metric_table_long(df_table1, [metric])
     fig = go.Figure()
+
     for method in long["Method"].unique():
         sub = long[long["Method"] == method]
+        y = sub["Mean"].to_numpy(dtype=float)
+        hi = sub["CI_hi"].to_numpy(dtype=float)
+        lo = sub["CI_lo"].to_numpy(dtype=float)
+        arr = np.maximum(0.0, hi - y)
+        arrm = np.maximum(0.0, y - lo)
+        finite = np.isfinite(arr).all() and np.isfinite(arrm).all()
+
         fig.add_trace(
             go.Bar(
                 name=method,
                 x=[metric],
-                y=sub["Mean"].to_numpy(),
+                y=y,
                 error_y=dict(
                     type="data",
-                    array=(sub["CI_hi"] - sub["Mean"]).to_numpy(),
-                    arrayminus=(sub["Mean"] - sub["CI_lo"]).to_numpy(),
-                    visible=True,
+                    array=arr,
+                    arrayminus=arrm,
+                    visible=bool(finite),
                 ),
             )
         )
+
     fig.update_layout(
         barmode="group",
         height=380,
@@ -286,8 +300,34 @@ def fig_mean_lift(df_table1: pd.DataFrame) -> go.Figure:
 
 
 def fig_routing(df_table5: pd.DataFrame) -> go.Figure:
+    required = [
+        "τ",
+        "Coverage (KAHM)",
+        "Accuracy among covered (KAHM)",
+        "Coverage (Mixedbread)",
+        "Accuracy among covered (Mixedbread)",
+    ]
+    missing = [c for c in required if c not in df_table5.columns]
+    if missing:
+        fig = go.Figure()
+        fig.update_layout(
+            height=240,
+            margin=dict(l=30, r=30, t=50, b=30),
+            title="Vote-based routing tradeoff (table parsing incomplete)",
+            annotations=[
+                dict(
+                    text=f"Missing columns in parsed Table 5: {', '.join(missing)}",
+                    x=0.5,
+                    y=0.5,
+                    xref="paper",
+                    yref="paper",
+                    showarrow=False,
+                )
+            ],
+        )
+        return fig
+
     def _parse_col(col: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # values like "0.780 (0.720, 0.835)"
         parsed = [MeanCI.parse(v) for v in df_table5[col].tolist()]
         means = np.array([p.mean if p else np.nan for p in parsed], dtype=float)
         lo = np.array([p.lo if p else np.nan for p in parsed], dtype=float)
@@ -295,10 +335,10 @@ def fig_routing(df_table5: pd.DataFrame) -> go.Figure:
         return means, lo, hi
 
     tau = df_table5["τ"].astype(float).to_numpy()
-    cov_k, cov_k_lo, cov_k_hi = _parse_col("Coverage (KAHM)")
-    acc_k, acc_k_lo, acc_k_hi = _parse_col("Accuracy among covered (KAHM)")
-    cov_m, cov_m_lo, cov_m_hi = _parse_col("Coverage (Mixedbread)")
-    acc_m, acc_m_lo, acc_m_hi = _parse_col("Accuracy among covered (Mixedbread)")
+    cov_k, _, _ = _parse_col("Coverage (KAHM)")
+    acc_k, _, _ = _parse_col("Accuracy among covered (KAHM)")
+    cov_m, _, _ = _parse_col("Coverage (Mixedbread)")
+    acc_m, _, _ = _parse_col("Accuracy among covered (Mixedbread)")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=tau, y=acc_m, mode="lines+markers", name="Mixedbread: acc|covered"))
@@ -343,6 +383,8 @@ def _load_dataframe(corpus_parquet: str) -> pd.DataFrame:
     if "sentence_id" not in df.columns:
         raise KeyError("Corpus parquet must contain column 'sentence_id'")
     df["sentence_id"] = df["sentence_id"].astype(np.int64)
+    if df["sentence_id"].duplicated().any():
+        raise ValueError("Corpus parquet contains non-unique sentence_id values")
     return df
 
 
@@ -356,12 +398,16 @@ def _load_bundle(npz_path: str) -> Dict[str, np.ndarray]:
 def _subset_to_metadata(bundle: Dict[str, np.ndarray], df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     ids = bundle["sentence_ids"].astype(np.int64)
     emb = bundle["emb"].astype(np.float32)
+    if emb.ndim != 2:
+        raise ValueError("NPZ bundle embeddings must be a 2D array")
+    if ids.ndim != 1:
+        raise ValueError("NPZ bundle sentence_ids must be a 1D array")
+    if emb.shape[0] != ids.shape[0]:
+        raise ValueError(f"NPZ bundle mismatch: {emb.shape[0]=} vs {ids.shape[0]=}")
+
     meta_ids = df["sentence_id"].astype(np.int64).to_numpy()
-    meta_set = set(meta_ids.tolist())
-    keep = np.array([int(s) in meta_set for s in ids.tolist()], dtype=bool)
-    ids2 = ids[keep]
-    emb2 = emb[keep]
-    return ids2, emb2
+    keep = np.isin(ids, meta_ids)
+    return ids[keep], emb[keep]
 
 
 def _build_faiss_index(embeddings: np.ndarray) -> Any:
@@ -402,7 +448,9 @@ def _embed_query_kahm(
     pipe = _load_idf_svd_model(idf_svd_model_path)
     X = eval3.embed_queries_idf_svd(pipe, [query])  # shape (1, d)
     model = _load_kahm_model(kahm_model_path)
-    Y = eval3.kahm_regress_once(model, X, mode=kahm_mode, batch_size=kahm_batch, show_progress=False)  # (1, 1024)
+    Y = eval3.kahm_regress_once(model, X, mode=kahm_mode, batch_size=kahm_batch, show_progress=False)  # (1, d)
+    # Ensure cosine-similarity semantics for IndexFlatIP
+    Y = eval3.l2_normalize_rows(Y.astype(np.float32))
     return Y[0]
 
 
@@ -411,6 +459,13 @@ def _search_topk(corpus: CorpusIndex, q_emb: np.ndarray, top_k: int) -> Tuple[np
     D, I = corpus.faiss_index.search(q, int(top_k))
     scores = D[0]
     idxs = I[0]
+
+    # FAISS may return -1 indices if k > n or on some index types.
+    valid = (idxs >= 0) & (idxs < len(corpus.sentence_ids))
+    if not np.all(valid):
+        scores = scores[valid]
+        idxs = idxs[valid]
+
     sids = corpus.sentence_ids[idxs]
     return scores, sids
 
@@ -419,8 +474,6 @@ def _format_hits(
     df_meta: pd.DataFrame,
     scores: np.ndarray,
     sentence_ids: np.ndarray,
-    *,
-    top_k: int,
 ) -> Tuple[pd.DataFrame, go.Figure]:
     # Prepare metadata mapping
     meta = df_meta.set_index("sentence_id", drop=False)
@@ -581,11 +634,11 @@ def ui_retrieve_for_selection(
 
     # KAHM(q->MB)
     s1, ids1 = _search_topk(mb_corpus, q_emb, int(top_k))
-    out1, fig1 = _format_hits(df_meta, s1, ids1, top_k=int(top_k))
+    out1, fig1 = _format_hits(df_meta, s1, ids1)
 
     # Full-KAHM (q->KAHM corpus)
     s2, ids2 = _search_topk(k_corpus, q_emb, int(top_k))
-    out2, fig2 = _format_hits(df_meta, s2, ids2, top_k=int(top_k))
+    out2, fig2 = _format_hits(df_meta, s2, ids2)
 
     return header, out1, fig1, out2, fig2
 
@@ -614,11 +667,10 @@ def ui_retrieve_custom(
         kahm_batch=int(kahm_batch),
     )
     s1, ids1 = _search_topk(mb_corpus, q_emb, int(top_k))
-    out1, fig1 = _format_hits(df_meta, s1, ids1, top_k=int(top_k))
+    out1, fig1 = _format_hits(df_meta, s1, ids1)
     s2, ids2 = _search_topk(k_corpus, q_emb, int(top_k))
-    out2, fig2 = _format_hits(df_meta, s2, ids2, top_k=int(top_k))
+    out2, fig2 = _format_hits(df_meta, s2, ids2)
     return out1, fig1, out2, fig2
-
 
 
 
@@ -1062,7 +1114,17 @@ CSS = r""".gradio-container {font-family: ui-sans-serif, system-ui, -apple-syste
 
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="KAHM Embeddings Dashboard") as demo:
+    """Build and return the Gradio dashboard.
+
+    CSS handling is version-tolerant: newer Gradio versions accept `css=` in Blocks;
+    older versions will ignore it via the fallback path.
+    """
+    try:
+        demo = gr.Blocks(title="KAHM Embeddings Dashboard", css=CSS)
+    except TypeError:  # pragma: no cover
+        demo = gr.Blocks(title="KAHM Embeddings Dashboard")
+
+    with demo:
         gr.Markdown("# KAHM embeddings dashboard", elem_id="title")
         gr.Markdown(
             "Dashboard for (1) visualizing the evaluation report and (2) interactively retrieving evidence sentences "
@@ -1230,9 +1292,12 @@ def build_app() -> gr.Blocks:
             texts, labels = _load_test_queries(qset)
             choices = _build_query_choices(texts, labels)
             default = choices[0] if choices else None
-            return gr.Dropdown(choices=choices, value=default)
+            return gr.update(choices=choices, value=default)
 
         demo.load(fn=_init_queries, inputs=[query_set], outputs=[test_query_dropdown])
+
+        # Refresh test queries if the query-set module path changes
+        query_set.change(fn=_init_queries, inputs=[query_set], outputs=[test_query_dropdown])
 
         # Retrieve for selected test query
         def _retrieve_sel(
@@ -1400,9 +1465,4 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    app = build_app()
-    # By default, gradio listens on localhost:7860
-    try:
-        app.launch(css=CSS)
-    except TypeError:
-        app.launch()
+    build_app().launch()
