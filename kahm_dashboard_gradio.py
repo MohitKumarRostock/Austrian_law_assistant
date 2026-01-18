@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 import sys
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +45,21 @@ import pandas as pd
 
 import gradio as gr
 import plotly.graph_objects as go
+
+# Optional dependencies for LLM post-processing (summarization / plain-language interpretation)
+# The dashboard remains fully functional without these dependencies.
+try:  # Transformers seq2seq summarizers (CPU-friendly)
+    import torch  # type: ignore
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+    AutoModelForSeq2SeqLM = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+
+try:  # llama.cpp bindings (local GGUF inference)
+    from llama_cpp import Llama  # type: ignore
+except Exception:  # pragma: no cover
+    Llama = None  # type: ignore
 
 # Optional dependency: faiss
 try:
@@ -527,6 +543,447 @@ def _format_hits(
     return out_df, fig
 
 
+
+
+# ----------------------------- LLM post-processing -----------------------------
+
+_DEFAULT_SEQ2SEQ_MODEL = "deutsche-telekom/mt5-small-sum-de-mit-v1"
+
+
+def _safe_str(x: object) -> str:
+    try:
+        return str(x)
+    except Exception:
+        return ""
+
+
+def _hits_to_compact_text(
+    df_hits: pd.DataFrame,
+    *,
+    max_items: int = 10,
+    max_chars: int = 9000,
+) -> str:
+    """Create a compact, citation-friendly text block from a retrieval DataFrame."""
+    if df_hits is None or df_hits.empty:
+        return ""
+    cols = set(df_hits.columns)
+    need = {"rank", "law_type", "sentence"}
+    if not need.issubset(cols):
+        return ""
+
+    rows = []
+    for _, r in df_hits.head(int(max_items)).iterrows():
+        rank = _safe_str(r.get("rank", "")).strip()
+        law = _safe_str(r.get("law_type", "")).strip()
+        sent = _safe_str(r.get("sentence", "")).strip()
+        if not sent:
+            continue
+        # Keep the model input compact and consistent.
+        if len(sent) > 800:
+            sent = sent[:800].rstrip() + "…"
+        prefix = f"[{rank}]" if rank else ""
+        law_part = f" ({law})" if law else ""
+        rows.append(f"{prefix}{law_part} {sent}")
+
+    out = "\n".join(rows).strip()
+    if len(out) > int(max_chars):
+        out = out[: int(max_chars)].rstrip() + "…"
+    return out
+
+
+
+def _evidence_stats(df_hits: pd.DataFrame, *, max_items: int = 10) -> Dict[str, float]:
+    """Compute simple evidence-quality stats to support grounded prompting."""
+    if df_hits is None or df_hits.empty:
+        return {"n_sent": 0.0, "n_law_types": 0.0, "law_type_ratio": 0.0}
+
+    n_sent = 0
+    law_types: List[str] = []
+    for _, r in df_hits.head(int(max_items)).iterrows():
+        sent = _safe_str(r.get("sentence", "")).strip()
+        if not sent:
+            continue
+        n_sent += 1
+        law = _safe_str(r.get("law_type", "")).strip()
+        if law:
+            law_types.append(law)
+
+    n_law = float(len(set(law_types))) if law_types else 0.0
+    ratio = float(n_law / n_sent) if n_sent else 0.0
+    return {"n_sent": float(n_sent), "n_law_types": n_law, "law_type_ratio": ratio}
+
+
+def _key_excerpts_md(df_hits: pd.DataFrame, *, max_items: int = 6) -> str:
+    """Create a compact bullet list of key excerpts for transparency."""
+    if df_hits is None or df_hits.empty:
+        return ""
+
+    lines: List[str] = []
+    for _, r in df_hits.head(int(max_items)).iterrows():
+        rank = _safe_str(r.get("rank", "")).strip()
+        law = _safe_str(r.get("law_type", "")).strip()
+        sent = _safe_str(r.get("sentence", "")).strip()
+        if not sent:
+            continue
+        if len(sent) > 500:
+            sent = sent[:500].rstrip() + "…"
+
+        rank0 = f"[{rank}]" if rank else ""
+        law0 = f"**{law}**: " if law else ""
+        lines.append(f"- {rank0} {law0}{sent}")
+
+    return "\n".join(lines).strip()
+
+
+@lru_cache(maxsize=2)
+def _load_seq2seq(model_id: str):
+    if AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
+        raise ImportError("transformers/torch are not available. Install: pip install transformers torch")
+
+    # Tokenizer policy (robust + warning-free for legal text):
+    # - Force the *slow* tokenizer (SentencePiece/Python) to avoid fast-tokenizer conversion warnings,
+    #   including byte-fallback limitations that can surface as <unk> for rare characters.
+    # - Explicitly set T5's legacy behavior when supported to prevent the "legacy behaviour" warning.
+    tok_kwargs = {"use_fast": False}
+    try:
+        tok = AutoTokenizer.from_pretrained(model_id, **tok_kwargs, legacy=True)
+    except TypeError:
+        # Non-T5 tokenizers (or older Transformers versions) may not accept `legacy`.
+        tok = AutoTokenizer.from_pretrained(model_id, **tok_kwargs)
+    except Exception:
+        # Last-resort fallback: if a repository does not ship a slow tokenizer, load the default.
+        # (This may reintroduce warnings, but ensures the dashboard remains functional.)
+        tok = AutoTokenizer.from_pretrained(model_id)
+
+    # Seq2seq-only backend (mT5/T5/BART/PEGASUS). If a causal model is provided, loading will fail.
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+    mdl.eval()
+    return tok, mdl
+
+
+
+@lru_cache(maxsize=1)
+def _load_llama_cpp(gguf_path: str, n_ctx: int, n_threads: int):
+    if Llama is None:
+        raise ImportError("llama_cpp is not available. Install: pip install llama-cpp-python")
+    p = Path(gguf_path)
+    if not p.exists():
+        raise FileNotFoundError(f"GGUF model not found: {gguf_path}")
+    n_threads0 = int(n_threads)
+    if n_threads0 <= 0:
+        # UI allows 0=auto; default to available logical CPUs.
+        n_threads0 = max(1, (os.cpu_count() or 4))
+    return Llama(model_path=str(p), n_ctx=int(n_ctx), n_threads=n_threads0, verbose=False)
+
+
+def _seq2seq_summarize(
+    text_in: str,
+    *,
+    model_id: str,
+    max_new_tokens: int = 160,
+) -> str:
+    if torch is None:
+        raise ImportError("transformers/torch are not available. Install: pip install transformers torch")
+    tok, mdl = _load_seq2seq(model_id)
+    # mT5-style models commonly use a prefix.
+    prompt = f"summarize: {text_in}"
+    inputs = tok(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=896,
+    )
+    with torch.no_grad():
+        out = mdl.generate(
+            **inputs,
+            max_new_tokens=int(max_new_tokens),
+            num_beams=4,
+            do_sample=False,
+            no_repeat_ngram_size=3,
+        )
+    return tok.decode(out[0], skip_special_tokens=True).strip()
+
+
+def _llama_cpp_generate(
+    compact_hits: str,
+    *,
+    query_text: str,
+    method_label: str,
+    output_language: str,
+    gguf_path: str,
+    max_new_tokens: int,
+    temperature: float,
+    n_ctx: int,
+    n_threads: int,
+    task: str,
+    strict_grounding: bool,
+    evidence_stats: Dict[str, float],
+    heterogeneity_threshold: int,
+    min_evidence_sentences: int,
+) -> str:
+    """Generate grounded, citation-forward summaries/paraphrases via a local GGUF instruct model."""
+    llm = _load_llama_cpp(gguf_path, n_ctx=n_ctx, n_threads=n_threads)
+
+    # Language handling
+    lang = (output_language or "German").strip().lower()
+    if lang.startswith("en"):
+        lang_hint = "Write in English."
+        unsupported_msg = "Not supported by the provided citations."
+        caveat = "Not legal advice."
+    else:
+        lang_hint = "Schreibe auf Deutsch."
+        unsupported_msg = "Nicht aus den Zitaten ableitbar."
+        caveat = "Keine Rechtsberatung."
+
+    task0 = (task or "Summary + plain-language interpretation").strip().lower()
+    wants_per_sentence = (
+        "per-sentence" in task0
+        or "per sentence" in task0
+        or "per-satz" in task0
+        or "paraphrase" in task0
+        or "paraphr" in task0
+    )
+    per_sentence_only = wants_per_sentence and ("only" in task0 or "nur" in task0)
+
+    n_sent = int(evidence_stats.get("n_sent", 0.0) or 0)
+    n_law = int(evidence_stats.get("n_law_types", 0.0) or 0)
+    heterogeneous = bool(heterogeneity_threshold and n_law >= int(heterogeneity_threshold))
+    sparse = bool(min_evidence_sentences and n_sent < int(min_evidence_sentences))
+
+    evidence_snapshot = f"{n_sent} retrieved sentences; {n_law} distinct law types."
+    flags = []
+    if sparse:
+        flags.append("sparse")
+    if heterogeneous:
+        flags.append("heterogeneous")
+    if flags:
+        evidence_snapshot += " Evidence is " + ", ".join(flags) + "."
+
+    # Task selection
+    if per_sentence_only:
+        task_hint = (
+            "Paraphrase each retrieved sentence individually in plain, professional language. "
+            "Keep each paraphrase to one short sentence. Do not add new facts."
+        )
+        output_format = f"""Output format (Markdown):
+- Per-sentence paraphrases (bullets; each bullet starts with [rank])
+- Caveat: one sentence stating this is not legal advice ({caveat})
+"""
+    elif task0.startswith("summary") and ("interpret" not in task0 and "interpretation" not in task0):
+        task_hint = "Provide a concise professional summary of the retrieved sentences."
+        output_format = f"""Output format (Markdown):
+- Executive summary (max 5 bullets)
+- Key provisions / concepts (bullets)
+- Caveat: one sentence stating this is not legal advice ({caveat})
+"""
+    else:
+        task_hint = (
+            "Provide (1) an executive summary and (2) a plain-language paraphrase of what the retrieved sentences say, "
+            "and (optionally) brief relevance notes to the user's query. "
+            "Do not provide legal advice and do not speculate beyond the retrieved text."
+        )
+        per_sentence_line = "- Per-sentence paraphrases (bullets; optional)\n" if wants_per_sentence else ""
+        output_format = f"""Output format (Markdown):
+- Executive summary (max 5 bullets)
+- Key provisions / concepts (bullets)
+- Plain-language paraphrase (2–6 sentences)
+- Relevance notes to the query (bullets, optional)
+{per_sentence_line}- Caveat: one sentence stating this is not legal advice ({caveat})
+"""
+
+    grounding_rules = [
+        "Use ONLY the retrieved sentences as evidence.",
+        "Cite evidence using rank citations like [1], [2] in every bullet.",
+        f"If something is not supported by the citations, write: '{unsupported_msg}' and do not add it.",
+    ]
+    if strict_grounding:
+        grounding_rules.append("STRICT MODE: omit any statement that cannot be grounded with at least one citation.")
+    if heterogeneous:
+        grounding_rules.append(
+            "The evidence is heterogeneous; be conservative in connecting it to the query. If linkage is unclear, say it is not supported."
+        )
+    if sparse:
+        grounding_rules.append(
+            "The evidence is sparse; relevance notes are optional and should be omitted if not clearly supported."
+        )
+
+    system = (
+        "You are a compliance-oriented legal text summarization assistant. "
+        "You summarize and paraphrase retrieved statutory sentences neutrally and professionally. "
+        "You do not give legal advice, you do not speculate beyond the text, and you always cite evidence by rank."
+    )
+
+    rules_md = "\n- ".join(grounding_rules)
+
+    user = f"""{lang_hint}
+Task: {task_hint}
+
+Retrieval method: {method_label}
+User query / context: {query_text.strip()}
+Evidence snapshot: {evidence_snapshot}
+
+Grounding rules:
+- {rules_md}
+
+Retrieved sentences (each line starts with a rank citation):
+{compact_hits}
+
+{output_format}"""
+
+    prompt = f"<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n"
+
+    out = llm(
+        prompt,
+        max_tokens=int(max_new_tokens),
+        temperature=float(temperature),
+        top_p=0.9,
+        stop=["</s>", "<|user|>", "<|system|>", "<|assistant|>", "<|end|>"],
+    )
+    return (out.get("choices", [{}])[0].get("text", "") or "").strip()
+
+
+
+def generate_retrieval_summary(
+    df_hits: pd.DataFrame,
+    *,
+    query_text: str,
+    method_label: str,
+    backend: str,
+    task: str,
+    output_language: str,
+    seq2seq_model_id: str,
+    gguf_path: str,
+    max_new_tokens: int,
+    temperature: float,
+    n_ctx: int,
+    n_threads: int,
+    strict_grounding: bool = True,
+    min_evidence_sentences: int = 3,
+    heterogeneity_threshold: int = 6,
+) -> str:
+    """Generate a professional, citation-forward summary / paraphrase for a retrieval result table."""
+    backend0 = (backend or "off").strip().lower()
+    if backend0 in {"off", "none", "disabled"}:
+        return (
+            "_LLM post-processing is disabled._\n\n"
+            "Set **LLM backend** in the sidebar to **Transformers (seq2seq)** or **llama.cpp (GGUF)**, then run retrieval again.\n"
+            "If you only want to recompute the summary after changing settings, use the **Generate LLM summary** button in the relevant accordion."
+        )
+    if df_hits is None or df_hits.empty:
+        return ""
+
+    # Evidence snapshot for transparency and hallucination-avoidance
+    ev = _evidence_stats(df_hits, max_items=10)
+    n_sent = int(ev.get("n_sent", 0.0) or 0)
+    n_law = int(ev.get("n_law_types", 0.0) or 0)
+    evidence_note = f"**Evidence snapshot:** {n_sent} retrieved sentences; {n_law} distinct law types."
+    if heterogeneity_threshold and n_law >= int(heterogeneity_threshold):
+        evidence_note += " Evidence is heterogeneous; relevance mapping may be limited."
+    if min_evidence_sentences and n_sent < int(min_evidence_sentences):
+        evidence_note += " Evidence is sparse; interpret cautiously."
+
+    compact = _hits_to_compact_text(df_hits, max_items=10, max_chars=9000)
+    if not compact:
+        return ""
+
+    task0 = (task or "").strip().lower()
+    wants_per_sentence = ("per-sentence" in task0) or ("per sentence" in task0) or ("paraphrase" in task0)
+    per_sentence_only = wants_per_sentence and (("only" in task0) or ("nur" in task0))
+
+    excerpts = _key_excerpts_md(df_hits, max_items=6)
+
+    try:
+        # -------- Transformers seq2seq (summary-only) --------
+        if backend0.startswith("transformers") or backend0.startswith("seq2seq") or backend0.startswith("mt5"):
+            model_id = (seq2seq_model_id or _DEFAULT_SEQ2SEQ_MODEL).strip()
+            caveat = (
+                "Hinweis: Automatisch generierte Darstellung; keine Rechtsberatung."
+                if not (output_language or "").lower().startswith("en")
+                else "Note: Automatically generated rendering; not legal advice."
+            )
+            parts = [evidence_note]
+            if per_sentence_only:
+                if excerpts:
+                    parts.append(f"### Key excerpts ({method_label})\n\n{excerpts}")
+                parts.append(f"_{caveat}_")
+                return "\n\n".join(parts).strip()
+
+            summ = _seq2seq_summarize(compact, model_id=model_id, max_new_tokens=int(max_new_tokens))
+            parts.append(f"### Summary ({method_label})\n\n{summ}")
+            if excerpts:
+                parts.append(f"### Key excerpts\n\n{excerpts}")
+            parts.append(f"_{caveat}_")
+            return "\n\n".join(parts).strip()
+
+        # -------- llama.cpp (grounded instruction model) --------
+        if backend0.startswith("llama"):
+            caveat = (
+                "Hinweis: Automatisch generierte Darstellung; keine Rechtsberatung."
+                if not (output_language or "").lower().startswith("en")
+                else "Note: Automatically generated rendering; not legal advice."
+            )
+            if not gguf_path or not str(gguf_path).strip():
+                parts = [evidence_note, "**LLM backend is set to llama.cpp, but no GGUF model path is configured.**"]
+                if excerpts:
+                    parts.append(f"### Key excerpts\n\n{excerpts}")
+                parts.append(f"_{caveat}_")
+                return "\n\n".join(parts).strip()
+
+            out = _llama_cpp_generate(
+                compact,
+                query_text=query_text,
+                method_label=method_label,
+                output_language=output_language,
+                gguf_path=gguf_path,
+                max_new_tokens=int(max_new_tokens),
+                temperature=float(temperature),
+                n_ctx=int(n_ctx),
+                n_threads=int(n_threads),
+                task=task,
+                strict_grounding=bool(strict_grounding),
+                evidence_stats=ev,
+                heterogeneity_threshold=int(heterogeneity_threshold),
+                min_evidence_sentences=int(min_evidence_sentences),
+            )
+            return "\n\n".join([evidence_note, out]).strip()
+
+        return f"**LLM post-processing is enabled, but backend '{backend}' is not recognized.**"
+    except Exception as e:
+        return f"**LLM post-processing error ({method_label}):** {type(e).__name__}: {e}"
+
+
+
+def _coerce_hits_df(obj: Any) -> pd.DataFrame:
+    """Best-effort conversion of Gradio Dataframe payloads into a pandas DataFrame."""
+    if obj is None:
+        return pd.DataFrame()
+    if isinstance(obj, pd.DataFrame):
+        return obj
+
+    # Gradio may pass dict payloads (e.g., {"headers": [...], "data": [...]})
+    if isinstance(obj, dict) and ("data" in obj or "headers" in obj):
+        data = obj.get("data") or []
+        headers = obj.get("headers")
+        if headers:
+            return pd.DataFrame(data, columns=headers)
+        return pd.DataFrame(data)
+
+    # Lists/tuples: list of dicts or list of rows
+    if isinstance(obj, (list, tuple)):
+        if len(obj) == 0:
+            return pd.DataFrame()
+        if isinstance(obj[0], dict):
+            return pd.DataFrame(list(obj))
+        cols = ["rank", "score", "law_type", "page_no", "sentence"]
+        if isinstance(obj[0], (list, tuple)) and len(obj[0]) == len(cols):
+            return pd.DataFrame(list(obj), columns=cols)
+        return pd.DataFrame(list(obj))
+
+    # Fallback: try constructor
+    try:
+        return pd.DataFrame(obj)
+    except Exception:
+        return pd.DataFrame()
 # ----------------------------- UI callables -----------------------------
 def ui_load_report(report_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, go.Figure, go.Figure, go.Figure, go.Figure]:
     tables = parse_report_tables(report_path)
@@ -610,7 +1067,16 @@ def ui_retrieve_for_selection(
     kahm_batch: int,
     top_k: int,
     query_set: str,
-) -> Tuple[str, pd.DataFrame, go.Figure, pd.DataFrame, go.Figure]:
+    llm_backend: str,
+    llm_task: str,
+    llm_output_language: str,
+    llm_seq2seq_model_id: str,
+    llm_gguf_path: str,
+    llm_max_new_tokens: int,
+    llm_temperature: float,
+    llm_n_ctx: int,
+    llm_n_threads: int,
+) -> Tuple[str, pd.DataFrame, go.Figure, str, pd.DataFrame, go.Figure, str]:
     texts, labels = _load_test_queries(query_set)
     # Parse index from selection string
     m = re.match(r"^\s*(\d+)\s*:", selection)
@@ -635,12 +1101,43 @@ def ui_retrieve_for_selection(
     # KAHM(q->MB)
     s1, ids1 = _search_topk(mb_corpus, q_emb, int(top_k))
     out1, fig1 = _format_hits(df_meta, s1, ids1)
+    sum1 = generate_retrieval_summary(
+        out1,
+        query_text=query_text,
+        method_label="KAHM(query→MB corpus)",
+        backend=llm_backend,
+        task=llm_task,
+        output_language=llm_output_language,
+        seq2seq_model_id=llm_seq2seq_model_id,
+        gguf_path=llm_gguf_path,
+        max_new_tokens=int(llm_max_new_tokens),
+        temperature=float(llm_temperature),
+        n_ctx=int(llm_n_ctx),
+        n_threads=int(llm_n_threads),
+    )
 
     # Full-KAHM (q->KAHM corpus)
     s2, ids2 = _search_topk(k_corpus, q_emb, int(top_k))
     out2, fig2 = _format_hits(df_meta, s2, ids2)
+    sum2 = generate_retrieval_summary(
+        out2,
+        query_text=query_text,
+        method_label="Full-KAHM (query→KAHM corpus)",
+        backend=llm_backend,
+        task=llm_task,
+        output_language=llm_output_language,
+        seq2seq_model_id=llm_seq2seq_model_id,
+        gguf_path=llm_gguf_path,
+        max_new_tokens=int(llm_max_new_tokens),
+        temperature=float(llm_temperature),
+        n_ctx=int(llm_n_ctx),
+        n_threads=int(llm_n_threads),
+    )
 
-    return header, out1, fig1, out2, fig2
+    return header, out1, fig1, sum1, out2, fig2, sum2
+
+
+
 
 
 def ui_retrieve_custom(
@@ -655,7 +1152,16 @@ def ui_retrieve_custom(
     kahm_mode: str,
     kahm_batch: int,
     top_k: int,
-) -> Tuple[pd.DataFrame, go.Figure, pd.DataFrame, go.Figure]:
+    llm_backend: str,
+    llm_task: str,
+    llm_output_language: str,
+    llm_seq2seq_model_id: str,
+    llm_gguf_path: str,
+    llm_max_new_tokens: int,
+    llm_temperature: float,
+    llm_n_ctx: int,
+    llm_n_threads: int,
+) -> Tuple[pd.DataFrame, go.Figure, str, pd.DataFrame, go.Figure, str]:
     if not query_text or not query_text.strip():
         raise ValueError("Please enter a query.")
     df_meta, mb_corpus, k_corpus = _load_corpora(base_dir, corpus_parquet, mb_npz, kahm_npz)
@@ -668,9 +1174,43 @@ def ui_retrieve_custom(
     )
     s1, ids1 = _search_topk(mb_corpus, q_emb, int(top_k))
     out1, fig1 = _format_hits(df_meta, s1, ids1)
+    sum1 = generate_retrieval_summary(
+        out1,
+        query_text=query_text,
+        method_label="KAHM(query→MB corpus)",
+        backend=llm_backend,
+        task=llm_task,
+        output_language=llm_output_language,
+        seq2seq_model_id=llm_seq2seq_model_id,
+        gguf_path=llm_gguf_path,
+        max_new_tokens=int(llm_max_new_tokens),
+        temperature=float(llm_temperature),
+        n_ctx=int(llm_n_ctx),
+        n_threads=int(llm_n_threads),
+    )
+
     s2, ids2 = _search_topk(k_corpus, q_emb, int(top_k))
     out2, fig2 = _format_hits(df_meta, s2, ids2)
-    return out1, fig1, out2, fig2
+    sum2 = generate_retrieval_summary(
+        out2,
+        query_text=query_text,
+        method_label="Full-KAHM (query→KAHM corpus)",
+        backend=llm_backend,
+        task=llm_task,
+        output_language=llm_output_language,
+        seq2seq_model_id=llm_seq2seq_model_id,
+        gguf_path=llm_gguf_path,
+        max_new_tokens=int(llm_max_new_tokens),
+        temperature=float(llm_temperature),
+        n_ctx=int(llm_n_ctx),
+        n_threads=int(llm_n_threads),
+    )
+
+    return out1, fig1, sum1, out2, fig2, sum2
+
+
+
+
 
 
 
@@ -805,9 +1345,10 @@ def _empty_retrieval_df() -> pd.DataFrame:
 
 def ui_parse_private_document(
     file_path: Optional[str],
-) -> Tuple[Dict[str, Any], Any, str, str, str, pd.DataFrame, go.Figure, pd.DataFrame, go.Figure]:
+) -> Tuple[Dict[str, Any], Any, str, str, str, pd.DataFrame, go.Figure, str, pd.DataFrame, go.Figure, str]:
     """
     Parse an uploaded private document, extract sentences, and prepare UI elements.
+
     Returns:
       - state dict (filename, sentences)
       - dropdown update (choices + default)
@@ -815,14 +1356,29 @@ def ui_parse_private_document(
       - initial selected sentence preview
       - cleared header markdown
       - empty result table + plot (KAHM->MB)
+      - empty summary markdown (KAHM->MB)
       - empty result table + plot (Full-KAHM)
+      - empty summary markdown (Full-KAHM)
     """
     empty_df = _empty_retrieval_df()
     empty_fig = go.Figure()
+    empty_summary = ""
 
     if not file_path:
         info = "Upload a document to begin. Supported: **.txt, .md, .docx, .pdf**."
-        return {"filename": "", "sentences": []}, gr.update(choices=[], value=None), info, "", "", empty_df, empty_fig, empty_df, empty_fig
+        return (
+            {"filename": "", "sentences": []},
+            gr.update(choices=[], value=None),
+            info,
+            "",
+            "",
+            empty_df,
+            empty_fig,
+            empty_summary,
+            empty_df,
+            empty_fig,
+            empty_summary,
+        )
 
     try:
         text = _read_text_from_path(str(file_path))
@@ -830,7 +1386,19 @@ def ui_parse_private_document(
         fname = Path(str(file_path)).name
         if not sentences:
             info = f"Loaded **{fname}**, but could not extract any sentences. Try a different file format or a text-based PDF."
-            return {"filename": fname, "sentences": []}, gr.update(choices=[], value=None), info, "", "", empty_df, empty_fig, empty_df, empty_fig
+            return (
+                {"filename": fname, "sentences": []},
+                gr.update(choices=[], value=None),
+                info,
+                "",
+                "",
+                empty_df,
+                empty_fig,
+                empty_summary,
+                empty_df,
+                empty_fig,
+                empty_summary,
+            )
 
         choices = _build_sentence_choices(sentences)
         default = choices[0] if choices else None
@@ -842,10 +1410,37 @@ def ui_parse_private_document(
             "Select a sentence below and run retrieval."
         )
         state = {"filename": fname, "sentences": sentences}
-        return state, gr.update(choices=choices, value=default), info, preview, "", empty_df, empty_fig, empty_df, empty_fig
+        return (
+            state,
+            gr.update(choices=choices, value=default),
+            info,
+            preview,
+            "",
+            empty_df,
+            empty_fig,
+            empty_summary,
+            empty_df,
+            empty_fig,
+            empty_summary,
+        )
     except Exception as e:
         info = f"Could not read the uploaded document. Details: {type(e).__name__}: {e}"
-        return {"filename": "", "sentences": []}, gr.update(choices=[], value=None), info, "", "", empty_df, empty_fig, empty_df, empty_fig
+        return (
+            {"filename": "", "sentences": []},
+            gr.update(choices=[], value=None),
+            info,
+            "",
+            "",
+            empty_df,
+            empty_fig,
+            empty_summary,
+            empty_df,
+            empty_fig,
+            empty_summary,
+        )
+
+
+
 
 
 def ui_private_sentence_preview(selection: str, state: Dict[str, Any]) -> str:
@@ -874,7 +1469,16 @@ def ui_retrieve_private_sentence(
     kahm_mode: str,
     kahm_batch: int,
     top_k: int,
-) -> Tuple[str, pd.DataFrame, go.Figure, pd.DataFrame, go.Figure]:
+    llm_backend: str,
+    llm_task: str,
+    llm_output_language: str,
+    llm_seq2seq_model_id: str,
+    llm_gguf_path: str,
+    llm_max_new_tokens: int,
+    llm_temperature: float,
+    llm_n_ctx: int,
+    llm_n_threads: int,
+) -> Tuple[str, pd.DataFrame, go.Figure, str, pd.DataFrame, go.Figure, str]:
     if not state or not state.get("sentences"):
         raise ValueError("Please upload a document and select a sentence first.")
     m = re.match(r"^\s*(\d+)\s*:", str(selection))
@@ -893,7 +1497,7 @@ def ui_retrieve_private_sentence(
         f"**Selected sentence #{idx:04d}:** {query_text}"
     )
 
-    out1, fig1, out2, fig2 = ui_retrieve_custom(
+    out1, fig1, sum1, out2, fig2, sum2 = ui_retrieve_custom(
         query_text,
         base_dir=base_dir,
         corpus_parquet=corpus_parquet,
@@ -904,8 +1508,21 @@ def ui_retrieve_private_sentence(
         kahm_mode=kahm_mode,
         kahm_batch=int(kahm_batch),
         top_k=int(top_k),
+        llm_backend=llm_backend,
+        llm_task=llm_task,
+        llm_output_language=llm_output_language,
+        llm_seq2seq_model_id=llm_seq2seq_model_id,
+        llm_gguf_path=llm_gguf_path,
+        llm_max_new_tokens=int(llm_max_new_tokens),
+        llm_temperature=float(llm_temperature),
+        llm_n_ctx=int(llm_n_ctx),
+        llm_n_threads=int(llm_n_threads),
     )
-    return header, out1, fig1, out2, fig2
+    return header, out1, fig1, sum1, out2, fig2, sum2
+
+
+
+
 
 
 
@@ -1031,65 +1648,101 @@ EMBEDDINGS_QUICKREF_MD = r"""
 
 # ----------------------------- Management pitch (dashboard tab) -----------------------------
 PITCH_MD = r"""
-# Management pitch: funding KAHM-driven language models
+# Management pitch: funding KAHM-driven retrieval and KAHM-efficient seq2seq summarization
 
 ## Executive summary
-KAHM has already demonstrated strong practical value in our Austrian‑law retrieval prototype. In our latest evaluation (see **Results** tab; 200 human‑labeled test queries, k=10), **KAHM(query→MB corpus)** achieves high Top‑K evidence retrieval quality (Hit@10 and MRR@10 typically in the ~0.89–0.92 and ~0.73–0.75 range across recent runs). This is achieved with a lightweight, mathematically grounded kernel mapping that runs efficiently on CPU‑class hardware.
+KAHM has demonstrated that we can **replace transformer-based query embedding at retrieval time** with a CPU‑friendly mapping from classic IR features into a strong neural embedding space.
 
-**Proposal:** fund a focused, time‑boxed R&D program to extend KAHM from *embedding approximation* into **KAHM‑driven language‑model (LM) components**—specifically: gradient‑free heads, routing policies, and decoding‑adjacent modules that reduce reliance on expensive end‑to‑end training and large‑model inference while preserving practical quality.
+In the latest evaluation on Austrian laws (**200 human‑labeled queries**, **71,069 aligned sentences**, **k=10**), **KAHM(query→MB corpus)** achieved:
+- **Hit@10:** 0.895 (0.850, 0.935)
+- **MRR@10 (unique laws):** 0.729 (0.679, 0.779)
+- **Top‑1 accuracy:** 0.605 (0.535, 0.675)
 
-## Strategic rationale for the company
-- **Differentiation and IP:** KAHM is a mathematically principled alternative to gradient‑descent‑heavy learning. A successful KAHM‑driven LM stack would be highly differentiating and likely patentable (routing, gradient‑free heads, and deployment patterns).
-- **Compute and cost discipline:** large‑model training and high‑QPS inference are capital intensive. KAHM emphasizes closed‑form / convex computations and domain‑specific mappings that are compatible with constrained compute and energy budgets.
-- **Governance‑friendly engineering:** kernel‑based components are comparatively easier to analyze, bound, and audit than end‑to‑end deep models—beneficial for regulated or high‑stakes domains.
+This represents a clear lift over the low‑cost baseline (**IDF–SVD**) and is statistically *not resolved* from the Mixedbread neural baseline under paired bootstrap on these 200 queries (the 95% CIs for deltas vs Mixedbread include 0; this is not a formal equivalence claim).
 
-## Evidence of traction: Austrian‑law evidence retrieval
-The current dashboard and evaluation demonstrate that KAHM can approximate transformer query embeddings at retrieval time while maintaining strong quality:
-- **Performance:** see Table 1 in the report (Results tab) for Hit@10, MRR@10, Top‑1 accuracy, and vote‑based routing metrics with bootstrap CIs.
-- **Clear lift over the low‑cost baseline:** KAHM consistently outperforms IDF–SVD under paired evaluation.
-- **Operational simplicity:** queries are mapped into a fixed corpus embedding space, enabling reuse of an existing index and minimizing production complexity.
+**Funding ask:** support a focused program to productize the retrieval stack and extend KAHM from *embedding approximation* into a **computation‑efficient alternative to transformer encoder components** for seq2seq summarization (and adjacent generation/control tasks), using KAHM’s geometry‑based routing as a drop‑in “encoder/selector” that avoids full attention‑heavy encoding.
 
-## How this extends to LM components (beyond retrieval)
-KAHM should not be framed as a standalone autoregressive decoder. Instead, it is a **latent‑space adapter and geometry‑based scoring head** that can become a practical LM component in a modern generation stack:
+---
 
-- **Reranker / head (decoding‑adjacent):** the base LLM proposes a small Top‑M candidate set (tokens, actions, templates). KAHM scores and reranks only those candidates using a lightweight geometry‑based criterion. This improves control and reliability without requiring KAHM to score the full vocabulary.
-- **Constrained decoding controller:** when the output set is naturally small (tool/action selection, template choice, controlled language), KAHM can act as the primary decision head—high leverage, low risk, production‑friendly.
-- **Hierarchical / token‑cluster decoding (research extension):** KAHM predicts a coarse bucket (semantic token cluster) conditioned on the LLM state; the LLM then generates within that bucket or KAHM reranks within the bucket. This offers a credible path to broader decoding influence while keeping class‑scaling tractable.
+## What KAHM is buying us (in plain business terms)
+- **Lower inference cost and latency at scale:** avoid running a large neural encoder for every user query while retaining MB‑level retrieval quality.
+- **Deployment practicality:** IDF–SVD feature extraction plus a small KAHM regressor is CPU‑friendly, auditable, and easier to operationalize in constrained environments.
+- **Leverage existing indices:** KAHM maps queries into the fixed Mixedbread (MB) embedding space, enabling reuse of an already‑built neural corpus index.
 
-This roadmap turns today’s “embedding approximation” capability into reusable LM infrastructure: **routing, control, and reliability components** that sit alongside a frozen or lightly tuned LLM.
+---
 
-## Why it makes sense to invest now
-Recent KAHM work (arXiv:2512.01025) supports the broader thesis that KAHM‑style models can underpin **gradient‑free learning systems** with advantages that map directly to company constraints:
-- reduced communication via low‑dimensional “space folding” summaries,
-- privacy/security‑friendly structure (differential privacy mechanisms and secure inference compatibility),
-- operator‑theoretic and complexity‑based analysis that strengthens the theoretical and auditability story.
+## Evidence of traction: Austrian‑law retrieval (what we can credibly claim today)
+**1) Strong lift versus the non‑neural baseline**
+- Paired deltas (KAHM − IDF–SVD): **Hit@10 +0.190** (+0.130, +0.250), **MRR@10 +0.241** (+0.182, +0.301), **Top‑1 +0.240** (+0.160, +0.320).
 
-Our retrieval results provide an internal “green light”: the core adapter mechanism works in a real domain and is already integrated into an interactive dashboard.
+**2) Competitive with the neural baseline for retrieval**
+- Mixedbread (true) Hit@10: 0.900 (0.855, 0.940) versus KAHM(query→MB corpus) 0.895 (0.850, 0.935).
+- Paired deltas versus Mixedbread are small and not resolved under this bootstrap.
+
+**3) Geometry alignment supports generalization**
+- Full‑KAHM embeddings show high cosine alignment with Mixedbread geometry (mean corpus cosine ≈ 0.9405), and recover similar **law‑level** neighborhoods.
+
+Operationally, this means the dashboard’s retrieval results are not a demo artifact: KAHM is learning a stable mapping into a high‑quality semantic space that is already useful for legal evidence retrieval.
+
+---
+
+## How KAHM enables a compute‑efficient alternative to transformer seq2seq components
+The current dashboard uses a lightweight transformer seq2seq model to summarize retrieved evidence. This is effective, but the **transformer encoder** is still the dominant inference cost when you scale to many queries or longer inputs.
+
+KAHM offers a credible path to reduce or remove that cost by replacing attention‑heavy encoding with **(1) cheap features, (2) geometry‑based routing, and (3) retrieval‑first compression**.
+
+### A) “KAHM as encoder replacement” for summarization
+1. **Segment the input** (query + retrieved evidence) into sentences/paragraphs.
+2. Compute **IDF–SVD** features per segment (CPU‑efficient, deterministic).
+3. Apply **KAHM** to map each segment into an MB‑like semantic vector.
+4. Use those vectors to produce a **summary plan** (topic distribution + top evidence segments) via routing weights and nearest‑neighbor structure.
+5. Generate the final summary with a **small decoder** (small transformer decoder, or a non‑transformer sequence model) conditioned on the plan and the short selected evidence.
+
+Key point: the expensive “encode everything with self‑attention” step is replaced by linear algebra + small models and aggressive evidence selection.
+
+### B) “KAHM‑routed cross‑attention” (hybrid)
+Instead of cross‑attending over all tokens/segments, the decoder attends to:
+- a small set of **topic region prototypes** (cluster centers in MB space), and
+- a small set of **top retrieved evidence segments** per topic.
+
+This approximates the role of attention with **bounded context** and **explicit routing**, reducing compute and making the system easier to govern.
+
+### C) Immediate product benefit: retrieval‑first summarization
+Even before a new seq2seq architecture is complete, KAHM improves the end‑to‑end system by:
+- reducing the cost of query embedding at retrieval time,
+- enabling high‑quality evidence selection (smaller context windows for any summarizer), and
+- providing confidence signals (vote margin/entropy) to trigger “abstain/escalate” behavior.
+
+---
 
 ## Proposed funded pilot (12–16 weeks) and deliverables
-1) **LM component Phase 1 — KAHM reranker/head (Weeks 1–6):**
-   - Implement KAHM as a lightweight scoring head over Top‑M candidates produced by a frozen LLM (or over action/template candidates in an agent).
-   - Evaluate quality, controllability, and reliability gains at fixed latency/cost (ablation against baseline decoding/prompt routing).
+1) **End‑to‑end costed baseline (Weeks 1–3):**
+   - Measure latency/cost for (a) current transformer‑encoder summarization and (b) retrieval‑first summarization with KAHM.
+   - Establish a target: quality parity within an agreed tolerance at materially lower CPU/GPU cost.
 
-2) **LM component Phase 2 — constrained decoding controller (Weeks 4–10):**
-   - Deploy KAHM for small‑alphabet generation tasks (tool routing, template selection, controlled outputs).
-   - Validate measurable reductions in expensive model calls and improved “abstain/escalate” behavior.
+2) **KAHM‑efficient summarizer prototype (Weeks 3–10):**
+   - Build the “KAHM encoder replacement” pipeline: KAHM embeddings → evidence selection + plan → small decoder.
+   - Evaluate on internal summarization tasks (legal answers, case summaries, compliance notes) with human review.
 
-3) **LM component Phase 3 — hierarchical/token‑cluster decoding (Weeks 8–16):**
-   - Research prototype: cluster vocabulary into semantic buckets; use KAHM to select buckets, then decode within‑bucket.
-   - Deliver a feasibility assessment with clear go/no‑go criteria (quality impact vs complexity).
+3) **Hybrid KAHM‑routed attention prototype (Weeks 8–16):**
+   - Research prototype using topic prototypes + bounded evidence sets for cross‑attention.
+   - Deliver an engineering feasibility report and clear go/no‑go criteria.
 
-4) **IP package and product roadmap (Weeks 10–16):**
-   - Identify patentable components and produce a productization roadmap (data, evaluation, governance, deployment assumptions).
+4) **Packaging for product and IP (Weeks 10–16):**
+   - A production‑ready retrieval module (KAHM query embedding + FAISS search + confidence routing).
+   - Evaluation harness and monitoring metrics.
+   - Identify protectable components (routing, planning, bounded‑attention interfaces).
+
+---
 
 ## Lean resource request
-- **Staffing:** 1 research engineer (FT) + 0.2–0.4 legal/domain SME (PT) + minimal security/compliance review.
-- **Compute:** CPU‑first for KAHM; small GPU budget only for baseline LLM comparisons and reporting.
+- **Staffing:** 1 research engineer (FT) + 0.2–0.4 legal/domain SME (PT) + light security/compliance review.
+- **Compute:** CPU‑first for KAHM; small GPU budget for baseline comparisons and decoder experiments.
 
 ## Decision criteria (what “success” looks like)
-- A demonstrable LM‑component prototype (reranker/router/controller) with competitive task performance at materially lower incremental compute/training requirements than gradient‑descent‑heavy alternatives.
-- A quantified business case (cost, latency, compliance) plus a clear go/no‑go recommendation for productization.
-- Defensible technical assets: evaluation suite, benchmarks, and prototype code that can be leveraged as IP.
+- A demonstrable **KAHM‑efficient summarization** prototype that achieves acceptable quality at materially lower incremental compute/latency than transformer‑encoder seq2seq.
+- A quantified business case (cost, latency, governance) and a go/no‑go recommendation for productization.
+- Defensible technical assets: benchmarks, evaluation suite, and prototype code that can be leveraged as IP.
 """
 
 
@@ -1147,6 +1800,69 @@ def build_app() -> gr.Blocks:
                     kahm_batch = gr.Number(value=512, label="KAHM batch size", precision=0)
                     top_k = gr.Slider(minimum=1, maximum=50, step=1, value=10, label="Top-K for retrieval")
                     query_set = gr.Textbox(value="query_set.TEST_QUERY_SET", label="Query set (module.attr)")
+
+
+                    with gr.Accordion("LLM post-processing (optional)", open=False):
+                        gr.Markdown(
+                            "Summarize and/or paraphrase retrieved sentences for professional presentation. "
+                            "This is optional and can run fully locally.\n\n"
+                            "- **Transformers (seq2seq)**: small summarization model (CPU-friendly).\n"
+                            "- **llama.cpp (GGUF)**: local instruction model for richer, citation-grounded interpretation."
+                        )
+                        llm_backend = gr.Dropdown(
+                            choices=[
+                                "Off",
+                                "Transformers (seq2seq)",
+                                "llama.cpp (GGUF)",
+                            ],
+                            value="Off",
+                            label="LLM backend",
+                        )
+                        llm_task = gr.Dropdown(
+                            choices=["Summary", "Summary + plain-language interpretation"],
+                            value="Summary + plain-language interpretation",
+                            label="LLM task",
+                        )
+                        llm_output_language = gr.Dropdown(
+                            choices=["German", "English"],
+                            value="German",
+                            label="Output language",
+                        )
+                        llm_seq2seq_model_id = gr.Textbox(
+                            value=_DEFAULT_SEQ2SEQ_MODEL,
+                            label="Transformers model id (seq2seq)",
+                        )
+                        llm_gguf_path = gr.Textbox(
+                            value="",
+                            label="GGUF model path (llama.cpp)",
+                            placeholder="/path/to/model.gguf",
+                        )
+                        llm_max_new_tokens = gr.Slider(
+                            minimum=64,
+                            maximum=512,
+                            step=8,
+                            value=224,
+                            label="Max new tokens (summary)",
+                        )
+                        llm_temperature = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            step=0.05,
+                            value=0.1,
+                            label="Temperature (llama.cpp)",
+                        )
+                        llm_n_ctx = gr.Slider(
+                            minimum=1024,
+                            maximum=8192,
+                            step=256,
+                            value=4096,
+                            label="Context window n_ctx (llama.cpp)",
+                        )
+                        llm_n_threads = gr.Number(
+                            value=0,
+                            label="Threads (llama.cpp, 0=auto)",
+                            precision=0,
+                        )
                     btn_load_report = gr.Button("Load/refresh report visuals", variant="primary")
 
                     with gr.Accordion("Embeddings & methods (overview)", open=False):
@@ -1189,9 +1905,19 @@ def build_app() -> gr.Blocks:
                             out_kahm_mb = gr.Dataframe(interactive=False, wrap=True, elem_classes=['kahm-table','retrieval-table'])
                             plot_kahm_mb = gr.Plot()
 
+                            with gr.Accordion("LLM summary & plain-language interpretation", open=False):
+                                btn_sum_kahm_mb = gr.Button("Generate LLM summary", variant="secondary")
+                                summary_kahm_mb = gr.Markdown()
+
+
                             gr.Markdown("### Full-KAHM (query→KAHM corpus)")
                             out_full = gr.Dataframe(interactive=False, wrap=True, elem_classes=['kahm-table','retrieval-table'])
                             plot_full = gr.Plot()
+
+                            with gr.Accordion("LLM summary & plain-language interpretation", open=False):
+                                btn_sum_full = gr.Button("Generate LLM summary", variant="secondary")
+                                summary_full = gr.Markdown()
+
 
                         with gr.Accordion("Search with a custom query", open=False):
                             custom_query = gr.Textbox(lines=2, label="Custom query (German or English)")
@@ -1200,9 +1926,19 @@ def build_app() -> gr.Blocks:
                             out_kahm_mb2 = gr.Dataframe(interactive=False, wrap=True, elem_classes=['kahm-table','retrieval-table'])
                             plot_kahm_mb2 = gr.Plot()
 
+                            with gr.Accordion("LLM summary & plain-language interpretation", open=False):
+                                btn_sum_kahm_mb2 = gr.Button("Generate LLM summary", variant="secondary")
+                                summary_kahm_mb2 = gr.Markdown()
+
+
                             gr.Markdown("### Full-KAHM (query→KAHM corpus)")
                             out_full2 = gr.Dataframe(interactive=False, wrap=True, elem_classes=['kahm-table','retrieval-table'])
                             plot_full2 = gr.Plot()
+
+                            with gr.Accordion("LLM summary & plain-language interpretation", open=False):
+                                btn_sum_full2 = gr.Button("Generate LLM summary", variant="secondary")
+                                summary_full2 = gr.Markdown()
+
 
 
                     with gr.Tab("Private document"):
@@ -1253,6 +1989,10 @@ def build_app() -> gr.Blocks:
                                 )
                                 private_plot_kahm = gr.Plot()
 
+                                with gr.Accordion("LLM summary & plain-language interpretation", open=False):
+                                    btn_sum_private_kahm = gr.Button("Generate LLM summary", variant="secondary")
+                                    private_summary_kahm = gr.Markdown()
+
                                 gr.Markdown("### Full-KAHM (query→KAHM corpus)")
                                 private_out_full_doc = gr.Dataframe(
                                     interactive=False,
@@ -1260,6 +2000,10 @@ def build_app() -> gr.Blocks:
                                     elem_classes=["kahm-table", "retrieval-table"],
                                 )
                                 private_plot_full_doc = gr.Plot()
+
+                                with gr.Accordion("LLM summary & plain-language interpretation", open=False):
+                                    btn_sum_private_full = gr.Button("Generate LLM summary", variant="secondary")
+                                    private_summary_full = gr.Markdown()
 
                     with gr.Tab("Funding pitch"):
                         gr.Markdown(PITCH_MD)
@@ -1312,6 +2056,15 @@ def build_app() -> gr.Blocks:
             batch: float,
             k: int,
             qset: str,
+            llm_b: str,
+            llm_t: str,
+            llm_lang: str,
+            llm_seq: str,
+            llm_gguf: str,
+            llm_max_tok: int,
+            llm_temp: float,
+            llm_ctx: int,
+            llm_thr: float,
         ):
             return ui_retrieve_for_selection(
                 sel,
@@ -1325,6 +2078,15 @@ def build_app() -> gr.Blocks:
                 kahm_batch=int(batch),
                 top_k=int(k),
                 query_set=qset,
+                llm_backend=llm_b,
+                llm_task=llm_t,
+                llm_output_language=llm_lang,
+                llm_seq2seq_model_id=llm_seq,
+                llm_gguf_path=llm_gguf,
+                llm_max_new_tokens=int(llm_max_tok),
+                llm_temperature=float(llm_temp),
+                llm_n_ctx=int(llm_ctx),
+                llm_n_threads=int(llm_thr),
             )
 
         btn_retrieve_sel.click(
@@ -1341,8 +2103,125 @@ def build_app() -> gr.Blocks:
                 kahm_batch,
                 top_k,
                 query_set,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
             ],
-            outputs=[selected_header, out_kahm_mb, plot_kahm_mb, out_full, plot_full],
+            outputs=[selected_header, out_kahm_mb, plot_kahm_mb, summary_kahm_mb, out_full, plot_full, summary_full],
+        )
+
+
+        # --- On-demand LLM summaries (selected test query) ---
+        def _summarize_sel_from_hits(
+            sel: str,
+            qset: str,
+            hits: Any,
+            method_label: str,
+            llm_b: str,
+            llm_t: str,
+            llm_lang: str,
+            llm_seq: str,
+            llm_gguf: str,
+            llm_max_tok: int,
+            llm_temp: float,
+            llm_ctx: int,
+            llm_thr: float,
+        ) -> str:
+            # Resolve the full query text from the selection.
+            texts, _labels = _load_test_queries(qset)
+            m = re.match(r"^\s*(\d+)\s*:", sel or "")
+            if not m:
+                return ""
+            idx0 = int(m.group(1))
+            if idx0 < 0 or idx0 >= len(texts):
+                return ""
+            query_text = texts[idx0]
+            df_hits = _coerce_hits_df(hits)
+            return generate_retrieval_summary(
+                df_hits,
+                query_text=query_text,
+                method_label=method_label,
+                backend=llm_b,
+                task=llm_t,
+                output_language=llm_lang,
+                seq2seq_model_id=llm_seq,
+                gguf_path=llm_gguf,
+                max_new_tokens=int(llm_max_tok),
+                temperature=float(llm_temp),
+                n_ctx=int(llm_ctx),
+                n_threads=int(llm_thr),
+            )
+
+        btn_sum_kahm_mb.click(
+            fn=lambda sel, qset, hits, llm_b, llm_t, llm_lang, llm_seq, llm_gguf, llm_max_tok, llm_temp, llm_ctx, llm_thr: _summarize_sel_from_hits(
+                sel,
+                qset,
+                hits,
+                "KAHM(query→MB corpus)",
+                llm_b,
+                llm_t,
+                llm_lang,
+                llm_seq,
+                llm_gguf,
+                llm_max_tok,
+                llm_temp,
+                llm_ctx,
+                llm_thr,
+            ),
+            inputs=[
+                test_query_dropdown,
+                query_set,
+                out_kahm_mb,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
+            ],
+            outputs=[summary_kahm_mb],
+        )
+
+        btn_sum_full.click(
+            fn=lambda sel, qset, hits, llm_b, llm_t, llm_lang, llm_seq, llm_gguf, llm_max_tok, llm_temp, llm_ctx, llm_thr: _summarize_sel_from_hits(
+                sel,
+                qset,
+                hits,
+                "Full-KAHM (query→KAHM corpus)",
+                llm_b,
+                llm_t,
+                llm_lang,
+                llm_seq,
+                llm_gguf,
+                llm_max_tok,
+                llm_temp,
+                llm_ctx,
+                llm_thr,
+            ),
+            inputs=[
+                test_query_dropdown,
+                query_set,
+                out_full,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
+            ],
+            outputs=[summary_full],
         )
 
         # Retrieve for custom query
@@ -1357,6 +2236,15 @@ def build_app() -> gr.Blocks:
             mode: str,
             batch: float,
             k: int,
+            llm_b: str,
+            llm_t: str,
+            llm_lang: str,
+            llm_seq: str,
+            llm_gguf: str,
+            llm_max_tok: int,
+            llm_temp: float,
+            llm_ctx: int,
+            llm_thr: float,
         ):
             return ui_retrieve_custom(
                 q,
@@ -1369,6 +2257,15 @@ def build_app() -> gr.Blocks:
                 kahm_mode=mode,
                 kahm_batch=int(batch),
                 top_k=int(k),
+                llm_backend=llm_b,
+                llm_task=llm_t,
+                llm_output_language=llm_lang,
+                llm_seq2seq_model_id=llm_seq,
+                llm_gguf_path=llm_gguf,
+                llm_max_new_tokens=int(llm_max_tok),
+                llm_temperature=float(llm_temp),
+                llm_n_ctx=int(llm_ctx),
+                llm_n_threads=int(llm_thr),
             )
 
         btn_retrieve_custom.click(
@@ -1384,8 +2281,111 @@ def build_app() -> gr.Blocks:
                 kahm_mode,
                 kahm_batch,
                 top_k,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
             ],
-            outputs=[out_kahm_mb2, plot_kahm_mb2, out_full2, plot_full2],
+            outputs=[out_kahm_mb2, plot_kahm_mb2, summary_kahm_mb2, out_full2, plot_full2, summary_full2],
+        )
+
+
+        # --- On-demand LLM summaries (custom query) ---
+        def _summarize_custom_from_hits(
+            q: str,
+            hits: Any,
+            method_label: str,
+            llm_b: str,
+            llm_t: str,
+            llm_lang: str,
+            llm_seq: str,
+            llm_gguf: str,
+            llm_max_tok: int,
+            llm_temp: float,
+            llm_ctx: int,
+            llm_thr: float,
+        ) -> str:
+            df_hits = _coerce_hits_df(hits)
+            return generate_retrieval_summary(
+                df_hits,
+                query_text=q or "",
+                method_label=method_label,
+                backend=llm_b,
+                task=llm_t,
+                output_language=llm_lang,
+                seq2seq_model_id=llm_seq,
+                gguf_path=llm_gguf,
+                max_new_tokens=int(llm_max_tok),
+                temperature=float(llm_temp),
+                n_ctx=int(llm_ctx),
+                n_threads=int(llm_thr),
+            )
+
+        btn_sum_kahm_mb2.click(
+            fn=lambda q, hits, llm_b, llm_t, llm_lang, llm_seq, llm_gguf, llm_max_tok, llm_temp, llm_ctx, llm_thr: _summarize_custom_from_hits(
+                q,
+                hits,
+                "KAHM(query→MB corpus)",
+                llm_b,
+                llm_t,
+                llm_lang,
+                llm_seq,
+                llm_gguf,
+                llm_max_tok,
+                llm_temp,
+                llm_ctx,
+                llm_thr,
+            ),
+            inputs=[
+                custom_query,
+                out_kahm_mb2,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
+            ],
+            outputs=[summary_kahm_mb2],
+        )
+
+        btn_sum_full2.click(
+            fn=lambda q, hits, llm_b, llm_t, llm_lang, llm_seq, llm_gguf, llm_max_tok, llm_temp, llm_ctx, llm_thr: _summarize_custom_from_hits(
+                q,
+                hits,
+                "Full-KAHM (query→KAHM corpus)",
+                llm_b,
+                llm_t,
+                llm_lang,
+                llm_seq,
+                llm_gguf,
+                llm_max_tok,
+                llm_temp,
+                llm_ctx,
+                llm_thr,
+            ),
+            inputs=[
+                custom_query,
+                out_full2,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
+            ],
+            outputs=[summary_full2],
         )
 
         # ---------- Private document tab ----------
@@ -1403,8 +2403,10 @@ def build_app() -> gr.Blocks:
                 private_header,
                 private_out_kahm,
                 private_plot_kahm,
+                private_summary_kahm,
                 private_out_full_doc,
                 private_plot_full_doc,
+                private_summary_full,
             ],
         )
 
@@ -1426,6 +2428,15 @@ def build_app() -> gr.Blocks:
             mode: str,
             batch: float,
             k: int,
+            llm_b: str,
+            llm_t: str,
+            llm_lang: str,
+            llm_seq: str,
+            llm_gguf: str,
+            llm_max_tok: int,
+            llm_temp: float,
+            llm_ctx: int,
+            llm_thr: float,
         ):
             return ui_retrieve_private_sentence(
                 sel,
@@ -1439,6 +2450,15 @@ def build_app() -> gr.Blocks:
                 kahm_mode=mode,
                 kahm_batch=int(batch),
                 top_k=int(k),
+                llm_backend=llm_b,
+                llm_task=llm_t,
+                llm_output_language=llm_lang,
+                llm_seq2seq_model_id=llm_seq,
+                llm_gguf_path=llm_gguf,
+                llm_max_new_tokens=int(llm_max_tok),
+                llm_temperature=float(llm_temp),
+                llm_n_ctx=int(llm_ctx),
+                llm_n_threads=int(llm_thr),
             )
 
         private_btn_retrieve.click(
@@ -1455,9 +2475,112 @@ def build_app() -> gr.Blocks:
                 kahm_mode,
                 kahm_batch,
                 top_k,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
             ],
-            outputs=[private_header, private_out_kahm, private_plot_kahm, private_out_full_doc, private_plot_full_doc],
+            outputs=[private_header, private_out_kahm, private_plot_kahm, private_summary_kahm, private_out_full_doc, private_plot_full_doc, private_summary_full],
         )
+
+        # --- On-demand LLM summaries (private document) ---
+        def _summarize_private_from_hits(
+            q: str,
+            hits: Any,
+            method_label: str,
+            llm_b: str,
+            llm_t: str,
+            llm_lang: str,
+            llm_seq: str,
+            llm_gguf: str,
+            llm_max_tok: int,
+            llm_temp: float,
+            llm_ctx: int,
+            llm_thr: float,
+        ) -> str:
+            df_hits = _coerce_hits_df(hits)
+            return generate_retrieval_summary(
+                df_hits,
+                query_text=q or "",
+                method_label=method_label,
+                backend=llm_b,
+                task=llm_t,
+                output_language=llm_lang,
+                seq2seq_model_id=llm_seq,
+                gguf_path=llm_gguf,
+                max_new_tokens=int(llm_max_tok),
+                temperature=float(llm_temp),
+                n_ctx=int(llm_ctx),
+                n_threads=int(llm_thr),
+            )
+
+        btn_sum_private_kahm.click(
+            fn=lambda q, hits, llm_b, llm_t, llm_lang, llm_seq, llm_gguf, llm_max_tok, llm_temp, llm_ctx, llm_thr: _summarize_private_from_hits(
+                q,
+                hits,
+                "KAHM(query→MB corpus)",
+                llm_b,
+                llm_t,
+                llm_lang,
+                llm_seq,
+                llm_gguf,
+                llm_max_tok,
+                llm_temp,
+                llm_ctx,
+                llm_thr,
+            ),
+            inputs=[
+                private_sentence_preview,
+                private_out_kahm,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
+            ],
+            outputs=[private_summary_kahm],
+        )
+
+        btn_sum_private_full.click(
+            fn=lambda q, hits, llm_b, llm_t, llm_lang, llm_seq, llm_gguf, llm_max_tok, llm_temp, llm_ctx, llm_thr: _summarize_private_from_hits(
+                q,
+                hits,
+                "Full-KAHM (query→KAHM corpus)",
+                llm_b,
+                llm_t,
+                llm_lang,
+                llm_seq,
+                llm_gguf,
+                llm_max_tok,
+                llm_temp,
+                llm_ctx,
+                llm_thr,
+            ),
+            inputs=[
+                private_sentence_preview,
+                private_out_full_doc,
+                llm_backend,
+                llm_task,
+                llm_output_language,
+                llm_seq2seq_model_id,
+                llm_gguf_path,
+                llm_max_new_tokens,
+                llm_temperature,
+                llm_n_ctx,
+                llm_n_threads,
+            ],
+            outputs=[private_summary_full],
+        )
+
 
 
 
