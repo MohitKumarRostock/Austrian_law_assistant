@@ -1,0 +1,758 @@
+[
+  {
+    "law": "ABGB",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ABGB.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "APG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/APG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "ASVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ASVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AVRAG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AVRAG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AWG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AWG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AZG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AZG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AktG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AktG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AlVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AlVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AngG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AngG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "ArbVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ArbVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AsylG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AsylG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AußStrG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AußStrG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "AÜG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/AÜG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "B-VG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/B-VG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "BAO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/BAO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "BEinstG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/BEinstG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "BWG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/BWG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "DSG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/DSG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "DSGVO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/DSGVO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "ECG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ECG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "EKHG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/EKHG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "EO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/EO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "EStG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/EStG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "EheG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/EheG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "ElWOG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ElWOG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "FAGG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/FAGG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "FPG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/FPG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "FSG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/FSG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "FinStrG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/FinStrG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "GSVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/GSVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "GewO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/GewO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "GlBG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/GlBG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "GmbHG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/GmbHG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "GrEStG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/GrEStG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "IG-L",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/IG-L.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "IO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/IO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KAKuG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KAKuG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KBGG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KBGG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KFG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KFG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KJBG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KJBG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KSchG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KSchG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KStG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KStG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KartG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KartG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "KommStG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/KommStG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "MRG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/MRG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "MSchG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/MSchG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "MeldeG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/MeldeG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "NAG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/NAG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "NoVAG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/NoVAG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "PSG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/PSG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "PatG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/PatG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "SH-GG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/SH-GG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "SMG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/SMG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "SPG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/SPG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "SchUG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/SchUG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "StGB",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/StGB.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "StPO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/StPO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "StVO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/StVO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "StbG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/StbG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "TKG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/TKG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "TSchG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/TSchG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UGB",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UGB.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UStG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UStG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UVP-G",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UVP-G.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UWG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UWG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UrhG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UrhG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "UrlG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/UrlG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VKG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VKG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VStG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VStG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VbVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VbVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VerG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VerG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VersG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VersG.pdf",
+    "search_url": "https://www.ris.bka.gv.at/Ergebnis.wxe?Abfrage=Bundesnormen&Titel=VersG&ResultPageSize=100",
+    "whole_law_url": "https://www.ris.bka.gv.at/GeltendeFassung.wxe?Abfrage=Bundesnormen&Gesetzesnummer=10000249",
+    "pdf_url": "https://www.ris.bka.gv.at/GeltendeFassung/Bundesnormen/10000249/Versammlungsgesetz%201953%2c%20Fassung%20vom%2005.02.2026.pdf",
+    "error": null
+  },
+  {
+    "law": "VersVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VersVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VfGG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VfGG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VwGG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VwGG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "VwGVG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/VwGVG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "WEG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/WEG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "WGG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/WGG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "WRG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/WRG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "WaffG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/WaffG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "ZPO",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ZPO.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  },
+  {
+    "law": "ZustG",
+    "ok": true,
+    "pdf_path": "/Users/mohit/Pythonprojects/Austrian_law_assistant/ris_pdfs/ZustG.pdf",
+    "search_url": null,
+    "whole_law_url": null,
+    "pdf_url": null,
+    "error": "SKIPPED (exists)"
+  }
+]
