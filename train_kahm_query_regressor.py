@@ -24,17 +24,10 @@ Saves a KAHM regressor joblib via kahm_regression.save_kahm_regressor().
 Example (recommended 2-step)
 ----------------------------
 1) Precompute Mixedbread query embeddings once (separate process):
-   python build_query_embedding_index_npz.py \
-      --out queries_embedding_index.npz \
-      --model mixedbread-ai/deepset-mxbai-embed-de-large-v1 \
-      --device cpu \
-      --batch 64
+   python build_query_embedding_index_npz.py 
 
 2) Train the query regressor (torch-free):
-   python train_kahm_query_regressor.py \
-      --idf_svd_model idf_svd_model.joblib \
-      --queries_npz queries_embedding_index.npz \
-      --out kahm_query_regressor_idf_to_mixedbread.joblib
+   python train_kahm_query_regressor.py 
 
 Notes
 -----
@@ -153,7 +146,7 @@ DEFAULT_QUERIES_NPZ_TRAIN = "queries_embedding_index_train.npz"
 DEFAULT_QUERIES_NPZ_TEST  = "queries_embedding_index_test.npz"
 DEFAULT_OUT = "kahm_query_regressor_idf_to_mixedbread.joblib"
 
-DEFAULT_N_CLUSTERS = 19000
+DEFAULT_N_CLUSTERS = 20000
 DEFAULT_SUBSPACE_DIM = 20
 DEFAULT_NB = 100
 DEFAULT_RANDOM_STATE = 0
@@ -599,7 +592,7 @@ def main() -> int:
                 np.hstack([Y_val_all.T, Y_train]),
                 mu=0.1,
                 epsilon=1,
-                epochs=1,
+                epochs=20,
                 batch_size=1024,
                 shuffle=True,
                 random_state=int(args.random_state),

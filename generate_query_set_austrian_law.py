@@ -2176,6 +2176,56 @@ def split_train_test_stratified_grid(
     rng.shuffle(train_rows)
     rng.shuffle(test_rows)
     return train_rows, test_rows
+
+
+def split_train_test_stratified_grid_test_topics_in_train(
+    pool: List[Dict[str, str]],
+    train_target: Dict[Tuple[str, str], int],
+    test_target: Dict[Tuple[str, str], int],
+    seed: int,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """IID split that maximizes train→test transfer.
+
+    Policy:
+      1) Sample TRAIN stratified by (law, style).
+      2) Sample TEST stratified by (law, style) but only from topics that appear in TRAIN (per-law).
+      3) Enforce no *exact text* overlap across splits.
+
+    This evaluates primarily surface-form and paraphrase generalization within the same topic set,
+    and typically yields higher test performance than unconstrained i.i.d. partitioning.
+    """
+    # 1) TRAIN from full pool
+    train_rows = sample_stratified_grid(pool, train_target, seed, forbid_texts=set())
+
+    # Topics observed in TRAIN (per-law)
+    train_topics_by_law: Dict[str, Set[str]] = {}
+    for r in train_rows:
+        law = r["consensus_law"]
+        train_topics_by_law.setdefault(law, set()).add(r["topic_id"])
+
+    # 2) Restrict candidates for TEST to topics seen in TRAIN
+    pool_for_test = [
+        r for r in pool
+        if r["topic_id"] in train_topics_by_law.get(r["consensus_law"], set())
+    ]
+
+    forbid = {r["query_text"] for r in train_rows}
+
+    # Use a deterministic offset for TEST sampling to avoid coupling shuffles
+    try:
+        test_rows = sample_stratified_grid(pool_for_test, test_target, seed + 101, forbid_texts=forbid)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Not enough candidates for TEST after restricting to topics seen in TRAIN. "
+            "Increase --variants_per_style and/or --candidate_oversupply, or switch to --split_mode iid_unrestricted."
+        ) from e
+
+    rng = random.Random(seed + 999)
+    rng.shuffle(train_rows)
+    rng.shuffle(test_rows)
+    return train_rows, test_rows
+
+
 def write_jsonl(path: Path, rows: List[Dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for r in rows:
@@ -2188,7 +2238,7 @@ def write_jsonl(path: Path, rows: List[Dict[str, str]]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=19)
-    ap.add_argument("--train_n", type=int, default=30000)
+    ap.add_argument("--train_n", type=int, default=40000)
     ap.add_argument("--test_n", type=int, default=5000)
     ap.add_argument("--output_dir", type=str, default=".")
     ap.add_argument("--variants_per_style", type=int, default=3)
@@ -2196,9 +2246,13 @@ def main() -> None:
     # Split policy
     ap.add_argument(
         "--split_mode",
-        choices=["iid", "topic_disjoint"],
+        choices=["iid", "iid_unrestricted", "topic_disjoint"],
         default="iid",
-        help="iid: TRAIN/TEST share the same topic mixture (recommended). topic_disjoint: no topic appears in both splits.",
+        help=(
+            "iid (default): stratified TRAIN/TEST; TEST draws only from topics seen in TRAIN (max transfer). "
+            "iid_unrestricted: stratified TRAIN/TEST as a partition of one pool (topics may be unseen in TRAIN). "
+            "topic_disjoint: no topic appears in both splits (hardest)."
+        ),
     )
 
     # Leakage control
@@ -2378,12 +2432,23 @@ def main() -> None:
         # One pool only -> no query_id collisions even when topics appear in both splits.
         pool = build_pool(all_topics, seed + 111)
 
-        train_rows, test_rows = split_train_test_stratified_grid(pool, train_target, test_target, seed + 303)
-
-        split_meta = {
-            "topics_per_law": topics_per_law,
-            "extra_topics_per_law": extra_topics_per_law,
-        }
+        if args.split_mode == "iid_unrestricted":
+            train_rows, test_rows = split_train_test_stratified_grid(pool, train_target, test_target, seed + 303)
+            split_meta = {
+                "topics_per_law": topics_per_law,
+                "extra_topics_per_law": extra_topics_per_law,
+                "test_topics_subset_of_train": False,
+            }
+        else:
+            # Default: maximize train→test performance by restricting TEST to topics observed in TRAIN.
+            train_rows, test_rows = split_train_test_stratified_grid_test_topics_in_train(
+                pool, train_target, test_target, seed + 303
+            )
+            split_meta = {
+                "topics_per_law": topics_per_law,
+                "extra_topics_per_law": extra_topics_per_law,
+                "test_topics_subset_of_train": True,
+            }
 
     # --- Write outputs ---
     train_path = outdir / "train.jsonl"
