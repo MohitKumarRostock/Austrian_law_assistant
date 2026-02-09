@@ -1996,15 +1996,14 @@ if __name__ == "__main__":
         n_jobs=-1,
         verbose=True,
     )
-
-    # Baseline (before center refinement)
-    Y_val_pred_soft_before = kahm_regress(model, X_val, mode="soft", batch_size=1024)
-    mse_val_before = _mse(Y_val_pred_soft_before, Y_val)
-
     print(
-        f"\nSoft-params chosen on val: alpha={tune_res.best_alpha}, topk={tune_res.best_topk} | "
-        f"Val MSE (soft, before NLMS centers): {mse_val_before:.6f}"
+        f"\nSoft-params chosen on val: alpha={tune_res.best_alpha}, topk={tune_res.best_topk}"
     )
+    # Baseline (before center refinement)
+    Y_test_pred_soft_before = kahm_regress(model, X_test, mode="soft", batch_size=1024)
+    mse_test_before = _mse(Y_test_pred_soft_before, Y_test)
+    r_2_test_before = _r2_overall(Y_test_pred_soft_before, Y_test)
+
 
     # ------------------------------------------------------------
     # 2) Refine cluster centers with NLMS (linear-parameter tuning)
@@ -2029,23 +2028,25 @@ if __name__ == "__main__":
         topk = tune_res.best_topk
     )
 
-    Y_val_pred_soft_after = kahm_regress(model, X_val, mode="soft", batch_size=1024)
-    mse_val_after = _mse(Y_val_pred_soft_after, Y_val)
-
+    Y_test_pred_soft_after = kahm_regress(model, X_test, mode="soft", batch_size=1024)
+    mse_test_after = _mse(Y_test_pred_soft_after, Y_test)
+    r_2_test_after = _r2_overall(Y_test_pred_soft_after, Y_test)
+    
     print(
-        f"NLMS center tuning: final train MSE (reported)={nlms_res.final_mse:.6f} | "
-        f"Val MSE (soft, after NLMS centers): {mse_val_after:.6f}"
+        f"Test MSE (soft, before NLMS centers): {mse_test_before:.6f} | R^2: {r_2_test_before:.4f}"
+    )
+    print(
+        f"Test MSE (soft, after NLMS centers): {mse_test_after:.6f} | R^2: {r_2_test_after:.4f}"
     )
 
     # Save/load
-    save_kahm_regressor(model, MODEL_PATH)
-    loaded_model = load_kahm_regressor(MODEL_PATH)
+    #save_kahm_regressor(model, MODEL_PATH)
+    #loaded_model = load_kahm_regressor(MODEL_PATH)
 
     # Hard prediction
-    Y_pred_hard = kahm_regress(loaded_model, X_test, mode="hard", batch_size=1024)
+    Y_pred_hard = kahm_regress(model, X_test, mode="hard", batch_size=1024)
 
     # Soft prediction: uses stored (soft_alpha, soft_topk) automatically
-    Y_pred_soft = kahm_regress(loaded_model, X_test, mode="soft", return_probabilities=False, batch_size=1024)
-    print(f"\nStored soft_alpha={loaded_model.get('soft_alpha')}, soft_topk={loaded_model.get('soft_topk')}")
-    print(f"Test MSE (hard): {_mse(Y_pred_hard, Y_test):.6f} | R^2 (hard): {_r2_overall(Y_pred_hard, Y_test):.4f}")
+    Y_pred_soft = kahm_regress(model, X_test, mode="soft", return_probabilities=False, batch_size=1024)
+    print(f"\nStored soft_alpha={model.get('soft_alpha')}, soft_topk={model.get('soft_topk')}")
     print(f"Test MSE (soft): {_mse(Y_pred_soft, Y_test):.6f} | R^2 (soft): {_r2_overall(Y_pred_soft, Y_test):.4f}")

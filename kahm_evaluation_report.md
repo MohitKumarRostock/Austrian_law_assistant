@@ -1,14 +1,14 @@
 # KAHM embeddings: retrieval evaluation on Austrian laws
 
-**Generated (UTC):** 2026-02-07T14:47:52Z  
-**Source script:** `evaluate_three_embeddings.py` (version `2026-01-25-combined-distance-gate-v1`)  
+**Generated (UTC):** 2026-02-09T10:05:24Z  
+**Source script:** `evaluate_three_embeddings.py` (version `2026-02-09-routing-threshold-objectives-fix-v1`)  
 
 **KAHM query embedding strategy:** `query_model`  
 **KAHM combine tie-break:** `query`  
 
 ## Abstract
 
-We study whether KAHM can replace transformer-based query embedding at retrieval time by learning a lightweight mapping from an IDF–SVD representation into Mixedbread embedding space, enabling search against a fixed Mixedbread corpus index. On 5000 human-labeled queries over 14,487 aligned sentences (k=10), KAHM(query→MB corpus) achieved Hit@10=0.571 (0.557, 0.585) and MRR@10=0.425 (0.412, 0.437). Compared with IDF–SVD, KAHM changed Hit@10 by +0.076 (+0.063, +0.090) and MRR@10 by +0.067 (+0.056, +0.078) under paired bootstrap. Against Mixedbread, paired deltas for Hit@10, MRR@10, Top-1 accuracy had 95% CIs excluding 0. Mean lift vs prior changed by -3.418 (-5.315, -1.596).  Majority-vote accuracy was lower by -0.016 (-0.027, -0.006) versus Mixedbread.Finally, Full-KAHM embeddings showed high cosine alignment with Mixedbread geometry (corpus cosine=0.9940 (0.9937, 0.9942), query cosine=0.9557 (0.9550, 0.9563)) and recovered similar law-level neighborhoods (law-set Jaccard@10=0.331 (0.325, 0.337); Δ vs IDF=+0.047 (+0.039, +0.054)), while sentence-level neighbor identity remained modest (sentence Jaccard@10=0.038 (0.036, 0.040); Δ vs IDF=-0.033 (-0.036, -0.031)).
+We study whether KAHM can replace transformer-based query embedding at retrieval time by learning a lightweight mapping from an IDF–SVD representation into Mixedbread embedding space, enabling search against a fixed Mixedbread corpus index. On 5000 human-labeled queries over 14,487 aligned sentences (k=100), KAHM(query→MB corpus) achieved Hit@100=0.785 (0.774, 0.796) and MRR@100=0.497 (0.485, 0.509). Compared with IDF–SVD, KAHM changed Hit@100 by +0.062 (+0.051, +0.074) and MRR@100 by +0.113 (+0.102, +0.123) under paired bootstrap. Against Mixedbread, paired deltas for Hit@100, MRR@100, Top-1 accuracy had 95% CIs excluding 0. Mean lift vs prior changed by +2.987 (+2.506, +3.470).  Majority-vote accuracy was higher by +0.032 (+0.022, +0.041) versus Mixedbread.Finally, Full-KAHM embeddings showed high cosine alignment with Mixedbread geometry (corpus cosine=0.9940 (0.9937, 0.9942), query cosine=0.9547 (0.9538, 0.9556)) and recovered similar law-level neighborhoods (law-set Jaccard@100=0.447 (0.444, 0.450); Δ vs IDF=+0.094 (+0.090, +0.098)), while sentence-level neighbor identity remained modest (sentence Jaccard@100=0.074 (0.072, 0.076); Δ vs IDF=-0.045 (-0.047, -0.043)).
 
 ## Experimental configuration
 
@@ -17,10 +17,10 @@ The following settings were recorded in the evaluation run:
 - Queries: **5000**
 - Corpus sentences (aligned): **14487**
 - Embedding dimension: **1024**
-- Retrieval depth: **k=10**
+- Retrieval depth: **k=100**
 - Bootstrap: **paired nonparametric**, 5000 samples, seed=0
-- Majority-vote routing thresholds: 0.5,0.6,0.7,0.8
-- Predominance fraction (per-query majority-vote accuracy metric): **0.50**
+- Majority-vote routing thresholds: 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8
+- Predominance fraction (per-query majority-vote accuracy metric): **0.10**
 
 ### Implementation details
 
@@ -51,7 +51,7 @@ Each query is labeled by human annotation with a single reference law identifier
 - **Hit@k:** 1 if the consensus law appears at least once among the top-k retrieved laws; else 0.
 - **Top-1 accuracy:** 1 if the top-ranked retrieved law equals the consensus law; else 0.
 - **MRR@k (unique laws):** form the ordered list of *unique* laws appearing in the top-k list; if the consensus law occurs at rank r in this list, score 1/r; otherwise 0.
-- **Majority-vote accuracy (predominance ≥ 0.50):** let the majority law be the most frequent law in the top-k list and let f be its fraction. Score 1 if (i) the majority law equals the consensus law and (ii) f ≥ 0.50; otherwise 0.
+- **Majority-vote accuracy (predominance ≥ 0.10):** let the majority law be the most frequent law in the top-k list and let f be its fraction. Score 1 if (i) the majority law equals the consensus law and (ii) f ≥ 0.10; otherwise 0.
 - **Mean consensus fraction:** fraction of the top-k items belonging to the consensus law (count/k).
 - **Mean lift vs prior:** for each query, divide the consensus fraction by the marginal probability of the consensus law in the aligned corpus; report the mean across queries.
 Note: lift vs prior can be sensitive to rare-law priors; interpret it as complementary to Hit/MRR/Top-1.
@@ -75,12 +75,12 @@ We estimate 95% confidence intervals (CIs) using a paired, nonparametric bootstr
 
 **Table 1.** Main retrieval metrics (mean over queries; 95% bootstrap CI).
 
-| Method | Hit@10 | MRR@10 (unique laws) | Top-1 accuracy | Majority-vote accuracy (predominance ≥ 0.50) | Mean consensus fraction | Mean lift vs prior |
+| Method | Hit@100 | MRR@100 (unique laws) | Top-1 accuracy | Majority-vote accuracy (predominance ≥ 0.10) | Mean consensus fraction | Mean lift vs prior |
 | --- | --- | --- | --- | --- | --- | --- |
-| Mixedbread (true) | 0.628 (0.614, 0.641) | 0.466 (0.453, 0.478) | 0.369 (0.356, 0.382) | 0.318 (0.306, 0.331) | 0.315 (0.306, 0.325) | 52.011 (49.398, 54.759) |
-| IDF–SVD | 0.495 (0.481, 0.509) | 0.358 (0.346, 0.370) | 0.281 (0.268, 0.293) | 0.257 (0.245, 0.269) | 0.260 (0.250, 0.270) | 38.860 (36.485, 41.363) |
-| KAHM(query→MB corpus) | 0.571 (0.557, 0.585) | 0.425 (0.412, 0.437) | 0.340 (0.327, 0.353) | 0.302 (0.289, 0.315) | 0.297 (0.287, 0.306) | 48.593 (45.988, 51.213) |
-| Full-KAHM (query→KAHM corpus) | 0.507 (0.494, 0.521) | 0.361 (0.349, 0.372) | 0.278 (0.266, 0.290) | 0.183 (0.172, 0.193) | 0.205 (0.197, 0.213) | 25.268 (24.016, 26.565) |
+| Mixedbread (true) | 0.797 (0.785, 0.808) | 0.475 (0.464, 0.487) | 0.362 (0.349, 0.375) | 0.349 (0.336, 0.362) | 0.196 (0.189, 0.202) | 24.273 (23.505, 25.078) |
+| IDF–SVD | 0.723 (0.710, 0.735) | 0.384 (0.373, 0.396) | 0.284 (0.271, 0.296) | 0.273 (0.260, 0.285) | 0.176 (0.169, 0.183) | 20.489 (19.694, 21.290) |
+| KAHM(query→MB corpus) | 0.785 (0.774, 0.796) | 0.497 (0.485, 0.509) | 0.393 (0.379, 0.407) | 0.381 (0.367, 0.394) | 0.217 (0.210, 0.224) | 27.260 (26.383, 28.152) |
+| Full-KAHM (query→KAHM corpus) | 0.749 (0.737, 0.760) | 0.426 (0.414, 0.437) | 0.321 (0.308, 0.334) | 0.242 (0.230, 0.253) | 0.110 (0.106, 0.114) | 11.606 (11.182, 12.040) |
 
 ### Comparative analyses
 
@@ -88,12 +88,12 @@ We estimate 95% confidence intervals (CIs) using a paired, nonparametric bootstr
 
 | Metric | Δ (KAHM − IDF) | 95% CI excludes 0? | Superiority (lower CI > 0)? |
 | --- | --- | --- | --- |
-| Hit@10 | +0.076 (+0.063, +0.090) | Yes | Yes |
-| MRR@10 (unique laws) | +0.067 (+0.056, +0.078) | Yes | Yes |
-| Top-1 accuracy | +0.059 (+0.045, +0.072) | Yes | Yes |
-| Majority-vote accuracy (predominance ≥ 0.50) | +0.045 (+0.034, +0.056) | Yes | Yes |
-| Mean consensus fraction | +0.036 (+0.029, +0.044) | Yes | Yes |
-| Mean lift vs prior | +9.733 (+7.088, +12.383) | Yes | Yes |
+| Hit@100 | +0.062 (+0.051, +0.074) | Yes | Yes |
+| MRR@100 (unique laws) | +0.113 (+0.102, +0.123) | Yes | Yes |
+| Top-1 accuracy | +0.109 (+0.095, +0.123) | Yes | Yes |
+| Majority-vote accuracy (predominance ≥ 0.10) | +0.108 (+0.096, +0.120) | Yes | Yes |
+| Mean consensus fraction | +0.041 (+0.036, +0.045) | Yes | Yes |
+| Mean lift vs prior | +6.771 (+5.989, +7.546) | Yes | Yes |
 
 Interpretation: the superiority column reflects the one-sided criterion used in the evaluation (paired 95% CI lower bound > 0).
 
@@ -101,23 +101,23 @@ Interpretation: the superiority column reflects the one-sided criterion used in 
 
 | Metric | Δ (KAHM − Mixedbread) | 95% CI excludes 0? |
 | --- | --- | --- |
-| Hit@10 | -0.056 (-0.067, -0.045) | Yes |
-| MRR@10 (unique laws) | -0.041 (-0.050, -0.032) | Yes |
-| Top-1 accuracy | -0.029 (-0.041, -0.018) | Yes |
-| Majority-vote accuracy (predominance ≥ 0.50) | -0.016 (-0.027, -0.006) | Yes |
-| Mean consensus fraction | -0.018 (-0.024, -0.012) | Yes |
-| Mean lift vs prior | -3.418 (-5.315, -1.596) | Yes |
+| Hit@100 | -0.012 (-0.020, -0.003) | Yes |
+| MRR@100 (unique laws) | +0.022 (+0.014, +0.030) | Yes |
+| Top-1 accuracy | +0.031 (+0.020, +0.042) | Yes |
+| Majority-vote accuracy (predominance ≥ 0.10) | +0.032 (+0.022, +0.041) | Yes |
+| Mean consensus fraction | +0.021 (+0.018, +0.024) | Yes |
+| Mean lift vs prior | +2.987 (+2.506, +3.470) | Yes |
 
 ### Majority-vote behavior
 
-**Table 4.** Vote-distribution diagnostics over the top-k neighborhood (k=10; 95% bootstrap CI).
+**Table 4.** Vote-distribution diagnostics over the top-k neighborhood (k=100; 95% bootstrap CI).
 
-| Method | Top-law fraction | Vote margin | Vote entropy | #Unique laws | P(all 10 one law) |
+| Method | Top-law fraction | Vote margin | Vote entropy | #Unique laws | P(all 100 one law) |
 | --- | --- | --- | --- | --- | --- |
-| Mixedbread (true) | 0.532 (0.525, 0.539) | 0.342 (0.334, 0.351) | 1.171 (1.155, 1.187) | 4.449 (4.393, 4.507) | 0.076 (0.069, 0.083) |
-| IDF–SVD | 0.549 (0.542, 0.556) | 0.363 (0.354, 0.372) | 1.117 (1.099, 1.134) | 4.250 (4.193, 4.306) | 0.116 (0.107, 0.125) |
-| KAHM(query→MB corpus) | 0.521 (0.514, 0.528) | 0.329 (0.321, 0.337) | 1.197 (1.181, 1.214) | 4.557 (4.499, 4.615) | 0.079 (0.072, 0.087) |
-| Full-KAHM (query→KAHM corpus) | 0.443 (0.437, 0.449) | 0.249 (0.243, 0.257) | 1.412 (1.398, 1.426) | 5.349 (5.292, 5.407) | 0.029 (0.025, 0.034) |
+| Mixedbread (true) | 0.338 (0.333, 0.344) | 0.191 (0.185, 0.197) | 2.239 (2.222, 2.257) | 20.002 (19.815, 20.192) | 0.000 (0.000, 0.000) |
+| IDF–SVD | 0.357 (0.351, 0.363) | 0.209 (0.202, 0.216) | 2.171 (2.152, 2.191) | 19.440 (19.241, 19.638) | 0.002 (0.001, 0.004) |
+| KAHM(query→MB corpus) | 0.356 (0.351, 0.362) | 0.207 (0.201, 0.214) | 2.163 (2.144, 2.182) | 19.073 (18.873, 19.271) | 0.000 (0.000, 0.000) |
+| Full-KAHM (query→KAHM corpus) | 0.234 (0.230, 0.237) | 0.107 (0.103, 0.111) | 2.711 (2.699, 2.723) | 26.897 (26.733, 27.061) | 0.000 (0.000, 0.000) |
 
 ### Vote-based routing
 
@@ -125,37 +125,53 @@ Interpretation: the superiority column reflects the one-sided criterion used in 
 
 | τ | Coverage (KAHM) | Accuracy among covered (KAHM) | Routing accuracy (KAHM) | Coverage (Mixedbread) | Accuracy among covered (Mixedbread) | Routing accuracy (Mixedbread) |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0.50 | 0.541 (0.527, 0.555) | 0.558 (0.539, 0.576) | 0.302 (0.289, 0.315) | 0.551 (0.538, 0.565) | 0.577 (0.558, 0.595) | 0.318 (0.305, 0.331) |
-| 0.60 | 0.382 (0.369, 0.396) | 0.668 (0.646, 0.688) | 0.255 (0.243, 0.268) | 0.404 (0.391, 0.418) | 0.657 (0.637, 0.678) | 0.266 (0.253, 0.278) |
-| 0.70 | 0.278 (0.266, 0.290) | 0.753 (0.730, 0.775) | 0.209 (0.198, 0.221) | 0.296 (0.283, 0.309) | 0.745 (0.723, 0.767) | 0.221 (0.209, 0.232) |
-| 0.80 | 0.202 (0.191, 0.213) | 0.839 (0.817, 0.861) | 0.169 (0.159, 0.180) | 0.214 (0.203, 0.226) | 0.801 (0.776, 0.825) | 0.171 (0.161, 0.182) |
+| 0.10 | 0.997 (0.996, 0.999) | 0.382 (0.368, 0.396) | 0.381 (0.367, 0.394) | 0.996 (0.995, 0.998) | 0.350 (0.337, 0.364) | 0.349 (0.335, 0.362) |
+| 0.20 | 0.774 (0.762, 0.786) | 0.452 (0.437, 0.469) | 0.350 (0.337, 0.364) | 0.752 (0.740, 0.763) | 0.418 (0.403, 0.434) | 0.314 (0.301, 0.327) |
+| 0.30 | 0.484 (0.471, 0.498) | 0.558 (0.538, 0.577) | 0.270 (0.257, 0.282) | 0.461 (0.447, 0.474) | 0.518 (0.498, 0.539) | 0.238 (0.227, 0.250) |
+| 0.40 | 0.307 (0.295, 0.320) | 0.644 (0.620, 0.668) | 0.198 (0.187, 0.209) | 0.291 (0.278, 0.303) | 0.608 (0.584, 0.634) | 0.177 (0.166, 0.187) |
+| 0.50 | 0.216 (0.205, 0.227) | 0.713 (0.685, 0.739) | 0.154 (0.144, 0.164) | 0.190 (0.179, 0.200) | 0.666 (0.635, 0.696) | 0.126 (0.117, 0.136) |
+| 0.60 | 0.149 (0.139, 0.159) | 0.762 (0.731, 0.792) | 0.113 (0.105, 0.122) | 0.123 (0.114, 0.132) | 0.766 (0.732, 0.800) | 0.094 (0.086, 0.103) |
+| 0.70 | 0.102 (0.094, 0.111) | 0.834 (0.801, 0.865) | 0.085 (0.078, 0.093) | 0.074 (0.066, 0.081) | 0.818 (0.778, 0.856) | 0.060 (0.054, 0.067) |
+| 0.80 | 0.064 (0.057, 0.071) | 0.906 (0.873, 0.938) | 0.058 (0.052, 0.065) | 0.041 (0.036, 0.046) | 0.859 (0.810, 0.904) | 0.035 (0.030, 0.041) |
 
 **Table 6.** Paired deltas vs Mixedbread for routing (KAHM(query→MB corpus) − Mixedbread).
 
 | τ | ΔCoverage | ΔRouting accuracy |
 | --- | --- | --- |
-| 0.50 | -0.010 (-0.024, +0.004) | -0.016 (-0.026, -0.006) |
-| 0.60 | -0.022 (-0.035, -0.009) | -0.010 (-0.020, -0.001) |
-| 0.70 | -0.019 (-0.030, -0.007) | -0.012 (-0.020, -0.003) |
-| 0.80 | -0.012 (-0.022, -0.002) | -0.002 (-0.010, +0.006) |
+| 0.10 | +0.001 (-0.001, +0.003) | +0.032 (+0.022, +0.041) |
+| 0.20 | +0.022 (+0.011, +0.034) | +0.036 (+0.027, +0.045) |
+| 0.30 | +0.024 (+0.012, +0.036) | +0.032 (+0.024, +0.040) |
+| 0.40 | +0.017 (+0.006, +0.027) | +0.021 (+0.014, +0.028) |
+| 0.50 | +0.026 (+0.017, +0.035) | +0.027 (+0.021, +0.034) |
+| 0.60 | +0.026 (+0.019, +0.033) | +0.019 (+0.014, +0.025) |
+| 0.70 | +0.029 (+0.023, +0.035) | +0.025 (+0.020, +0.031) |
+| 0.80 | +0.023 (+0.018, +0.029) | +0.023 (+0.018, +0.028) |
 
 **Table 7.** Decomposition of ΔRouting accuracy into coverage and precision effects.
 
 Point estimates:
 | τ | ΔRouting accuracy | Coverage contribution | Precision contribution |
 | --- | --- | --- | --- |
-| 0.50 | -0.016 | -0.006 | -0.011 |
-| 0.60 | -0.010 | -0.014 | +0.004 |
-| 0.70 | -0.012 | -0.014 | +0.002 |
-| 0.80 | -0.002 | -0.010 | +0.008 |
+| 0.10 | +0.032 | +0.000 | +0.031 |
+| 0.20 | +0.036 | +0.010 | +0.026 |
+| 0.30 | +0.032 | +0.013 | +0.019 |
+| 0.40 | +0.021 | +0.010 | +0.011 |
+| 0.50 | +0.027 | +0.018 | +0.009 |
+| 0.60 | +0.019 | +0.020 | -0.001 |
+| 0.70 | +0.025 | +0.024 | +0.001 |
+| 0.80 | +0.023 | +0.020 | +0.003 |
 
 With paired-bootstrap CIs:
 | τ | ΔRouting accuracy | Coverage contribution | Precision contribution |
 | --- | --- | --- | --- |
-| 0.50 | -0.016 (-0.026, -0.007) | -0.006 (-0.014, +0.003) | -0.011 (-0.020, -0.002) |
-| 0.60 | -0.010 (-0.020, -0.001) | -0.014 (-0.023, -0.006) | +0.004 (-0.003, +0.012) |
-| 0.70 | -0.012 (-0.020, -0.003) | -0.014 (-0.022, -0.005) | +0.002 (-0.004, +0.008) |
-| 0.80 | -0.002 (-0.010, +0.006) | -0.010 (-0.018, -0.002) | +0.008 (+0.003, +0.013) |
+| 0.10 | +0.032 (+0.022, +0.041) | +0.000 (-0.000, +0.001) | +0.031 (+0.022, +0.041) |
+| 0.20 | +0.036 (+0.027, +0.045) | +0.010 (+0.004, +0.015) | +0.026 (+0.017, +0.035) |
+| 0.30 | +0.032 (+0.024, +0.039) | +0.013 (+0.006, +0.019) | +0.019 (+0.012, +0.026) |
+| 0.40 | +0.021 (+0.014, +0.028) | +0.010 (+0.004, +0.017) | +0.011 (+0.005, +0.016) |
+| 0.50 | +0.027 (+0.021, +0.034) | +0.018 (+0.012, +0.024) | +0.009 (+0.005, +0.014) |
+| 0.60 | +0.019 (+0.013, +0.025) | +0.020 (+0.014, +0.025) | -0.001 (-0.004, +0.003) |
+| 0.70 | +0.025 (+0.020, +0.030) | +0.024 (+0.019, +0.029) | +0.001 (-0.001, +0.004) |
+| 0.80 | +0.023 (+0.018, +0.028) | +0.020 (+0.016, +0.025) | +0.003 (+0.001, +0.004) |
 
 **Table 8.** Suggested routing thresholds (coverage constraint and objectives).
 
@@ -165,14 +181,14 @@ Threshold search grid: **0.00–1.00 (step 0.01)**
 
 | Method | τ* | Coverage | Accuracy among covered | Routing accuracy | Objective |
 | --- | --- | --- | --- | --- | --- |
-| Mixedbread (true) | 0.00 | 1.000 | 0.407 | 0.407 | Maximize precision |
-| KAHM(query→MB corpus) | 0.11 | 0.996 | 0.377 | 0.375 | Maximize precision |
-| Full-KAHM (query→KAHM corpus) | 0.00 | 1.000 | 0.280 | 0.280 | Maximize precision |
-| IDF–SVD | 0.11 | 0.998 | 0.309 | 0.308 | Maximize precision |
-| Mixedbread (true) | 0.00 | 1.000 | 0.407 | 0.407 | Maximize routing accuracy |
-| KAHM(query→MB corpus) | 0.11 | 0.996 | 0.377 | 0.375 | Maximize routing accuracy |
-| Full-KAHM (query→KAHM corpus) | 0.00 | 1.000 | 0.280 | 0.280 | Maximize routing accuracy |
-| IDF–SVD | 0.11 | 0.998 | 0.309 | 0.308 | Maximize routing accuracy |
+| Mixedbread (true) | 0.09 | 0.999 | 0.350 | 0.349 | Maximize precision |
+| KAHM(query→MB corpus) | 0.11 | 0.991 | 0.384 | 0.381 | Maximize precision |
+| Full-KAHM (query→KAHM corpus) | 0.00 | 1.000 | 0.243 | 0.243 | Maximize precision |
+| IDF–SVD | 0.11 | 0.994 | 0.274 | 0.273 | Maximize precision |
+| Mixedbread (true) | 0.09 | 0.999 | 0.350 | 0.349 | Maximize routing accuracy |
+| KAHM(query→MB corpus) | 0.11 | 0.991 | 0.384 | 0.381 | Maximize routing accuracy |
+| Full-KAHM (query→KAHM corpus) | 0.00 | 1.000 | 0.243 | 0.243 | Maximize routing accuracy |
+| IDF–SVD | 0.11 | 0.994 | 0.274 | 0.273 | Maximize routing accuracy |
 
 ### Embedding-space alignment and neighborhood overlap
 
@@ -181,12 +197,12 @@ Threshold search grid: **0.00–1.00 (step 0.01)**
 | Quantity | Estimate (95% CI) |
 | --- | --- |
 | Cosine alignment (corpus) | 0.9940 (0.9937, 0.9942) |
-| Cosine alignment (queries) | 0.9557 (0.9550, 0.9563) |
-| Sentence Jaccard@10 | 0.038 (0.036, 0.040) |
-| Sentence overlap fraction@10 | 0.066 (0.063, 0.069) |
-| Law-set Jaccard@10 | 0.331 (0.325, 0.337) |
-| Δ sentence Jaccard (Full − IDF) | -0.033 (-0.036, -0.031) |
-| Δ law-set Jaccard (Full − IDF) | +0.047 (+0.039, +0.054) |
+| Cosine alignment (queries) | 0.9547 (0.9538, 0.9556) |
+| Sentence Jaccard@100 | 0.074 (0.072, 0.076) |
+| Sentence overlap fraction@100 | 0.130 (0.127, 0.133) |
+| Law-set Jaccard@100 | 0.447 (0.444, 0.450) |
+| Δ sentence Jaccard (Full − IDF) | -0.045 (-0.047, -0.043) |
+| Δ law-set Jaccard (Full − IDF) | +0.094 (+0.090, +0.098) |
 
 ## Reproducibility checklist
 
@@ -204,4 +220,4 @@ Threshold search grid: **0.00–1.00 (step 0.01)**
 ---
 ## Summary paragraph
 
-Across 5000 queries (k=10), KAHM(query→MB corpus) achieved Hit@10=0.571 (0.557, 0.585) and MRR@10=0.425 (0.412, 0.437). Paired-bootstrap deltas supported KAHM(query→MB corpus) superiority over IDF–SVD on Hit@10, MRR@10, Top-1 accuracy (Table 2). Compared to Mixedbread, paired deltas indicated differences for Hit@10, MRR@10, Top-1 accuracy with 95% CIs excluding 0 (Table 3). Majority-vote behavior differed depending on the routing threshold τ (Tables 5–8). Majority-vote accuracy was lower by -0.016 (-0.027, -0.006) relative to Mixedbread. Full-KAHM embeddings showed high cosine alignment with Mixedbread in embedding space (mean corpus cosine 0.9940) and recovered similar law-level neighborhoods (law-set Jaccard@10=0.331 (0.325, 0.337); Δ vs IDF=+0.047 (+0.039, +0.054); Table 9), while sentence-level neighbor identity remained modest (sentence Jaccard@10=0.038 (0.036, 0.040); Δ vs IDF=-0.033 (-0.036, -0.031); Table 9).
+Across 5000 queries (k=100), KAHM(query→MB corpus) achieved Hit@100=0.785 (0.774, 0.796) and MRR@100=0.497 (0.485, 0.509). Paired-bootstrap deltas supported KAHM(query→MB corpus) superiority over IDF–SVD on Hit@100, MRR@100, Top-1 accuracy (Table 2). Compared to Mixedbread, paired deltas indicated differences for Hit@100, MRR@100, Top-1 accuracy with 95% CIs excluding 0 (Table 3). Majority-vote behavior differed depending on the routing threshold τ (Tables 5–8). Majority-vote accuracy was higher by +0.032 (+0.022, +0.041) relative to Mixedbread. Full-KAHM embeddings showed high cosine alignment with Mixedbread in embedding space (mean corpus cosine 0.9940) and recovered similar law-level neighborhoods (law-set Jaccard@100=0.447 (0.444, 0.450); Δ vs IDF=+0.094 (+0.090, +0.098); Table 9), while sentence-level neighbor identity remained modest (sentence Jaccard@100=0.074 (0.072, 0.076); Δ vs IDF=-0.045 (-0.047, -0.043); Table 9).

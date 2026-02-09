@@ -46,6 +46,7 @@ import os
 import sys
 import gc
 import datetime
+from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional, Sequence
@@ -54,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2026-01-25-combined-distance-gate-v1"
+SCRIPT_VERSION = "2026-02-09-routing-threshold-objectives-fix-v1"
 
 
 def _safe_ratio(num: float, denom: float) -> float:
@@ -1182,6 +1183,100 @@ def load_kahm_model(path: str) -> dict:
     return load_kahm_regressor(path)
 
 
+def _kahm_model_path_exists(path: str) -> bool:
+    """True if `path` exists as a joblib model file or as a directory containing *.joblib models."""
+    p = str(path or "").strip()
+    if not p:
+        return False
+    if os.path.isdir(p):
+        try:
+            return any(Path(p).glob("*.joblib"))
+        except Exception:
+            return False
+    return os.path.exists(p)
+
+
+def load_kahm_models_from_dir(dir_path: str) -> Dict[str, dict]:
+    """Load all *.joblib KAHM regressors from a directory (non-recursive)."""
+    d = Path(str(dir_path)).expanduser()
+    if not d.exists() or not d.is_dir():
+        raise FileNotFoundError(f"KAHM model directory not found: {dir_path}")
+    paths = sorted(d.glob("*.joblib"))
+    if not paths:
+        raise FileNotFoundError(f"No *.joblib models found in directory: {dir_path}")
+    models: Dict[str, dict] = {}
+    for fp in paths:
+        models[fp.stem] = load_kahm_model(str(fp))
+    return models
+
+
+def kahm_regress_distance_gated_multi_models(
+    X_row: np.ndarray,
+    *,
+    models: Dict[str, dict] | Sequence[dict],
+    mode: str,
+    batch_size: int,
+    tie_break: str = "first",
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """Distance-gated combination across >=2 KAHM models (returns row-major embeddings + min-distance scores)."""
+    try:
+        from combine_kahm_regressors_generalized import combine_kahm_regressors_distance_gated_multi
+    except Exception as e:
+        raise ImportError(
+            "Missing dependency: combine_kahm_regressors_generalized.py is required for directory-based query models."
+        ) from e
+
+    Y, chosen, best_score, _all_scores, names = combine_kahm_regressors_distance_gated_multi(
+        X_row,
+        models=models,
+        input_layout="row",
+        output_layout="row",
+        mode=str(mode),
+        batch_size=int(batch_size),
+        tie_break=str(tie_break),
+        show_progress=bool(show_progress),
+        return_all_scores=False,
+    )
+    Y = l2_normalize_rows(np.asarray(Y, dtype=np.float32))
+    return Y, np.asarray(chosen), np.asarray(best_score, dtype=np.float32), list(names)
+
+
+def kahm_predict_with_min_distance_row(
+    model: dict,
+    X_row: np.ndarray,
+    *,
+    mode: str,
+    batch_size: int,
+    alpha: Optional[float] = None,
+    topk: Optional[int | None] = None,
+    show_progress: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict with a single KAHM model and also return per-sample min cluster distance (row-major)."""
+    try:
+        from combine_kahm_regressors_generalized import kahm_predict_with_min_distance
+    except Exception as e:
+        raise ImportError(
+            "Missing dependency: combine_kahm_regressors_generalized.py is required for distance-gated routing scores."
+        ) from e
+
+    X_row = np.asarray(X_row, dtype=np.float32)
+    X_col = np.ascontiguousarray(X_row.T)  # (D_in,N)
+    Y_col, d = kahm_predict_with_min_distance(
+        model,
+        X_col,
+        mode=str(mode),
+        alpha=alpha,
+        topk=topk,
+        batch_size=int(batch_size),
+        show_progress=bool(show_progress),
+    )
+    Y_row = l2_normalize_rows(np.asarray(Y_col.T, dtype=np.float32))
+    d = np.asarray(d, dtype=np.float32).reshape(-1)
+    return Y_row, d
+
+
+
 def kahm_regress_batched_normalized(
     model: dict,
     X: np.ndarray,
@@ -1891,10 +1986,11 @@ def main() -> None:
 
     p.add_argument(
         "--kahm_query_model",
-        default="kahm_query_regressor_idf_to_mixedbread.joblib",
+        default="kahm_query_regressors_by_law",
         help=(
             "Optional query-specific KAHM regressor (IDF→MB space) used for query embeddings. "
-            "If the file does not exist, the script falls back to --kahm_model."
+            "May be a single *.joblib model, or a directory of *.joblib models (combined via min-distance gating). "
+            "If the path does not exist, the script falls back to --kahm_model."
         ),
     )
     
@@ -1921,11 +2017,11 @@ def main() -> None:
     p.add_argument("--kahm_batch", type=int, default=1024)
     p.add_argument("--query_set", default="query_set.TEST_QUERY_SET")
 
-    p.add_argument("--k", type=int, default=10)
-    p.add_argument("--predominance_fraction", type=float, default=0.5)
+    p.add_argument("--k", type=int, default=100)
+    p.add_argument("--predominance_fraction", type=float, default=0.1)
     p.add_argument(
         "--majority_thresholds",
-        default="0.5,0.6,0.7,0.8",
+        default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8",
         help="Comma-separated thresholds for majority-vote diagnostics (tau values for coverage/accuracy sweeps).",
     )
 
@@ -2065,7 +2161,7 @@ def main() -> None:
     q_path = str(getattr(args, "kahm_query_model", "")).strip()
 
     have_emb = bool(emb_path) and os.path.exists(emb_path)
-    have_q = bool(q_path) and os.path.exists(q_path)
+    have_q = _kahm_model_path_exists(q_path)
 
     q_kahm: Optional[np.ndarray] = None
 
@@ -2083,60 +2179,133 @@ def main() -> None:
             kahm_strategy = "query_model" if have_q else "embedding_model"
         else:
             kahm_emb_model = load_kahm_model(emb_path)
-            kahm_q_model = load_kahm_model(q_path)
-            try:
-                from combine_kahm_regressors import combine_kahm_regressors_distance_gated
-            except Exception:
-                try:
-                    from combine_kahm_regressors_distance_gated import combine_kahm_regressors_distance_gated  # type: ignore
-                except Exception as e:
-                    raise ImportError(
-                        "Failed to import combine_kahm_regressors_distance_gated. "
-                        "Ensure the updated combiner module is available as combine_kahm_regressors.py "
-                        "(preferred) or combine_kahm_regressors_distance_gated.py, and is on PYTHONPATH."
-                    ) from e
 
-            q_kahm, chosen, d_emb, d_q = combine_kahm_regressors_distance_gated(
-                q_idf,
-                embedding_model=kahm_emb_model,
-                query_model=kahm_q_model,
-                input_layout="row",
-                output_layout="row",
-                mode=args.kahm_mode,
-                batch_size=args.kahm_batch,
-                tie_break=str(getattr(args, "kahm_combine_tiebreak", "query")).strip().lower(),
-                show_progress=bool(args.kahm_show_progress),
-            )
-            q_kahm = l2_normalize_rows(np.asarray(q_kahm, dtype=np.float32))
-            frac_query = float(np.mean(chosen.astype(np.float64)))
-            setattr(args, "_kahm_combined_frac_query", frac_query)
-            print(f"  Combined KAHM (distance-gated): chose query-model for {frac_query:.3f} of queries", flush=True)
+            # If --kahm_query_model is a directory, interpret it as a set of law-specific regressors
+            # and combine them via min-distance gating.
+            if os.path.isdir(q_path):
+                q_models = load_kahm_models_from_dir(q_path)
+                q_pred, q_chosen, q_score, q_names = kahm_regress_distance_gated_multi_models(
+                    q_idf,
+                    models=q_models,
+                    mode=args.kahm_mode,
+                    batch_size=args.kahm_batch,
+                    show_progress=bool(args.kahm_show_progress),
+                )
+                emb_pred, emb_score = kahm_predict_with_min_distance_row(
+                    kahm_emb_model,
+                    q_idf,
+                    mode=args.kahm_mode,
+                    batch_size=args.kahm_batch,
+                    show_progress=bool(args.kahm_show_progress),
+                )
 
-    # Single-model fallback (or explicitly selected strategy).
-    if q_kahm is None:
-        if kahm_strategy == "query_model":
-            if have_q:
-                kahm_q_model = load_kahm_model(q_path)
+                tb = str(getattr(args, "kahm_combine_tiebreak", "query")).strip().lower()
+                prefer_query = tb == "query"
+                choose_query = (q_score <= emb_score) if prefer_query else (q_score < emb_score)
+
+                chosen = choose_query.astype(np.int8)
+                q_kahm = np.where(choose_query[:, None], q_pred, emb_pred).astype(np.float32, copy=False)
+                q_kahm = l2_normalize_rows(q_kahm)
+
+                frac_query = float(np.mean(chosen.astype(np.float64)))
+                setattr(args, "_kahm_combined_frac_query", frac_query)
+
+                # Diagnostics: show most frequently chosen query sub-models (top 8)
+                c = Counter(np.asarray(q_chosen, dtype=np.int64).tolist())
+                top_items = sorted(c.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                top = ", ".join([f"{q_names[i]}:{n}" for i, n in top_items])
+                more = "" if len(c) <= 8 else f" (+{len(c)-8} more)"
+                print(
+                    f"  Combined KAHM (distance-gated): chose query-group for {frac_query:.3f} of queries "
+                    f"(query-model mix: {top}{more})",
+                    flush=True,
+                )
             else:
-                if q_path and not os.path.exists(q_path):
-                    print(
-                        f"WARNING: kahm_query_model not found ({q_path}); falling back to kahm_model={emb_path}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                kahm_q_model = load_kahm_model(emb_path)
+                kahm_q_model = load_kahm_model(q_path)
+
+                # Prefer generalized combiner if available (supports the same 2-model API).
+                try:
+                    from combine_kahm_regressors_generalized import combine_kahm_regressors_distance_gated
+                except Exception:
+                    try:
+                        from combine_kahm_regressors import combine_kahm_regressors_distance_gated
+                    except Exception:
+                        try:
+                            from combine_kahm_regressors_distance_gated import combine_kahm_regressors_distance_gated  # type: ignore
+                        except Exception as e:
+                            raise ImportError(
+                                "Failed to import combine_kahm_regressors_distance_gated. "
+                                "Ensure combine_kahm_regressors_generalized.py (preferred) or "
+                                "combine_kahm_regressors.py is available and on PYTHONPATH."
+                            ) from e
+
+                q_kahm, chosen, d_emb, d_q = combine_kahm_regressors_distance_gated(
+                    q_idf,
+                    embedding_model=kahm_emb_model,
+                    query_model=kahm_q_model,
+                    input_layout="row",
+                    output_layout="row",
+                    mode=args.kahm_mode,
+                    batch_size=args.kahm_batch,
+                    tie_break=str(getattr(args, "kahm_combine_tiebreak", "query")).strip().lower(),
+                    show_progress=bool(args.kahm_show_progress),
+                )
+                q_kahm = l2_normalize_rows(np.asarray(q_kahm, dtype=np.float32))
+                frac_query = float(np.mean(chosen.astype(np.float64)))
+                setattr(args, "_kahm_combined_frac_query", frac_query)
+                print(f"  Combined KAHM (distance-gated): chose query-model for {frac_query:.3f} of queries", flush=True)
+
+        # Single-model fallback (or explicitly selected strategy).
+    if q_kahm is None:
+        kahm_q_model: Optional[dict] = None
+
+        if kahm_strategy == "query_model":
+            # Directory path => distance-gated combination of multiple query regressors
+            if have_q and os.path.isdir(q_path):
+                q_models = load_kahm_models_from_dir(q_path)
+                q_kahm, q_chosen, _q_score, q_names = kahm_regress_distance_gated_multi_models(
+                    q_idf,
+                    models=q_models,
+                    mode=args.kahm_mode,
+                    batch_size=args.kahm_batch,
+                    show_progress=bool(args.kahm_show_progress),
+                )
+                q_kahm = l2_normalize_rows(np.asarray(q_kahm, dtype=np.float32))
+
+                # Diagnostics: show most frequently chosen query sub-models (top 8)
+                c = Counter(np.asarray(q_chosen, dtype=np.int64).tolist())
+                top_items = sorted(c.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                top = ", ".join([f"{q_names[i]}:{n}" for i, n in top_items])
+                more = "" if len(c) <= 8 else f" (+{len(c)-8} more)"
+                print(f"  Query-model group (distance-gated): used {len(q_names)} models (mix: {top}{more})", flush=True)
+            else:
+                if have_q:
+                    kahm_q_model = load_kahm_model(q_path)
+                else:
+                    if q_path and not os.path.exists(q_path):
+                        print(
+                            f"WARNING: kahm_query_model not found ({q_path}); falling back to kahm_model={emb_path}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    kahm_q_model = load_kahm_model(emb_path)
+
         elif kahm_strategy == "embedding_model":
             kahm_q_model = load_kahm_model(emb_path)
         else:
             raise ValueError(f"Unknown --kahm_query_strategy: {kahm_strategy}")
 
-        q_kahm = kahm_regress_batched_normalized(
-            kahm_q_model,
-            q_idf,
-            mode=args.kahm_mode,
-            batch_size=args.kahm_batch,
-            show_progress=bool(args.kahm_show_progress),
-        )
+        if q_kahm is None:
+            if kahm_q_model is None:
+                raise RuntimeError("Internal error: kahm_q_model is None but q_kahm has not been computed.")
+            q_kahm = kahm_regress_batched_normalized(
+                kahm_q_model,
+                q_idf,
+                mode=args.kahm_mode,
+                batch_size=args.kahm_batch,
+                show_progress=bool(args.kahm_show_progress),
+            )
+
     print("Embedding queries with Mixedbread ...", flush=True)
     query_ids = extract_query_ids(qs)
     # Prefer precomputed NPZ embeddings (train/test split) to keep evaluation transformer-free.
