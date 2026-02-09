@@ -365,6 +365,10 @@ def main() -> int:
         if bool(args.tune_soft):
             alphas = tuple(base.parse_float_list(str(args.soft_alphas)))
             topks = tuple(base.parse_topk_list(str(args.soft_topks)))
+            topk_candidates_eff = [k for k in topks if (k is not None and k <= n_clusters_eff)]
+            if not topk_candidates_eff:
+                topk_candidates_eff = [1]
+                print(f"[{law}] WARNING: no valid topk candidates <= n_clusters_eff={n_clusters_eff}; using topk=1 only.")
             if X_val is None or Y_val is None:
                 print("WARNING: tune_soft requested, but validation split is empty. Skipping tuning.")
             else:
@@ -374,7 +378,7 @@ def main() -> int:
                     X_val.T,
                     Y_val.T,
                     alphas=alphas,
-                    topks=topks,
+                    topks=topk_candidates_eff,
                     n_jobs=1,
                     verbose=True,
                 )

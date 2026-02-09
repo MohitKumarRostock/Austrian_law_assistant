@@ -7,9 +7,16 @@ Precompute KAHM-regressed approximate Mixedbread embeddings for ALL sentences
 
 Update (combined models)
 ------------------------
-This version can optionally combine TWO already-trained KAHM regressors:
-  - embedding regressor (trained on corpus embeddings)
-  - query regressor     (trained on query embeddings)
+This version can optionally combine already-trained KAHM regressors.
+
+In addition to passing a single .joblib model file, you may pass a DIRECTORY
+containing multiple per-law regressors (e.g., kahm_embedding_regressors_by_law/).
+When a directory is provided, all '*.joblib' models inside are loaded and
+combined via min-distance gating (same distance definition as KAHM itself).
+
+If both an embedding-model family and a query-model family are provided and
+--kahm_strategy=combined_distance is used, the script first selects the best
+model within each family (min-distance), then gates between families.
 
 Combination rule (distance gating):
   For each input sample x and each model M, compute:
@@ -40,7 +47,8 @@ import argparse
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -52,8 +60,8 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_IDF_SVD_NPZ = "embedding_index_idf_svd.npz"
-DEFAULT_KAHM_MODEL = "kahm_regressor_idf_to_mixedbread.joblib"
-DEFAULT_KAHM_QUERY_MODEL = "kahm_query_regressor_idf_to_mixedbread.joblib"
+DEFAULT_KAHM_MODEL = "kahm_embedding_regressors_by_law"
+DEFAULT_KAHM_QUERY_MODEL = "kahm_query_regressors_by_law"
 DEFAULT_OUT_NPZ = "embedding_index_kahm_mixedbread_approx.npz"
 DEFAULT_KAHM_MODE = "soft"
 DEFAULT_BATCH = 1024
@@ -109,6 +117,45 @@ def load_npz_bundle(path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     return ids, emb, meta
 
 
+def _find_joblib_models(model_dir: str) -> List[Path]:
+    p = Path(model_dir)
+    if not p.is_dir():
+        raise NotADirectoryError(f"Not a directory: {model_dir}")
+    files = sorted([x for x in p.iterdir() if x.is_file() and x.suffix.lower() == ".joblib"])
+    return files
+
+
+def load_kahm_models(path_or_dir: str, *, base_dir_override: Optional[str] = None) -> Tuple[List[dict], List[str], str]:
+    """Load one or many KAHM regressors.
+
+    - If `path_or_dir` is a file: returns ([model], [name], "file")
+    - If `path_or_dir` is a directory: loads all '*.joblib' inside and returns (models, names, "dir")
+
+    Names are derived from file stems.
+    """
+    from kahm_regression import load_kahm_regressor
+
+    p = Path(path_or_dir)
+    if p.is_dir():
+        files = _find_joblib_models(str(p))
+        if len(files) == 0:
+            raise FileNotFoundError(f"No .joblib models found in directory: {path_or_dir}")
+        base_dir = base_dir_override if base_dir_override is not None else str(p)
+        models: List[dict] = []
+        names: List[str] = []
+        for f in files:
+            m = load_kahm_regressor(str(f), base_dir=base_dir)
+            models.append(m)
+            names.append(f.stem)
+        return models, names, "dir"
+
+    # file
+    if not p.exists():
+        raise FileNotFoundError(f"Model not found: {path_or_dir}")
+    m = load_kahm_regressor(str(p), base_dir=base_dir_override)
+    return [m], [p.stem], "file"
+
+
 def kahm_regress_batched(
     model: dict,
     X_row: np.ndarray,
@@ -141,6 +188,22 @@ def kahm_regress_batched(
     return np.asarray(Yt.T, dtype=np.float32)
 
 
+def _format_choice_fractions(chosen_idx: np.ndarray, names: Sequence[str]) -> str:
+    """Return a compact 'name=fraction;name=fraction;...' string."""
+    chosen_idx = np.asarray(chosen_idx).reshape(-1)
+    if chosen_idx.size == 0:
+        return ""
+    Q = len(list(names))
+    if Q <= 0:
+        return ""
+    counts = np.bincount(chosen_idx.astype(np.int64, copy=False), minlength=Q).astype(np.float64)
+    total = float(np.sum(counts))
+    if total <= 0:
+        return ""
+    fracs = counts / total
+    return ";".join([f"{names[i]}={fracs[i]:.6f}" for i in range(Q)])
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Precompute KAHM-regressed corpus embeddings and save as NPZ.")
 
@@ -148,11 +211,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help=f"Path to IDF–SVD NPZ (default: {DEFAULT_IDF_SVD_NPZ})")
 
     # Keep legacy flag name for backward compatibility: --kahm_model refers to the "embedding regressor"
-    p.add_argument("--kahm_model", default=DEFAULT_KAHM_MODEL,
-                   help=f"Path to trained KAHM embedding regressor joblib (default: {DEFAULT_KAHM_MODEL})")
+    p.add_argument(
+        "--kahm_model",
+        default=DEFAULT_KAHM_MODEL,
+        help=(
+            "Path to trained KAHM embedding regressor (.joblib) OR a directory containing multiple per-law regressors. "
+            f"(default: {DEFAULT_KAHM_MODEL})"
+        ),
+    )
 
-    p.add_argument("--kahm_query_model", default=DEFAULT_KAHM_QUERY_MODEL,
-                   help=f"Optional path to trained KAHM query regressor joblib (default: none; suggested: {DEFAULT_KAHM_QUERY_MODEL})")
+    p.add_argument(
+        "--kahm_query_model",
+        default=None,
+        help=(
+            "Optional path to trained KAHM query regressor (.joblib) OR a directory containing multiple per-law regressors. "
+            f"(suggested: {DEFAULT_KAHM_QUERY_MODEL})"
+        ),
+    )
 
     p.add_argument("--kahm_embedding_base_dir", default=None,
                    help="Optional override for embedding regressor classifier_dir (if model was relocated).")
@@ -163,7 +238,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    choices=["auto", "embedding_only", "query_only", "combined_distance"],
                    help="How to compute KAHM embeddings. 'auto' combines if kahm_query_model is provided, else uses embedding_only.")
 
-    p.add_argument("--combine_tie_break", default="query", choices=["query", "embedding"],
+    p.add_argument("--combine_tie_break", default="embedding", choices=["query", "embedding"],
                    help="When min distances are equal, choose which model (default: query).")
 
     p.add_argument("--out_npz", default=DEFAULT_OUT_NPZ,
@@ -207,80 +282,228 @@ def main() -> int:
     ids, X, meta_x = load_npz_bundle(args.idf_svd_npz)
     print(f"  ids={ids.shape} X={X.shape}")
 
-    from kahm_regression import load_kahm_regressor
+    print(f"Loading KAHM embedding model(s): {args.kahm_model}")
+    emb_models, emb_names, emb_kind = load_kahm_models(args.kahm_model, base_dir_override=args.kahm_embedding_base_dir)
+    print(f"  loaded {len(emb_models)} embedding model(s) ({emb_kind})")
 
-    print(f"Loading KAHM embedding model: {args.kahm_model}")
-    emb_model = load_kahm_regressor(args.kahm_model, base_dir=args.kahm_embedding_base_dir)
-
-    q_model = None
+    q_models: Optional[List[dict]] = None
+    q_names: Optional[List[str]] = None
+    q_kind: Optional[str] = None
     if args.kahm_query_model is not None:
-        print(f"Loading KAHM query model: {args.kahm_query_model}")
-        q_model = load_kahm_regressor(args.kahm_query_model, base_dir=args.kahm_query_base_dir)
+        print(f"Loading KAHM query model(s): {args.kahm_query_model}")
+        q_models, q_names, q_kind = load_kahm_models(args.kahm_query_model, base_dir_override=args.kahm_query_base_dir)
+        print(f"  loaded {len(q_models)} query model(s) ({q_kind})")
 
     # Normalize inputs (typical cosine/IP retrieval)
     Xn = l2_normalize_rows(X)
 
     strategy = str(args.kahm_strategy).lower().strip()
     if strategy == "auto":
-        strategy = "combined_distance" if q_model is not None else "embedding_only"
+        strategy = "combined_distance" if q_models is not None else "embedding_only"
 
     show_progress = (not bool(args.no_progress))
 
     gating_meta: Dict[str, Any] = {}
+
+    # Lazy import: only needed for multi-model or family gating
+    def _import_combiner():
+        from combine_kahm_regressors_generalized import (
+                combine_kahm_regressors_distance_gated,
+                combine_kahm_regressors_distance_gated_multi,
+                kahm_predict_with_min_distance,
+            )
+        return combine_kahm_regressors_distance_gated, combine_kahm_regressors_distance_gated_multi, kahm_predict_with_min_distance
+
+
     if strategy == "combined_distance":
-        if q_model is None:
+        if q_models is None or q_names is None:
             print("ERROR: kahm_strategy=combined_distance requires --kahm_query_model.", file=sys.stderr)
             return 2
 
-        # Import combiner (supports either module name)
-        try:
-            from combine_kahm_regressors import combine_kahm_regressors_distance_gated  # type: ignore
-        except Exception:
-            from combine_kahm_regressors_distance_gated import combine_kahm_regressors_distance_gated  # type: ignore
+        combine_2, combine_multi, kahm_predict_with_min_distance = _import_combiner()
 
         print(f"Computing combined KAHM corpus embeddings via distance gating (mode={args.kahm_mode}) ...")
-        Y_row, chosen, d_emb, d_q = combine_kahm_regressors_distance_gated(
-            Xn,
-            embedding_model=emb_model,
-            query_model=q_model,
-            input_layout="row",
-            output_layout="row",
-            mode=str(args.kahm_mode),
-            alpha=args.alpha,
-            topk=args.topk,
-            batch_size=int(args.batch),
-            tie_break=str(args.combine_tie_break),
-            show_progress=show_progress,
-        )
 
-        frac_q = float(np.mean(chosen))
-        gating_meta = dict(
-            combine_strategy="combined_distance",
-            combine_tie_break=str(args.combine_tie_break),
-            chosen_query_fraction=frac_q,
-            chosen_embedding_fraction=(1.0 - frac_q),
-            min_dist_embedding_mean=float(np.mean(d_emb)),
-            min_dist_query_mean=float(np.mean(d_q)),
-        )
-        Y = np.asarray(Y_row, dtype=np.float32)
+        # Fast path: single embedding model vs single query model
+        if len(emb_models) == 1 and len(q_models) == 1:
+            Y_row, chosen_family, d_emb, d_q = combine_2(
+                Xn,
+                embedding_model=emb_models[0],
+                query_model=q_models[0],
+                input_layout="row",
+                output_layout="row",
+                mode=str(args.kahm_mode),
+                alpha=args.alpha,
+                topk=args.topk,
+                batch_size=int(args.batch),
+                tie_break=str(args.combine_tie_break),
+                show_progress=show_progress,
+            )
+            Y = np.asarray(Y_row, dtype=np.float32)
+            frac_q = float(np.mean(chosen_family))
+            gating_meta = dict(
+                combine_strategy="combined_distance",
+                combine_tie_break=str(args.combine_tie_break),
+                chosen_query_fraction=frac_q,
+                chosen_embedding_fraction=(1.0 - frac_q),
+                min_dist_embedding_mean=float(np.mean(d_emb)),
+                min_dist_query_mean=float(np.mean(d_q)),
+            )
+
+        else:
+            # Family gating: pick best model within each family, then gate between families.
+            X_col = np.ascontiguousarray(Xn.T)
+
+            # --- embedding family ---
+            if len(emb_models) == 1:
+                Y_emb_col, d_emb_best = kahm_predict_with_min_distance(
+                    emb_models[0],
+                    X_col,
+                    mode=str(args.kahm_mode),
+                    alpha=args.alpha,
+                    topk=args.topk,
+                    batch_size=int(args.batch),
+                    show_progress=show_progress,
+                )
+                Y_emb = np.ascontiguousarray(Y_emb_col.T)
+                chosen_emb = np.zeros((Xn.shape[0],), dtype=np.int16)
+            else:
+                Y_emb, chosen_emb, d_emb_best, _all_scores, _names = combine_multi(
+                    Xn,
+                    models=emb_models,
+                    model_names=emb_names,
+                    input_layout="row",
+                    output_layout="row",
+                    mode=str(args.kahm_mode),
+                    alpha=args.alpha,
+                    topk=args.topk,
+                    batch_size=int(args.batch),
+                    tie_break="first",
+                    show_progress=show_progress,
+                    return_all_scores=False,
+                )
+
+            # --- query family ---
+            if len(q_models) == 1:
+                Y_q_col, d_q_best = kahm_predict_with_min_distance(
+                    q_models[0],
+                    X_col,
+                    mode=str(args.kahm_mode),
+                    alpha=args.alpha,
+                    topk=args.topk,
+                    batch_size=int(args.batch),
+                    show_progress=show_progress,
+                )
+                Y_q = np.ascontiguousarray(Y_q_col.T)
+                chosen_q = np.zeros((Xn.shape[0],), dtype=np.int16)
+            else:
+                Y_q, chosen_q, d_q_best, _all_scores2, _names2 = combine_multi(
+                    Xn,
+                    models=q_models,
+                    model_names=q_names,
+                    input_layout="row",
+                    output_layout="row",
+                    mode=str(args.kahm_mode),
+                    alpha=args.alpha,
+                    topk=args.topk,
+                    batch_size=int(args.batch),
+                    tie_break="first",
+                    show_progress=show_progress,
+                    return_all_scores=False,
+                )
+
+            d_emb_best = np.asarray(d_emb_best, dtype=np.float32).reshape(-1)
+            d_q_best = np.asarray(d_q_best, dtype=np.float32).reshape(-1)
+            if d_emb_best.shape != d_q_best.shape:
+                raise ValueError(f"Distance shape mismatch: embedding={d_emb_best.shape} query={d_q_best.shape}")
+
+            choose_q = d_q_best < d_emb_best
+            if str(args.combine_tie_break).lower().strip() == "query":
+                choose_q = np.logical_or(choose_q, d_q_best == d_emb_best)
+
+            chosen_family = choose_q.astype(np.int8)
+            Y = np.where(choose_q[:, None], Y_q, Y_emb).astype(np.float32, copy=False)
+
+            frac_q = float(np.mean(chosen_family))
+            gating_meta = dict(
+                combine_strategy="combined_distance",
+                combine_tie_break=str(args.combine_tie_break),
+                chosen_query_fraction=frac_q,
+                chosen_embedding_fraction=(1.0 - frac_q),
+                min_dist_embedding_mean=float(np.mean(d_emb_best)),
+                min_dist_query_mean=float(np.mean(d_q_best)),
+                embedding_family_n_models=int(len(emb_models)),
+                query_family_n_models=int(len(q_models)),
+                embedding_family_choice_fractions=_format_choice_fractions(chosen_emb, emb_names),
+                query_family_choice_fractions=_format_choice_fractions(chosen_q, q_names),
+            )
 
     elif strategy == "query_only":
-        if q_model is None:
+        if q_models is None or q_names is None:
             print("ERROR: kahm_strategy=query_only requires --kahm_query_model.", file=sys.stderr)
             return 2
-        print(f"Regressing corpus embeddings via KAHM query model ({args.kahm_mode}) ...")
-        Y = kahm_regress_batched(
-            q_model, Xn, mode=args.kahm_mode, batch_size=int(args.batch),
-            alpha=args.alpha, topk=args.topk, show_progress=show_progress
-        )
+
+        if len(q_models) == 1:
+            print(f"Regressing corpus embeddings via KAHM query model ({args.kahm_mode}) ...")
+            Y = kahm_regress_batched(
+                q_models[0], Xn, mode=args.kahm_mode, batch_size=int(args.batch),
+                alpha=args.alpha, topk=args.topk, show_progress=show_progress
+            )
+        else:
+            _, combine_multi, _ = _import_combiner()
+            print(f"Regressing corpus embeddings via combined query models ({len(q_models)} models; {args.kahm_mode}) ...")
+            Y, chosen_idx, best_score, _all_scores, _names = combine_multi(
+                Xn,
+                models=q_models,
+                model_names=q_names,
+                input_layout="row",
+                output_layout="row",
+                mode=str(args.kahm_mode),
+                alpha=args.alpha,
+                topk=args.topk,
+                batch_size=int(args.batch),
+                tie_break="first",
+                show_progress=show_progress,
+                return_all_scores=False,
+            )
+            gating_meta = dict(
+                combine_strategy="query_only_multi",
+                query_family_n_models=int(len(q_models)),
+                query_family_choice_fractions=_format_choice_fractions(chosen_idx, q_names),
+                query_family_min_dist_mean=float(np.mean(best_score)),
+            )
 
     else:
         # embedding_only
-        print(f"Regressing corpus embeddings via KAHM embedding model ({args.kahm_mode}) ...")
-        Y = kahm_regress_batched(
-            emb_model, Xn, mode=args.kahm_mode, batch_size=int(args.batch),
-            alpha=args.alpha, topk=args.topk, show_progress=show_progress
-        )
+        if len(emb_models) == 1:
+            print(f"Regressing corpus embeddings via KAHM embedding model ({args.kahm_mode}) ...")
+            Y = kahm_regress_batched(
+                emb_models[0], Xn, mode=args.kahm_mode, batch_size=int(args.batch),
+                alpha=args.alpha, topk=args.topk, show_progress=show_progress
+            )
+        else:
+            _, combine_multi, _ = _import_combiner()
+            print(f"Regressing corpus embeddings via combined embedding models ({len(emb_models)} models; {args.kahm_mode}) ...")
+            Y, chosen_idx, best_score, _all_scores, _names = combine_multi(
+                Xn,
+                models=emb_models,
+                model_names=emb_names,
+                input_layout="row",
+                output_layout="row",
+                mode=str(args.kahm_mode),
+                alpha=args.alpha,
+                topk=args.topk,
+                batch_size=int(args.batch),
+                tie_break="first",
+                show_progress=show_progress,
+                return_all_scores=False,
+            )
+            gating_meta = dict(
+                combine_strategy="embedding_only_multi",
+                embedding_family_n_models=int(len(emb_models)),
+                embedding_family_choice_fractions=_format_choice_fractions(chosen_idx, emb_names),
+                embedding_family_min_dist_mean=float(np.mean(best_score)),
+            )
 
     Yn = l2_normalize_rows(Y)
 
@@ -293,8 +516,12 @@ def main() -> int:
         source_idf_svd_npz=os.path.basename(args.idf_svd_npz),
         source_idf_svd_fingerprint_sha256=(fp_x or ""),
         kahm_strategy=str(strategy),
-        source_kahm_embedding_model=os.path.basename(args.kahm_model),
-        source_kahm_query_model=(os.path.basename(args.kahm_query_model) if args.kahm_query_model else ""),
+        source_kahm_embedding_model=os.path.basename(str(args.kahm_model)),
+        source_kahm_query_model=(os.path.basename(str(args.kahm_query_model)) if args.kahm_query_model else ""),
+        source_kahm_embedding_model_kind=str(emb_kind),
+        source_kahm_query_model_kind=(str(q_kind) if q_kind is not None else ""),
+        source_kahm_embedding_models=(";".join(list(emb_names)) if emb_names else ""),
+        source_kahm_query_models=(";".join(list(q_names)) if q_names else ""),
         kahm_mode=str(args.kahm_mode),
         soft_alpha_override=("" if args.alpha is None else str(args.alpha)),
         soft_topk_override=("" if args.topk is None else str(args.topk)),
@@ -317,6 +544,10 @@ def main() -> int:
         kahm_strategy=np.asarray(out_meta["kahm_strategy"]),
         source_kahm_embedding_model=np.asarray(out_meta["source_kahm_embedding_model"]),
         source_kahm_query_model=np.asarray(out_meta["source_kahm_query_model"]),
+        source_kahm_embedding_model_kind=np.asarray(out_meta.get("source_kahm_embedding_model_kind", "")),
+        source_kahm_query_model_kind=np.asarray(out_meta.get("source_kahm_query_model_kind", "")),
+        source_kahm_embedding_models=np.asarray(out_meta.get("source_kahm_embedding_models", "")),
+        source_kahm_query_models=np.asarray(out_meta.get("source_kahm_query_models", "")),
         kahm_mode=np.asarray(out_meta["kahm_mode"]),
         soft_alpha_override=np.asarray(out_meta["soft_alpha_override"]),
         soft_topk_override=np.asarray(out_meta["soft_topk_override"]),
@@ -332,6 +563,14 @@ def main() -> int:
         chosen_embedding_fraction=np.asarray(float(out_meta.get("chosen_embedding_fraction", np.nan))),
         min_dist_embedding_mean=np.asarray(float(out_meta.get("min_dist_embedding_mean", np.nan))),
         min_dist_query_mean=np.asarray(float(out_meta.get("min_dist_query_mean", np.nan))),
+
+        # Per-family multi-model diagnostics (when directory models are used)
+        embedding_family_n_models=np.asarray(int(out_meta.get("embedding_family_n_models", 0))),
+        query_family_n_models=np.asarray(int(out_meta.get("query_family_n_models", 0))),
+        embedding_family_choice_fractions=np.asarray(out_meta.get("embedding_family_choice_fractions", "")),
+        query_family_choice_fractions=np.asarray(out_meta.get("query_family_choice_fractions", "")),
+        embedding_family_min_dist_mean=np.asarray(float(out_meta.get("embedding_family_min_dist_mean", np.nan))),
+        query_family_min_dist_mean=np.asarray(float(out_meta.get("query_family_min_dist_mean", np.nan))),
     )
     print("Done.")
     return 0
