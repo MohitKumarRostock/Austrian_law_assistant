@@ -1,6 +1,5 @@
 # Python caches
 __pycache__/
-kahm_ae_cache/
 
 #MacOS files
 .DS_Store
@@ -8,7 +7,7 @@ kahm_ae_cache/
 venv/
 
 # Generated artifacts
-*.npz
-*.parquet
-*.joblib
-*.jsonl
+#*.npz
+#*.parquet
+#*.joblib
+#*.jsonl
