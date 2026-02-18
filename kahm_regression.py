@@ -273,6 +273,9 @@ def train_kahm_regressor(
     D_out, _ = Y.shape
 
 
+    N_orig = int(N)
+
+
 
     if verbose:
         print(f"Training KAHM regressor on {N} samples.")
@@ -284,36 +287,52 @@ def train_kahm_regressor(
     if input_scale != 1.0:
         X = _scale_like(X, float(input_scale), inplace=False)
 
-    # 1) K-means on outputs
-    if verbose:
-        print("Running K-means on outputs...")
+    # 1) Output clustering on Y
+    # Special case: if n_clusters == N, each sample is its own cluster and the
+    # cluster centroids must equal the original target samples (no KMeans needed).
+    if int(n_clusters) > N:
+        raise ValueError(f"n_clusters={int(n_clusters)} cannot exceed number of samples N={int(N)}.")
 
-    Y_T = Y.T  # (N, D_out)
+    skip_kmeans = (int(n_clusters) == int(N))
 
-    kind = str(kmeans_kind).lower().strip()
-    if kind not in ("auto", "full", "minibatch"):
-        raise ValueError("kmeans_kind must be one of {'auto','full','minibatch'}")
-
-    use_minibatch = (kind == "minibatch") or (kind == "auto" and int(n_clusters) >= 2000)
-
-    if use_minibatch:
+    if skip_kmeans:
         if verbose:
             print(
-                f"Using MiniBatchKMeans (n_clusters={n_clusters}, batch_size={int(kmeans_batch_size)}) "
-                "to reduce peak memory."
+                "Skipping K-means on outputs because n_clusters == number of samples (N). "
+                "Using each sample as its own output cluster."
             )
-        kmeans = MiniBatchKMeans(
-            n_clusters=int(n_clusters),
-            random_state=random_state,
-            batch_size=int(kmeans_batch_size),
-            n_init="auto",
-            reassignment_ratio=0.01,
-        )
-        kmeans.fit(Y_T)
+        kmeans = None  # type: ignore[assignment]
+        labels_zero_based = np.arange(int(N), dtype=np.int64)
     else:
-        kmeans = KMeans(n_clusters=int(n_clusters), random_state=random_state, n_init="auto")
-        kmeans.fit(Y_T)
-    labels_zero_based = kmeans.labels_.astype(int)
+        if verbose:
+            print("Running K-means on outputs...")
+
+        Y_T = Y.T  # (N, D_out)
+
+        kind = str(kmeans_kind).lower().strip()
+        if kind not in ("auto", "full", "minibatch"):
+            raise ValueError("kmeans_kind must be one of {'auto','full','minibatch'}")
+
+        use_minibatch = (kind == "minibatch") or (kind == "auto" and int(n_clusters) >= 2000)
+
+        if use_minibatch:
+            if verbose:
+                print(
+                    f"Using MiniBatchKMeans (n_clusters={n_clusters}, batch_size={int(kmeans_batch_size)}) "
+                    "to reduce peak memory."
+                )
+            kmeans = MiniBatchKMeans(
+                n_clusters=int(n_clusters),
+                random_state=random_state,
+                batch_size=int(kmeans_batch_size),
+                n_init="auto",
+                reassignment_ratio=0.01,
+            )
+            kmeans.fit(Y_T)
+        else:
+            kmeans = KMeans(n_clusters=int(n_clusters), random_state=random_state, n_init="auto")
+            kmeans.fit(Y_T)
+        labels_zero_based = kmeans.labels_.astype(int)
 
     # 1a) Handle singleton clusters
     counts = np.bincount(labels_zero_based, minlength=n_clusters)
@@ -327,11 +346,18 @@ def train_kahm_regressor(
         if strategy not in ("augment", "merge"):
             raise ValueError("singleton_strategy must be one of {'augment','merge'}")
 
-        centers = kmeans.cluster_centers_
-        # Precompute squared norms of centers once (avoids large temporaries during singleton handling).
-        c2 = np.einsum("ij,ij->i", centers, centers)
-
         if strategy == "merge":
+            if kmeans is None:
+                raise ValueError(
+                    "singleton_strategy='merge' is incompatible with n_clusters == number of samples (N). "
+                    "Use singleton_strategy='augment' to keep per-sample centroids without KMeans."
+                )
+
+            centers = kmeans.cluster_centers_
+            # Precompute squared norms of centers once (avoids large temporaries during singleton handling).
+            c2 = np.einsum("ij,ij->i", centers, centers)
+
+
             # Legacy behavior: reassign each singleton sample to nearest non-singleton cluster (by output distance).
             for cl in singletons:
                 sample_indices = np.where(labels_zero_based == cl)[0]
@@ -426,7 +452,6 @@ def train_kahm_regressor(
                     # Already resolved, skip.
                     continue
                 s_idx = int(members[0])
-                y_sample = Y_T[s_idx]  # (D_out,)
                 x_singleton = X[:, s_idx]  # (D_in,)
 
                 # Choose the global nearest neighbor in input space (Euclidean) and mix towards it.
@@ -488,10 +513,16 @@ def train_kahm_regressor(
     labels_one_based = labels_mapped_zero + 1  # OTFL expects labels 1..C_eff
   # OTFL expects labels 1..C_eff
 
-    cluster_centers = np.zeros((D_out, n_clusters_eff), dtype=work_dtype)
-    for new_c in range(n_clusters_eff):
-        mask = labels_mapped_zero == new_c
-        cluster_centers[:, new_c] = Y[:, mask].mean(axis=1)
+    # Compute output cluster centroids
+    # - In the special case skip_kmeans (n_clusters == N_orig), each original sample defines its own cluster,
+    #   so centroids must equal the original Y samples (no expensive per-cluster masking loop).
+    if 'skip_kmeans' in locals() and bool(skip_kmeans) and int(n_clusters_eff) == int(N_orig):
+        cluster_centers = Y[:, :N_orig].astype(work_dtype, copy=False).copy()
+    else:
+        cluster_centers = np.zeros((D_out, n_clusters_eff), dtype=work_dtype)
+        for new_c in range(n_clusters_eff):
+            mask = labels_mapped_zero == new_c
+            cluster_centers[:, new_c] = Y[:, mask].mean(axis=1)
 
     # Optional centroid normalization for directional targets (e.g., unit-norm embeddings)
     cc_req = str(cluster_center_normalization).lower().strip()
@@ -1941,7 +1972,7 @@ if __name__ == "__main__":
     MODEL_PATH = "kahm_regressor_example.joblib"
 
     # Toy data
-    D_in, D_out, N = 5, 3, 10_000
+    D_in, D_out, N = 5, 3, 5000
     X = np.tanh(np.random.randn(D_in, N))
     Y = np.vstack(
         [
@@ -1966,7 +1997,7 @@ if __name__ == "__main__":
     model = train_kahm_regressor(
         X_train,
         Y_train,
-        n_clusters=1000,
+        n_clusters=3500,
         subspace_dim=20,
         Nb=100,
         random_state=0,

@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-extract_sentences_from_German_pdfs.py  (IR-optimized adaptation)
+extract_sentences_from_German_pdfs.py  (RIS law PDF extraction; paragraph-robust)
 
-Purpose
--------
-Extract semantically meaningful text units from RIS law PDFs, label with law type + page number,
-and write to a Parquet file. Also prints ONE example unit per PDF.
+What changed vs. the original
+-----------------------------
+This variant keeps the output schema identical but improves paragraph extraction robustness
+for Austrian RIS PDFs by:
+
+- Using layout-aware extraction (PyMuPDF "dict") to reconstruct *lines* in reading order.
+- Removing repeating headers/footers using a frequency-based blacklist + existing regex drops.
+- Segmenting paragraphs using a combination of:
+    * legal markers (e.g., "§ 12", "Art. 5")
+    * indentation patterns (common in RIS PDFs)
+    * large vertical gaps (blank-line style spacing)
+- Merging paragraphs that continue across page breaks (optional; enabled by default for paragraph/passage).
+- Fixing dehyphenation so compound hyphens like "Privat-Rechte" are preserved.
 
 Downstream compatibility
 -----------------------
-The output schema is unchanged:
-  Columns: sentence_id, law_type, page, sentence, source_file
+Output columns remain:
+  sentence_id, law_type, page, sentence, source_file
 
 The column name "sentence" is intentionally kept for compatibility even when
 the extraction unit is a paragraph/passage.
 
-IR optimization
---------------
-By default, this version extracts *passages* (chunked paragraph-like blocks) rather than
-single sentences, because:
-  - sentence boundaries are hard to reconstruct reliably from PDFs, especially in legal text
-  - embedding retrieval typically performs better with self-contained context windows
+You can still use:
+  --unit sentence   (legacy sentence-ish splitting)
+  --unit paragraph  (layout paragraphs; robust)
+  --unit passage    (chunked passages for embeddings; default)
 
-You can switch back to legacy behavior with:  --unit sentence
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ import argparse
 import importlib
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast, Set
 
@@ -122,7 +129,7 @@ def _normalize_whitespace(raw: str, *, drop_patterns: Optional[List[str]] = None
     """
     Recall-first normalization.
     - Keep line boundaries long enough to strip RIS prefixes safely.
-    - Dehyphenate across line breaks.
+    - Dehyphenate across line breaks, *without* destroying compound hyphens.
     - Normalize enumeration markers.
     - Collapse whitespace.
     """
@@ -144,8 +151,11 @@ def _normalize_whitespace(raw: str, *, drop_patterns: Optional[List[str]] = None
 
     s = "\n".join(lines)
 
-    # Dehyphenate across line breaks
-    s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s)
+    # Dehyphenate across line breaks:
+    # - If the next line continues a word (lowercase), remove the hyphen.
+    # - If the next line starts with uppercase, keep the hyphen but remove the newline.
+    s = re.sub(r"([A-Za-zÄÖÜäöüß])-\s*\n\s*([a-zäöüß])", r"\1\2", s)
+    s = re.sub(r"([A-Za-zÄÖÜäöüß])-\s*\n\s*([A-ZÄÖÜ])", r"\1-\2", s)
 
     # Normalize enumeration markers at line starts
     s = _ENUM_ROMAN_LINE_RE.sub(r"\1) ", s)
@@ -308,145 +318,101 @@ def is_semantically_meaningful(
     return True
 
 
-# ----------------------------- IR-oriented paragraph/passage extraction -----------------------------
-
-def _extract_paragraph_candidates_from_page_text(
-    raw_page_text: str,
-    *,
-    drop_patterns: Optional[List[str]] = None,
-) -> List[str]:
-    """
-    Paragraph candidates from a plain page text (fallback when block extraction is not available).
-    """
-    if not raw_page_text or not raw_page_text.strip():
-        return []
-
-    s = raw_page_text.replace("\u00ad", "")
-    s = _RIS_INLINE_FOOTER_RE.sub("", s)
-    s = _RIS_URL_ONLY_RE.sub("", s)
-
-    kept_lines: List[str] = []
-    for ln in s.splitlines():
-        ln = ln.rstrip("\n")
-        if drop_patterns:
-            if any(re.fullmatch(pat, ln.strip(), flags=re.IGNORECASE) for pat in drop_patterns):
-                continue
-        kept_lines.append(_strip_noise_prefixes(ln))
-
-    cleaned = "\n".join(kept_lines)
-
-    # Prefer blank-line paragraphs if they exist.
-    toks = [p.strip() for p in re.split(r"\n\s*\n+", cleaned) if p and p.strip()]
-    if len(toks) >= 3:
-        paras = [_normalize_whitespace(p, drop_patterns=drop_patterns) for p in toks]
-        return [p for p in paras if p]
-
-    # Otherwise merge lines into paragraph-like blocks.
-    lines = [ln.strip() for ln in kept_lines if ln.strip()]
-    if not lines:
-        return []
-
-    merged: List[str] = []
-    buf: List[str] = []
-    for ln in lines:
-        buf.append(ln)
-        joined = " ".join(buf)
-        strong_end = bool(re.search(r"[\.?!:;]\s*$", ln))
-        long_enough = len(joined) >= 240
-        if strong_end or long_enough:
-            merged.append(" ".join(buf))
-            buf = []
-    if buf:
-        merged.append(" ".join(buf))
-
-    paras = [_normalize_whitespace(p, drop_patterns=drop_patterns) for p in merged]
-    return [p for p in paras if p]
-
+# ----------------------------- IR-oriented chunking -----------------------------
 
 def _count_tokens(s: str) -> int:
     return len(_TOKEN_RE.findall(s))
 
 
-def _chunk_paragraphs_to_passages(
-    paragraphs: List[str],
+def _chunk_items_to_passages(
+    items: List[Tuple[int, str]],
     *,
     target_tokens: int = 260,
     overlap_tokens: int = 60,
     min_tokens: int = 40,
     max_tokens: int = 420,
     split_enumerations: bool = True,
-) -> List[str]:
+) -> List[Tuple[int, str]]:
     """
-    Chunk paragraph candidates into embedding-friendly passages with overlap.
+    Chunk (page, paragraph) items into embedding-friendly passages with overlap.
+    The returned page number is the *start page* of the first non-overlap paragraph in the chunk.
     """
-    if not paragraphs:
+    if not items:
         return []
 
-    paras = [p.strip() for p in paragraphs if p and p.strip()]
-    if not paras:
-        return []
-
-    # Expand overlong paragraphs before chunking.
-    expanded: List[str] = []
-    for p in paras:
+    # Expand overlong paragraphs before chunking (keeps their page).
+    expanded_items: List[Tuple[int, str]] = []
+    for pg, p in items:
         if _count_tokens(p) > max_tokens and split_enumerations:
             parts = _split_on_list_markers(p)
-            expanded.extend([x.strip() for x in parts if x and x.strip()])
+            expanded_items.extend([(pg, x.strip()) for x in parts if x and x.strip()])
         else:
-            expanded.append(p)
-    paras = expanded
+            expanded_items.append((pg, p))
 
-    passages: List[str] = []
+    passages: List[Tuple[int, str]] = []
+
     cur_parts: List[str] = []
     cur_tokens = 0
+    cur_start_page: Optional[int] = None
+    has_real = False  # at least one non-overlap paragraph
+    pending_overlap_prefix: Optional[str] = None
 
-    def finalize_current() -> Optional[str]:
-        nonlocal cur_parts, cur_tokens
-        if not cur_parts:
+    def finalize_current() -> Optional[Tuple[int, str]]:
+        nonlocal cur_parts, cur_tokens, cur_start_page, has_real, pending_overlap_prefix
+        if not cur_parts or not has_real or cur_start_page is None:
+            cur_parts, cur_tokens, cur_start_page, has_real = [], 0, None, False
             return None
-        txt = "\n\n".join(cur_parts).strip()
-        cur_parts = []
-        cur_tokens = 0
+        txt = "\n\n".join([x for x in cur_parts if x]).strip()
+        start_page = cur_start_page
+        cur_parts, cur_tokens, cur_start_page, has_real = [], 0, None, False
         if not txt:
             return None
-        # Hard trim if needed
         if _count_tokens(txt) > max_tokens:
             w = _TOKEN_RE.findall(txt)[:max_tokens]
             txt = " ".join(w)
-        return txt
+        return (start_page, txt)
 
-    def overlap_seed(prev: str) -> Tuple[List[str], int]:
+    def compute_overlap_prefix(prev_txt: str) -> str:
         if overlap_tokens <= 0:
-            return [], 0
-        words = _TOKEN_RE.findall(prev)
+            return ""
+        words = _TOKEN_RE.findall(prev_txt)
         ov = words[-overlap_tokens:] if len(words) > overlap_tokens else words
-        if not ov:
-            return [], 0
-        return [" ".join(ov)], len(ov)
+        return " ".join(ov)
 
-    for para in paras:
+    for pg, para in expanded_items:
+        para = para.strip()
+        if not para:
+            continue
         pt = _count_tokens(para)
         if pt == 0:
             continue
 
-        if cur_parts and (cur_tokens + pt) > target_tokens and cur_tokens >= min_tokens:
+        # Initialize new chunk with overlap prefix (but don't set start_page yet).
+        if not cur_parts and pending_overlap_prefix:
+            cur_parts = [pending_overlap_prefix]
+            cur_tokens = _count_tokens(pending_overlap_prefix)
+            pending_overlap_prefix = None
+
+        if cur_parts and (cur_tokens + pt) > target_tokens and cur_tokens >= min_tokens and has_real:
             finished = finalize_current()
             if finished:
                 passages.append(finished)
-                cur_parts, cur_tokens = overlap_seed(finished)
+                pending_overlap_prefix = compute_overlap_prefix(finished[1])
 
+        if cur_start_page is None:
+            cur_start_page = pg
         cur_parts.append(para)
         cur_tokens += pt
+        has_real = True
 
     finished = finalize_current()
     if finished:
         passages.append(finished)
 
-    # Drop tiny overlap-only chunks
-    return [p for p in passages if _count_tokens(p) >= min_tokens]
+    return [(pg, txt) for (pg, txt) in passages if _count_tokens(txt) >= min_tokens]
 
 
-# ----------------------------- PDF extraction (robust + fallback) -----------------------------
+# ----------------------------- PDF extraction (layout-aware) -----------------------------
 
 def _load_pymupdf_module() -> Any:
     errors: List[str] = []
@@ -458,72 +424,6 @@ def _load_pymupdf_module() -> Any:
         except Exception as e:
             errors.append(f"{module_name}: {type(e).__name__}: {e}")
     raise RuntimeError("PyMuPDF not available. Tried pymupdf/fitz. Errors: " + " | ".join(errors))
-
-
-def _extract_pages_with_pymupdf(pdf_path: Path) -> Iterable[Tuple[int, str]]:
-    pymupdf_mod = _load_pymupdf_module()
-    Document = cast(Optional[Any], getattr(pymupdf_mod, "Document", None))
-    open_fn = cast(Optional[Any], getattr(pymupdf_mod, "open", None))
-
-    if callable(Document):
-        doc = Document(str(pdf_path))
-    elif callable(open_fn):
-        doc = open_fn(str(pdf_path))
-    else:
-        raise RuntimeError("PyMuPDF module loaded but provides neither Document nor open().")
-
-    try:
-        if getattr(doc, "needs_pass", False):
-            raise RuntimeError(f"Encrypted PDF (password needed): {pdf_path.name}")
-
-        for i, page in enumerate(cast(Iterable[Any], doc), start=1):
-            try:
-                txt = page.get_text("text", sort=True)  # type: ignore[call-arg]
-            except TypeError:
-                txt = page.get_text("text")
-            yield i, (txt or "")
-    finally:
-        close_method = getattr(doc, "close", None)
-        if callable(close_method):
-            close_method()
-
-
-def _extract_pages_with_pymupdf_blocks(pdf_path: Path) -> Iterable[Tuple[int, List[str]]]:
-    pymupdf_mod = _load_pymupdf_module()
-    Document = cast(Optional[Any], getattr(pymupdf_mod, "Document", None))
-    open_fn = cast(Optional[Any], getattr(pymupdf_mod, "open", None))
-
-    if callable(Document):
-        doc = Document(str(pdf_path))
-    elif callable(open_fn):
-        doc = open_fn(str(pdf_path))
-    else:
-        raise RuntimeError("PyMuPDF module loaded but provides neither Document nor open().")
-
-    try:
-        if getattr(doc, "needs_pass", False):
-            raise RuntimeError(f"Encrypted PDF (password needed): {pdf_path.name}")
-
-        for i, page in enumerate(cast(Iterable[Any], doc), start=1):
-            try:
-                blocks = page.get_text("blocks", sort=True)  # type: ignore[call-arg]
-            except TypeError:
-                blocks = page.get_text("blocks")
-
-            out: List[str] = []
-            for b in blocks or []:
-                # (x0, y0, x1, y1, text, block_no, block_type)
-                try:
-                    txt = b[4]
-                except Exception:
-                    txt = ""
-                if txt:
-                    out.append(str(txt))
-            yield i, out
-    finally:
-        close_method = getattr(doc, "close", None)
-        if callable(close_method):
-            close_method()
 
 
 def _extract_pages_with_pdfplumber(pdf_path: Path) -> Iterable[Tuple[int, str]]:
@@ -545,22 +445,342 @@ def extract_pages_text(pdf_path: Path) -> Iterable[Tuple[int, str]]:
     Text extraction with fallback (legacy interface).
     """
     try:
-        yield from _extract_pages_with_pymupdf(pdf_path)
+        pymupdf_mod = _load_pymupdf_module()
+        Document = cast(Optional[Any], getattr(pymupdf_mod, "Document", None))
+        open_fn = cast(Optional[Any], getattr(pymupdf_mod, "open", None))
+
+        if callable(Document):
+            doc = Document(str(pdf_path))
+        elif callable(open_fn):
+            doc = open_fn(str(pdf_path))
+        else:
+            raise RuntimeError("PyMuPDF module loaded but provides neither Document nor open().")
+
+        try:
+            if getattr(doc, "needs_pass", False):
+                raise RuntimeError(f"Encrypted PDF (password needed): {pdf_path.name}")
+
+            for i, page in enumerate(cast(Iterable[Any], doc), start=1):
+                try:
+                    txt = page.get_text("text", sort=True)  # type: ignore[call-arg]
+                except TypeError:
+                    txt = page.get_text("text")
+                yield i, (txt or "")
+        finally:
+            close_method = getattr(doc, "close", None)
+            if callable(close_method):
+                close_method()
     except Exception:
         yield from _extract_pages_with_pdfplumber(pdf_path)
 
 
-def extract_pages_blocks(pdf_path: Path) -> Iterable[Tuple[int, List[str]]]:
+# --- Paragraph extraction helpers ---
+
+_SECTION_START_RE = re.compile(r"^\s*(?:§{1,2}\s*\d+[A-Za-z]?|Art\.?\s*\d+[A-Za-z]?|Artikel\s+\d+)", re.IGNORECASE)
+_LIST_ITEM_RE = re.compile(r"^\s*(?:\(\d{1,3}\)|\d{1,3}\)|[A-Za-z]\)|[•\u2022])\s+")
+_STRONG_SENT_END_RE = re.compile(r"[\.!?]\s*$")
+
+
+def _normalize_header_footer_key(s: str) -> str:
+    s = _strip_noise_prefixes(s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = re.sub(r"\d+", "<d>", s)  # remove page numbers etc.
+    return s
+
+
+def _matches_drop_patterns(s: str, drop_patterns: Optional[List[str]]) -> bool:
+    if not drop_patterns:
+        return False
+    st = s.strip()
+    for pat in drop_patterns:
+        if re.fullmatch(pat, st, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _extract_lines_from_page_dict(page_dict: Dict[str, Any]) -> List[Tuple[float, float, float, float, str]]:
     """
-    Block extraction with fallback:
-      - Prefer PyMuPDF blocks
-      - Fallback to pdfplumber page text (as single block)
+    Extract (x0, y0, x1, y1, text) lines from a PyMuPDF page.get_text("dict") result.
     """
+    out: List[Tuple[float, float, float, float, str]] = []
+    for b in page_dict.get("blocks", []) or []:
+        if b.get("type", 0) != 0:
+            continue
+        for ln in b.get("lines", []) or []:
+            spans = ln.get("spans", []) or []
+            if not spans:
+                continue
+            txt = "".join((sp.get("text", "") or "") for sp in spans)
+            txt = txt.strip()
+            if not txt:
+                continue
+            x0, y0, x1, y1 = ln.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            out.append((float(x0), float(y0), float(x1), float(y1), txt))
+    out.sort(key=lambda t: (round(t[1], 2), t[0]))
+    return out
+
+
+def _percentile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    v = sorted(values)
+    if q <= 0:
+        return v[0]
+    if q >= 1:
+        return v[-1]
+    idx = int(round((len(v) - 1) * q))
+    return v[max(0, min(len(v) - 1, idx))]
+
+
+def _join_lines_into_paragraphs(
+    lines: List[Tuple[float, float, float, float, str]],
+    *,
+    page_width: float,
+    page_height: float,
+) -> List[str]:
+    """
+    Convert filtered lines into paragraph strings.
+    """
+    if not lines:
+        return []
+
+    x0s = [x0 for (x0, _, _, _, _) in lines]
+    base_x0 = _percentile(x0s, 0.10)  # stable left margin baseline
+    indent_threshold = 12.0
+
+    # Estimate "blank line" vertical gap using line heights.
+    heights = [max(0.0, y1 - y0) for (_, y0, _, y1, _) in lines]
+    line_h = _percentile(heights, 0.50) or 10.0
+    gap_threshold = max(0.90 * line_h, 9.0)
+
+    paras: List[str] = []
+    cur: List[str] = []
+
+    prev_x0: Optional[float] = None
+    prev_y1: Optional[float] = None
+    prev_text: str = ""
+
+    def flush():
+        nonlocal cur, prev_text
+        if not cur:
+            return
+        txt = "".join(cur).strip()
+        txt = _normalize_paragraph_text(txt)
+        if txt:
+            paras.append(txt)
+        cur = []
+        prev_text = ""
+
+    for (x0, y0, x1, y1, txt) in lines:
+        # Normalize per-line, but keep list markers and section starts intact.
+        lt = txt.replace("\u00ad", "").strip()
+        if not lt:
+            continue
+
+        is_section_start = bool(_SECTION_START_RE.match(lt))
+        is_list_item = bool(_LIST_ITEM_RE.match(lt))
+        is_indented = (x0 - base_x0) >= indent_threshold
+
+        # Large vertical gap (blank line) -> paragraph break.
+        gap = None
+        if prev_y1 is not None:
+            gap = y0 - prev_y1
+
+        starts_new_para = False
+        if not cur:
+            starts_new_para = True
+        else:
+            # Explicit structure markers.
+            if is_section_start:
+                starts_new_para = True
+            # Indentation-based paragraph starts (common in RIS PDFs).
+            elif is_indented and (prev_x0 is not None) and (prev_x0 - base_x0) < indent_threshold:
+                if _STRONG_SENT_END_RE.search(prev_text) or (gap is not None and gap >= 0):
+                    starts_new_para = True
+            # Blank-line style separation.
+            elif gap is not None and gap > gap_threshold:
+                starts_new_para = True
+            # Centered heading-ish line (short and centered) -> own paragraph.
+            else:
+                # A crude center heuristic: left margin far from base and short text
+                if (x0 - base_x0) > 60 and len(lt) < 80:
+                    starts_new_para = True
+
+        if starts_new_para and cur:
+            flush()
+
+        # Append current line to paragraph with robust line-join rules.
+        if not cur:
+            cur.append(lt)
+        else:
+            prev = cur[-1]
+
+            # Dehyphenation / hyphen-preserving join:
+            # - If previous ends with "-" and current starts lowercase: remove hyphen (word continuation).
+            # - Else if previous ends with "-" keep it but join without space (compound with uppercase etc.)
+            if prev.endswith("-") and lt and re.match(r"^[a-zäöüß]", lt):
+                cur[-1] = prev[:-1] + lt
+            elif prev.endswith("-") and lt:
+                cur[-1] = prev + lt
+            # List items: preserve structure on separate line.
+            elif is_list_item or (prev.endswith(":") and is_list_item):
+                cur.append("\n" + lt)
+            else:
+                cur.append(" " + lt)
+
+        prev_x0 = x0
+        prev_y1 = y1
+        prev_text = lt
+
+    flush()
+    return paras
+
+
+def _normalize_paragraph_text(s: str) -> str:
+    """
+    Paragraph-level normalization that preserves newlines (used for lists).
+    """
+    if not s:
+        return ""
+    # Temporarily protect newlines so we can reuse _normalize_whitespace.
+    placeholder = " ⏎ "
+    s2 = s.replace("\n", placeholder)
+    s2 = _normalize_whitespace(s2, drop_patterns=None)
+    s2 = s2.replace(placeholder, "\n")
+    # Clean up newline spacing
+    s2 = re.sub(r"[ \t]*\n[ \t]*", "\n", s2).strip()
+    return s2
+
+
+def extract_paragraph_items(
+    pdf_path: Path,
+    *,
+    drop_patterns: Optional[List[str]] = None,
+    merge_across_pages: bool = True,
+    header_footer_scan_ratio: float = 0.10,
+    header_footer_min_page_ratio: float = 0.20,
+) -> List[Tuple[int, str]]:
+    """
+    Extract robust layout paragraphs from a RIS PDF.
+
+    Returns: list of (start_page_no, paragraph_text).
+
+    Strategy:
+      1) Extract layout lines per page using PyMuPDF dict.
+      2) Build a repeating header/footer blacklist using top/bottom bands.
+      3) Segment paragraphs with indentation + markers.
+      4) Optionally merge paragraphs across page breaks when they look like continuations.
+    """
+    if drop_patterns is None:
+        drop_patterns = list(_DEFAULT_DROP_PATTERNS)
+
+    pymupdf_mod = _load_pymupdf_module()
+    Document = cast(Optional[Any], getattr(pymupdf_mod, "Document", None))
+    open_fn = cast(Optional[Any], getattr(pymupdf_mod, "open", None))
+
+    if callable(Document):
+        doc = Document(str(pdf_path))
+    elif callable(open_fn):
+        doc = open_fn(str(pdf_path))
+    else:
+        raise RuntimeError("PyMuPDF module loaded but provides neither Document nor open().")
+
     try:
-        yield from _extract_pages_with_pymupdf_blocks(pdf_path)
-    except Exception:
-        for page_no, txt in extract_pages_text(pdf_path):
-            yield page_no, [txt]
+        if getattr(doc, "needs_pass", False):
+            raise RuntimeError(f"Encrypted PDF (password needed): {pdf_path.name}")
+
+        n_pages = int(getattr(doc, "page_count", 0) or len(cast(List[Any], doc)))
+        if n_pages <= 0:
+            return []
+
+        # Pass 1: build header/footer blacklist by frequency.
+        counts: Counter[str] = Counter()
+        for pi in range(n_pages):
+            page = doc[pi]
+            pd = page.get_text("dict")
+            lines = _extract_lines_from_page_dict(pd)
+            h = float(getattr(page.rect, "height", pd.get("height", 0.0)))
+            top_y = h * header_footer_scan_ratio
+            bot_y = h * (1.0 - header_footer_scan_ratio)
+
+            for (x0, y0, x1, y1, txt) in lines:
+                t = txt.strip()
+                if not t:
+                    continue
+                # Consider only top/bottom bands for header/footer candidates.
+                if y0 <= top_y or y1 >= bot_y:
+                    key = _normalize_header_footer_key(t)
+                    if key:
+                        counts[key] += 1
+
+        min_count = max(3, int(round(n_pages * header_footer_min_page_ratio)))
+        hf_blacklist = {k for (k, c) in counts.items() if c >= min_count and 2 <= len(k) <= 120}
+
+        # Pass 2: extract paragraphs per page and optionally merge across pages.
+        out_items: List[Tuple[int, str]] = []
+        prev_pg: Optional[int] = None
+        prev_txt: Optional[str] = None
+
+        def should_merge(prev: str, cur: str) -> bool:
+            # Do not merge if the new paragraph clearly starts a new section/list.
+            if _SECTION_START_RE.match(cur) or _LIST_ITEM_RE.match(cur):
+                return False
+            # Merge if previous paragraph ends without a strong stop, OR clearly ends with a hyphen.
+            if prev.rstrip().endswith("-"):
+                return True
+            if not _STRONG_SENT_END_RE.search(prev):
+                # Avoid merging if the next paragraph looks like a heading (center/short).
+                if len(cur) < 80 and re.match(r"^[A-ZÄÖÜ0-9]", cur):
+                    return False
+                return True
+            return False
+
+        for pi in range(n_pages):
+            page_no = pi + 1
+            page = doc[pi]
+            pd = page.get_text("dict")
+            lines = _extract_lines_from_page_dict(pd)
+
+            # Filter header/footer and obvious noise lines.
+            filtered: List[Tuple[float, float, float, float, str]] = []
+            for (x0, y0, x1, y1, txt) in lines:
+                t = _strip_noise_prefixes(txt).strip()
+                if not t:
+                    continue
+                if _matches_drop_patterns(t, drop_patterns):
+                    continue
+                if _normalize_header_footer_key(t) in hf_blacklist:
+                    continue
+                # Drop pure URL line variants.
+                if re.fullmatch(r"https?://\S+", t, flags=re.IGNORECASE):
+                    continue
+                filtered.append((x0, y0, x1, y1, t))
+
+            paras = _join_lines_into_paragraphs(
+                filtered,
+                page_width=float(getattr(page.rect, "width", pd.get("width", 0.0))),
+                page_height=float(getattr(page.rect, "height", pd.get("height", 0.0))),
+            )
+
+            for ptxt in paras:
+                if not ptxt:
+                    continue
+                # Optional cross-page merge.
+                if merge_across_pages and prev_txt is not None and prev_pg is not None:
+                    if should_merge(prev_txt, ptxt):
+                        merged = (prev_txt.rstrip() + " " + ptxt.lstrip()).strip()
+                        out_items[-1] = (prev_pg, merged)
+                        prev_txt = merged
+                        continue
+
+                out_items.append((page_no, ptxt))
+                prev_pg, prev_txt = page_no, ptxt
+
+        return out_items
+    finally:
+        close_method = getattr(doc, "close", None)
+        if callable(close_method):
+            close_method()
 
 
 # ----------------------------- Main pipeline -----------------------------
@@ -583,10 +803,11 @@ def ris_pdfs_to_parquet(
     min_passage_tokens: int = 40,
     max_passage_tokens: int = 420,
     dedupe_within_pdf: bool = True,
+    merge_across_pages: bool = True,
 ) -> pd.DataFrame:
     """
-    Reads all PDFs in input_dir, extracts and filters units page-by-page,
-    labels them with law_type (PDF stem) and page number, writes Parquet.
+    Reads all PDFs in input_dir, extracts and filters units, labels them with law_type + start page,
+    and writes Parquet. Output schema is unchanged.
     """
     input_dir = Path(input_dir)
     output_parquet = Path(output_parquet)
@@ -642,60 +863,57 @@ def ris_pdfs_to_parquet(
                     rows.append(
                         {"sentence_id": sentence_id, "law_type": law_type, "page": page_no, "sentence": u, "source_file": pdf_path.name}
                     )
+
         else:
-            for page_no, blocks in extract_pages_blocks(pdf_path):
-                if not blocks:
-                    continue
+            # Robust paragraph extraction (layout-aware) across the entire PDF.
+            paragraph_items = extract_paragraph_items(
+                pdf_path,
+                drop_patterns=drop_patterns,
+                merge_across_pages=merge_across_pages,
+            )
 
-                # Create paragraph candidates
-                if len(blocks) == 1:
-                    paras = _extract_paragraph_candidates_from_page_text(blocks[0], drop_patterns=drop_patterns)
-                else:
-                    paras = []
-                    for b in blocks:
-                        nb = _normalize_whitespace(b, drop_patterns=drop_patterns)
-                        if nb:
-                            paras.append(nb)
+            if split_enumerations and paragraph_items:
+                expanded_items: List[Tuple[int, str]] = []
+                for pg, ptxt in paragraph_items:
+                    parts = _split_on_list_markers(ptxt)
+                    expanded_items.extend([(pg, x.strip()) for x in parts if x and x.strip()])
+                paragraph_items = expanded_items
 
-                if split_enumerations and paras:
-                    expanded: List[str] = []
-                    for ptxt in paras:
-                        parts = _split_on_list_markers(ptxt)
-                        expanded.extend([x.strip() for x in parts if x and x.strip()])
-                    paras = expanded
-
-                units = paras if unit == "paragraph" else _chunk_paragraphs_to_passages(
-                    paras,
+            units_items: List[Tuple[int, str]] = (
+                paragraph_items if unit == "paragraph"
+                else _chunk_items_to_passages(
+                    paragraph_items,
                     target_tokens=target_tokens,
                     overlap_tokens=overlap_tokens,
                     min_tokens=min_passage_tokens,
                     max_tokens=max_passage_tokens,
                     split_enumerations=split_enumerations,
                 )
+            )
 
-                for u in units:
-                    u = u.strip()
-                    if not u:
-                        continue
-                    if filter_sentences and not is_semantically_meaningful(
-                        u,
-                        min_chars=min_chars,
-                        min_alpha_tokens=min_alpha_tokens,
-                        max_digit_ratio=max_digit_ratio,
-                        drop_patterns=drop_patterns,
-                    ):
-                        continue
-                    if dedupe_within_pdf and u in seen_texts:
-                        continue
-                    seen_texts.add(u)
+            for page_no, u in units_items:
+                u = u.strip()
+                if not u:
+                    continue
+                if filter_sentences and not is_semantically_meaningful(
+                    u,
+                    min_chars=min_chars,
+                    min_alpha_tokens=min_alpha_tokens,
+                    max_digit_ratio=max_digit_ratio,
+                    drop_patterns=drop_patterns,
+                ):
+                    continue
+                if dedupe_within_pdf and u in seen_texts:
+                    continue
+                seen_texts.add(u)
 
-                    if law_type not in first_example:
-                        first_example[law_type] = (page_no, u)
+                if law_type not in first_example:
+                    first_example[law_type] = (page_no, u)
 
-                    sentence_id += 1
-                    rows.append(
-                        {"sentence_id": sentence_id, "law_type": law_type, "page": page_no, "sentence": u, "source_file": pdf_path.name}
-                    )
+                sentence_id += 1
+                rows.append(
+                    {"sentence_id": sentence_id, "law_type": law_type, "page": page_no, "sentence": u, "source_file": pdf_path.name}
+                )
 
     if print_example_per_pdf:
         print("Example unit per PDF (first retained unit found):")
@@ -725,7 +943,7 @@ def ris_pdfs_to_parquet(
 # ----------------------------- CLI -----------------------------
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract labeled units from RIS PDFs and write Parquet (IR-optimized).")
+    p = argparse.ArgumentParser(description="Extract labeled units from RIS PDFs and write Parquet (paragraph-robust).")
     p.add_argument("--input_dir", default="ris_pdfs", help="Folder containing RIS PDF files.")
     p.add_argument("--output", default="ris_sentences.parquet", help="Output Parquet file path.")
     p.add_argument("--recursive", action="store_true", help="Search PDFs recursively.")
@@ -742,13 +960,18 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--unit",
         choices=["sentence", "paragraph", "passage"],
         default="passage",
-        help="Extraction unit: sentence (legacy), paragraph (blocks), passage (chunked for embeddings; default).",
+        help="Extraction unit: sentence (legacy), paragraph (layout; robust), passage (chunked for embeddings; default).",
     )
     p.add_argument("--target_tokens", type=int, default=260, help="Target token size for passage chunks.")
     p.add_argument("--overlap_tokens", type=int, default=60, help="Token overlap between passages.")
     p.add_argument("--min_passage_tokens", type=int, default=40, help="Minimum token size for retained passages.")
     p.add_argument("--max_passage_tokens", type=int, default=420, help="Hard maximum token size for a passage.")
     p.add_argument("--no_dedupe_within_pdf", action="store_true", help="Disable duplicate removal within each PDF.")
+    p.add_argument(
+        "--no_merge_across_pages",
+        action="store_true",
+        help="Disable merging paragraphs that continue across page breaks (paragraph/passage units).",
+    )
     return p.parse_args(argv)
 
 
@@ -770,6 +993,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_passage_tokens=args.min_passage_tokens,
         max_passage_tokens=args.max_passage_tokens,
         dedupe_within_pdf=not args.no_dedupe_within_pdf,
+        merge_across_pages=not args.no_merge_across_pages,
     )
     return 0
 
