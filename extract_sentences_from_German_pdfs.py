@@ -696,7 +696,7 @@ def extract_paragraph_items(
         # Pass 1: build header/footer blacklist by frequency.
         counts: Counter[str] = Counter()
         for pi in range(n_pages):
-            page = doc[pi]
+            page = cast(Any, doc)[pi]
             pd = page.get_text("dict")
             lines = _extract_lines_from_page_dict(pd)
             h = float(getattr(page.rect, "height", pd.get("height", 0.0)))
@@ -737,7 +737,7 @@ def extract_paragraph_items(
 
         for pi in range(n_pages):
             page_no = pi + 1
-            page = doc[pi]
+            page = cast(Any, doc)[pi]
             pd = page.get_text("dict")
             lines = _extract_lines_from_page_dict(pd)
 

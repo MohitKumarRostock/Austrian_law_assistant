@@ -272,6 +272,8 @@ def train_kahm_regressor(
     D_in, N = X.shape
     D_out, _ = Y.shape
 
+    # Initialize optional transposed target matrix for type-checkers and safe cleanup.
+    Y_T: Optional[np.ndarray] = None
 
     N_orig = int(N)
 
@@ -364,7 +366,7 @@ def train_kahm_regressor(
                 if sample_indices.size != 1:
                     continue
                 s_idx = int(sample_indices[0])
-                y_sample = Y_T[s_idx]
+                y_sample = Y[:, s_idx]
 
                 y2 = float(np.dot(y_sample, y_sample))
                 d2 = c2 + y2 - 2.0 * centers.dot(y_sample)
@@ -493,10 +495,10 @@ def train_kahm_regressor(
 
             # Update N after appending synthetic samples (used later for sanity checks and subsampling).
             N = int(X.shape[1])    # Free the transposed matrix used for KMeans to reduce peak RAM.
-    try:
+    if Y_T is not None:
+        # Free the transposed matrix used for KMeans to reduce peak RAM.
         del Y_T
-    except Exception:
-        pass
+        Y_T = None
     # 1c) Drop empty clusters, remap to contiguous labels
     used_clusters = np.unique(labels_zero_based)
     n_clusters_eff = used_clusters.size
@@ -2076,7 +2078,7 @@ if __name__ == "__main__":
 
     # Hard prediction
     Y_pred_hard = kahm_regress(model, X_test, mode="hard", batch_size=1024)
-
+    print(f"Test MSE (hard): {_mse(Y_pred_hard, Y_test):.6f} | R^2 (hard): {_r2_overall(Y_pred_hard, Y_test):.4f}")
     # Soft prediction: uses stored (soft_alpha, soft_topk) automatically
     Y_pred_soft = kahm_regress(model, X_test, mode="soft", return_probabilities=False, batch_size=1024)
     print(f"\nStored soft_alpha={model.get('soft_alpha')}, soft_topk={model.get('soft_topk')}")

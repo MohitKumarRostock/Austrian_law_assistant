@@ -1,31 +1,37 @@
-"""evaluate_three_embeddings.py
+"""evaluate_kahm_query_adapter.py
 
 Purpose
 -------
-Clean, publication-friendly evaluation script that tells a simple, defensible story about
-KAHM embeddings as a retrieval-time alternative to Mixedbread (MB).
+Scientific retrieval evaluation for Austrian law routing on a fixed sentence corpus.
 
-It prints three storylines (A/B/C) from the *same* run:
+Core hypothesis
+---------------
+KAHM is a **compute-efficient, gradient-free alternative to transformer query encoders**.
+We keep a strong transformer corpus index fixed (Mixedbread corpus embeddings) and replace
+online transformer query encoding with a lightweight adapter:
 
-  A) Effectiveness vs a strong low-cost baseline:
-     KAHM(q→MB) decisively beats IDF–SVD on retrieval quality.
+    IDF–SVD(query features) → KAHM adapter → Mixedbread embedding space
 
-  B) Competitiveness vs MB at top-k:
-     KAHM(q→MB) is close to MB on top-k retrieval quality (paired deltas + bootstrap CIs).
+We compare exactly three systems:
 
-  C) Alignment / "right direction" evidence:
-     Full-KAHM embeddings preserve Mixedbread geometry (high cosine alignment) and recover
-     similar law-level neighborhoods; sentence-level neighbor identity is modest.
- 
+  1) **IDF–SVD** (lexical / linear baseline): IDF–SVD queries → IDF–SVD corpus
+  2) **Mixedbread (true)** (transformer query encoder): MB queries → MB corpus
+  3) **KAHM(query→MB corpus)** (gradient-free query adapter): KAHM queries → MB corpus
 
-All confidence intervals use nonparametric *paired* bootstrap (default 5000).
+Full-KAHM retrieval (query→KAHM corpus) and corpus-alignment/geometry storylines are
+intentionally **not** evaluated here.
+
+Statistical protocol
+--------------------
+- All quality metrics are computed **per query** and averaged.
+- Uncertainty uses **paired nonparametric bootstrap** (default 5000 resamples).
+- Optional macro (per-law) averaging is reported as a robustness check.
 
 Run
 ---
-python evaluate_three_embeddings.py
+python evaluate_three_embeddings_storylines.py    --ks 1,5,10,20,50,100   --report_path kahm_evaluation_report.md
 
 """
-
 from __future__ import annotations
 
 import argparse
@@ -35,6 +41,8 @@ import os
 import sys
 import gc
 import datetime
+import time
+import json
 from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass
@@ -44,7 +52,7 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2026-02-10-storylines-report-v1"
+SCRIPT_VERSION = "2026-02-19-scientific-q2mb-v2"
 
 
 def _safe_ratio(num: float, denom: float) -> float:
@@ -765,7 +773,275 @@ def build_publication_report_md(
     lines.append("- arXiv 2512.01025: https://arxiv.org/abs/2512.01025")
     lines.append("")
 
+    
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Focused scientific report (no Full-KAHM; focuses on KAHM(query→MB corpus))
+# ---------------------------------------------------------------------------
+
+def build_scientific_report_md(
+    *,
+    report_title: str,
+    args: argparse.Namespace,
+    n_queries: int,
+    n_corpus: int,
+    embedding_dim: int,
+    ks: List[int],
+    summaries_by_k: Dict[int, Dict[str, Dict[str, Tuple[float, Tuple[float, float]]]]],
+    deltas_vs_idf_by_k: Dict[int, Dict[str, Dict[str, Any]]],
+    deltas_vs_mb_by_k: Dict[int, Dict[str, Dict[str, Any]]],
+    macro_summaries_by_k: Dict[int, Dict[str, Dict[str, Tuple[float, Tuple[float, float]]]]],
+    macro_deltas_vs_idf_by_k: Dict[int, Dict[str, Dict[str, Any]]],
+    macro_deltas_vs_mb_by_k: Dict[int, Dict[str, Dict[str, Any]]],
+    timing: Dict[str, Any],
+    threshold_suggestions: Dict[str, Any],
+) -> str:
+    """Generate a publication-ready Markdown report for the focused comparison."""
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ks_sorted = sorted({int(k) for k in ks})
+
+    def _cell(method: str, k: int, metric: str, digits: int = 3) -> str:
+        pt, ci = summaries_by_k[int(k)][method][metric]
+        return _fmt_ci(pt, ci, digits=digits)
+
+    def _dcell(d: Dict[str, Any], digits: int = 3) -> str:
+        return _fmt_delta(float(d["pt"]), tuple(d["ci"]), digits=digits)
+
+    def _ms(v: Any) -> str:
+        try:
+            if v is None:
+                return "n/a"
+            vv = float(v)
+            if not np.isfinite(vv):
+                return "n/a"
+            return f"{vv*1000.0:0.3f} ms"
+        except Exception:
+            return "n/a"
+
+    lines: List[str] = []
+    lines.append(f"# {report_title}")
+    lines.append("")
+    lines.append(
+        f"Generated: {now} | script={os.path.basename(__file__)} | version={SCRIPT_VERSION}"
+    )
+    lines.append("")
+
+    lines.append("## Experimental design")
+    lines.append("")
+    lines.append(
+        "This report evaluates Austrian law retrieval with a fixed sentence corpus. "
+        "KAHM is evaluated strictly as a *query adapter* into a frozen transformer corpus space (Mixedbread)."
+    )
+    lines.append("")
+    lines.append("### Systems compared")
+    lines.append("")
+    lines.append("- **IDF–SVD**: IDF–SVD query encoder → IDF–SVD corpus index (low-cost baseline).")
+    lines.append("- **Mixedbread (true)**: transformer query encoder → Mixedbread corpus index (upper baseline).")
+    lines.append("- **KAHM(query→MB corpus)**: IDF–SVD features → KAHM adapter → Mixedbread corpus index (no transformer on query path).")
+    lines.append("")
+
+    lines.append("### Protocol")
+    lines.append("")
+    lines.append(f"- Queries: {n_queries}")
+    lines.append(f"- Aligned corpus sentences: {n_corpus}")
+    lines.append(f"- Mixedbread embedding dim: {embedding_dim}")
+    lines.append(f"- Cutoffs k: {', '.join(str(k) for k in ks_sorted)}")
+    lines.append(
+        f"- Bootstrap: paired nonparametric, n={int(getattr(args, 'bootstrap_samples', 0))}, seed={int(getattr(args, 'bootstrap_seed', 0))}"
+    )
+    lines.append("")
+
+    lines.append("## Retrieval quality")
+    lines.append("")
+
+    for k in ks_sorted:
+        lines.append(f"### Micro-average (per query) at k={k}")
+        headers = [
+            "Method",
+            "hit@k",
+            "MRR@k (unique laws)",
+            "top1",
+            "majority-acc",
+            "consensus frac",
+            "lift (prior)",
+        ]
+        rows = []
+        for method in ["Mixedbread (true)", "KAHM(query→MB corpus)", "IDF–SVD"]:
+            rows.append(
+                [
+                    method,
+                    _cell(method, k, "hit"),
+                    _cell(method, k, "mrr_ul"),
+                    _cell(method, k, "top1"),
+                    _cell(method, k, "majority"),
+                    _cell(method, k, "cons_frac"),
+                    _cell(method, k, "lift"),
+                ]
+            )
+        lines.append(_md_table(headers, rows))
+        lines.append("")
+
+        lines.append(f"Δ at k={k} (paired bootstrap, mean differences)")
+        headers = ["Comparison", "Δhit", "ΔMRR_ul", "Δtop1", "Δmajority", "Δcons_frac", "Δlift"]
+        d_idf = deltas_vs_idf_by_k[int(k)]
+        d_mb = deltas_vs_mb_by_k[int(k)]
+        rows = [
+            [
+                "KAHM − IDF",
+                _dcell(d_idf["hit"]),
+                _dcell(d_idf["mrr_ul"]),
+                _dcell(d_idf["top1"]),
+                _dcell(d_idf["majority"]),
+                _dcell(d_idf["cons_frac"]),
+                _dcell(d_idf["lift"]),
+            ],
+            [
+                "KAHM − MB",
+                _dcell(d_mb["hit"]),
+                _dcell(d_mb["mrr_ul"]),
+                _dcell(d_mb["top1"]),
+                _dcell(d_mb["majority"]),
+                _dcell(d_mb["cons_frac"]),
+                _dcell(d_mb["lift"]),
+            ],
+        ]
+        lines.append(_md_table(headers, rows))
+        lines.append("")
+
+    # Macro robustness (default k=10 if present)
+    k_macro = 10 if 10 in ks_sorted else ks_sorted[-1]
+    if int(k_macro) in macro_summaries_by_k:
+        lines.append("## Robustness: macro-average (per law)")
+        lines.append("")
+        lines.append(
+            "Macro averages resample laws (labels) rather than queries; this reduces sensitivity to label imbalance. "
+            f"Reported at k={k_macro}."
+        )
+        lines.append("")
+        headers = ["Method", "hit@k", "MRR_ul@k", "top1", "majority-acc"]
+        rows = []
+        for method in ["Mixedbread (true)", "KAHM(query→MB corpus)", "IDF–SVD"]:
+            m = macro_summaries_by_k[int(k_macro)][method]
+            rows.append(
+                [
+                    method,
+                    _fmt_ci(m["hit"][0], m["hit"][1], digits=3),
+                    _fmt_ci(m["mrr_ul"][0], m["mrr_ul"][1], digits=3),
+                    _fmt_ci(m["top1"][0], m["top1"][1], digits=3),
+                    _fmt_ci(m["majority"][0], m["majority"][1], digits=3),
+                ]
+            )
+        lines.append(_md_table(headers, rows))
+        lines.append("")
+
+        md_idf = macro_deltas_vs_idf_by_k[int(k_macro)]
+        md_mb = macro_deltas_vs_mb_by_k[int(k_macro)]
+        headers = ["Comparison", "Δhit", "ΔMRR_ul", "Δtop1", "Δmajority"]
+        rows = [
+            ["KAHM − IDF", _dcell(md_idf["hit"]), _dcell(md_idf["mrr_ul"]), _dcell(md_idf["top1"]), _dcell(md_idf["majority"])],
+            ["KAHM − MB", _dcell(md_mb["hit"]), _dcell(md_mb["mrr_ul"]), _dcell(md_mb["top1"]), _dcell(md_mb["majority"])],
+        ]
+        lines.append(_md_table(headers, rows))
+        lines.append("")
+
+    lines.append("## Compute profile (measured wall-time proxies)")
+    lines.append("")
+    lines.append("Per-query numbers below are steady-state proxies (one-time initialization and warm-up are reported separately).")
+    lines.append("")
+
+    lines.append("### One-time initialization and warm-up (cold-start)")
+    lines.append("")
+    headers = ["Component", "Wall time"]
+    rows = [
+        ["IDF–SVD pipeline load", _ms(timing.get("idf_init_seconds_total"))],
+        ["KAHM init (models + caches)", _ms(timing.get("kahm_query_init_seconds_total"))],
+        ["KAHM warm-up", _ms(timing.get("kahm_query_warmup_seconds_total"))],
+        ["Mixedbread model load", _ms(timing.get("mb_query_init_seconds_total"))],
+        ["Mixedbread warm-up encode", _ms(timing.get("mb_query_warmup_seconds_total"))],
+    ]
+    lines.append(_md_table(headers, rows))
+    lines.append("")
+
+
+    headers = ["Path", "Query source", "Query embed / q", "FAISS search / q", "Total online / q"]
+    rows = [
+        [
+            "IDF–SVD",
+            "model",
+            _ms(timing.get("idf_embed_seconds_per_query")),
+            _ms(timing.get("faiss_idf_search_seconds_per_query")),
+            _ms(timing.get("online_idf_seconds_per_query")),
+        ],
+        [
+            "KAHM(q→MB)",
+            str(timing.get("kahm_query_source", "model")),
+            _ms(timing.get("kahm_query_seconds_per_query")),
+            _ms(timing.get("faiss_kahm_qmb_search_seconds_per_query")),
+            _ms(timing.get("online_kahm_seconds_per_query")),
+        ],
+        [
+            "Mixedbread (true)",
+            str(timing.get("mb_query_source", "npz")),
+            _ms(timing.get("mb_query_seconds_per_query")),
+            _ms(timing.get("faiss_mb_search_seconds_per_query")),
+            _ms(timing.get("online_mb_seconds_per_query")),
+        ],
+    ]
+    lines.append(_md_table(headers, rows))
+    lines.append("")
+
+    lines.append("### Memory footprint proxies")
+    lines.append("")
+    mb_bytes = int(timing.get("corpus_mb_bytes", 0))
+    idf_bytes = int(timing.get("corpus_idf_bytes", 0))
+    lines.append(f"- MB corpus embeddings: {mb_bytes/1e6:0.1f} MB")
+    lines.append(f"- IDF corpus embeddings: {idf_bytes/1e6:0.1f} MB")
+    lines.append("")
+
+    lines.append("## Majority-vote routing (tau recommendation)")
+    lines.append("")
+    min_cov = float(threshold_suggestions.get("coverage_constraint", float("nan")))
+    lines.append(f"Coverage constraint: coverage ≥ {min_cov:0.2f}")
+    lines.append("")
+
+    rec = threshold_suggestions.get("maximize_precision_subject_to_coverage", {})
+    headers = ["Method", "tau*", "coverage", "acc|covered", "majority-acc"]
+    rows = []
+    for method in ["Mixedbread (true)", "KAHM(query→MB corpus)", "IDF–SVD"]:
+        if method in rec:
+            r = rec[method]
+            rows.append(
+                [
+                    method,
+                    f"{float(r['tau']):0.2f}",
+                    f"{float(r['coverage']):0.3f}",
+                    f"{float(r['acc_given_covered']):0.3f}",
+                    f"{float(r['majority_acc']):0.3f}",
+                ]
+            )
+    if rows:
+        lines.append(_md_table(headers, rows))
+        lines.append("")
+
+    lines.append("## Reproducibility")
+    lines.append("")
+    lines.append("Command-line arguments:")
+    lines.append("")
+    try:
+        args_dict = vars(args)
+    except Exception:
+        args_dict = {}
+    lines.append("```json")
+    lines.append(json.dumps(args_dict, indent=2, sort_keys=True, ensure_ascii=False))
+    lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     X = np.asarray(X, dtype=np.float32)
     n = np.linalg.norm(X, axis=1, keepdims=True)
@@ -805,6 +1081,91 @@ def _bootstrap_paired_delta_ci(
     for i in range(int(n_boot)):
         idx = rng.integers(0, n, size=n)
         bs[i] = float(np.mean(d[idx]))
+    lo, hi = np.quantile(bs, [0.025, 0.975])
+    return pt, (float(lo), float(hi))
+
+
+
+def _bootstrap_macro_mean_ci(
+    x: np.ndarray,
+    groups: Sequence[str],
+    *,
+    n_boot: int,
+    seed: int,
+) -> Tuple[float, Tuple[float, float]]:
+    """Macro-average CI by resampling groups (laws) with replacement.
+
+    Macro average = mean over groups of within-group mean.
+    This reduces sensitivity to label imbalance (some laws occur far more often).
+    """
+    x = np.asarray(x, dtype=np.float64)
+    g = np.asarray([str(s) for s in groups], dtype=object)
+    if x.shape[0] != g.shape[0]:
+        raise ValueError(f"macro bootstrap length mismatch: {x.shape} vs {g.shape}")
+    if x.size == 0:
+        return float("nan"), (float("nan"), float("nan"))
+
+    uniq = np.unique(g)
+    # Compute per-group means once
+    means = np.empty(len(uniq), dtype=np.float64)
+    for i, u in enumerate(uniq.tolist()):
+        mask = (g == u)
+        means[i] = float(np.mean(x[mask])) if np.any(mask) else np.nan
+
+    means = means[np.isfinite(means)]
+    if means.size == 0:
+        return float("nan"), (float("nan"), float("nan"))
+
+    pt = float(np.mean(means))
+    rng = np.random.default_rng(int(seed))
+    bs = np.empty(int(n_boot), dtype=np.float64)
+    m = int(means.size)
+    for b in range(int(n_boot)):
+        idx = rng.integers(0, m, size=m)
+        bs[b] = float(np.mean(means[idx]))
+    lo, hi = np.quantile(bs, [0.025, 0.975])
+    return pt, (float(lo), float(hi))
+
+
+def _bootstrap_macro_paired_delta_ci(
+    a: np.ndarray,
+    b: np.ndarray,
+    groups: Sequence[str],
+    *,
+    n_boot: int,
+    seed: int,
+) -> Tuple[float, Tuple[float, float]]:
+    """Macro paired delta CI by resampling groups with replacement.
+
+    For each group, compute mean(a-b) within group; macro delta is the mean
+    of these group-level deltas.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    g = np.asarray([str(s) for s in groups], dtype=object)
+    if a.shape != b.shape or a.shape[0] != g.shape[0]:
+        raise ValueError("macro paired delta: shape mismatch")
+    if a.size == 0:
+        return float("nan"), (float("nan"), float("nan"))
+
+    d = a - b
+    uniq = np.unique(g)
+    deltas = np.empty(len(uniq), dtype=np.float64)
+    for i, u in enumerate(uniq.tolist()):
+        mask = (g == u)
+        deltas[i] = float(np.mean(d[mask])) if np.any(mask) else np.nan
+
+    deltas = deltas[np.isfinite(deltas)]
+    if deltas.size == 0:
+        return float("nan"), (float("nan"), float("nan"))
+
+    pt = float(np.mean(deltas))
+    rng = np.random.default_rng(int(seed))
+    bs = np.empty(int(n_boot), dtype=np.float64)
+    m = int(deltas.size)
+    for i in range(int(n_boot)):
+        idx = rng.integers(0, m, size=m)
+        bs[i] = float(np.mean(deltas[idx]))
     lo, hi = np.quantile(bs, [0.025, 0.975])
     return pt, (float(lo), float(hi))
 
@@ -929,6 +1290,40 @@ def load_query_npz_bundle(path: str) -> Dict[str, np.ndarray]:
     return {"query_ids": qids, "emb": l2_normalize_rows(emb)}
 
 
+
+def load_query_embeddings_from_npz(path: str, ids: Sequence[str]) -> Optional[np.ndarray]:
+    """Load query embeddings from an NPZ file and align to the provided query ids.
+
+    Returns:
+        (N, D) float32 array aligned to `ids`, or None if any id is missing.
+
+    Notes:
+        - The NPZ must contain unique query ids.
+        - This function is intentionally strict: if even one requested id is absent, it returns None
+          so the caller can try another NPZ candidate.
+    """
+    bundle = load_query_npz_bundle(path)
+    qids = bundle["query_ids"]
+    emb = bundle["emb"]  # already L2-normalized
+
+    # Build index mapping (object dtype string keys).
+    idx_map: Dict[str, int] = {str(q): int(i) for i, q in enumerate(qids.tolist())}
+
+    out_rows: List[np.ndarray] = []
+    for q in ids:
+        key = str(q)
+        j = idx_map.get(key, None)
+        if j is None:
+            return None
+        out_rows.append(emb[j])
+
+    if not out_rows:
+        return np.zeros((0, int(emb.shape[1])), dtype=np.float32)
+
+    return np.vstack(out_rows).astype(np.float32, copy=False)
+
+
+
 def extract_query_ids(qs: List[Any]) -> List[str]:
     """Extract query_id for alignment with precomputed query embedding NPZ files."""
     keys = ["query_id", "id", "qid", "uid"]
@@ -1021,16 +1416,25 @@ def align_by_common_sentence_ids(
     df: pd.DataFrame,
     mb: Dict[str, np.ndarray],
     idf: Dict[str, np.ndarray],
-    kahm: Dict[str, np.ndarray],
 ) -> Dict[str, np.ndarray]:
+    """Align df/MB/IDF bundles by common sentence_ids.
+
+    We require a common set of sentence_ids so that top-k retrieval indices can be
+    mapped back to the same law labels (law_type) for evaluation.
+
+    Notes
+    -----
+    - KAHM(query→MB) does **not** require a separate KAHM corpus embedding bundle.
+      KAHM produces *query* embeddings directly in the Mixedbread space and is
+      evaluated against the frozen MB corpus index.
+    """
     s_df = df["sentence_id"].astype(np.int64).to_numpy()
     s_mb = mb["sentence_ids"].astype(np.int64)
     s_idf = idf["sentence_ids"].astype(np.int64)
-    s_k = kahm["sentence_ids"].astype(np.int64)
 
-    common = np.intersect1d(np.intersect1d(np.intersect1d(s_df, s_mb), s_idf), s_k)
+    common = np.intersect1d(np.intersect1d(s_df, s_mb), s_idf)
     if common.size == 0:
-        raise ValueError("No common sentence_ids across df/MB/IDF/KAHM bundles")
+        raise ValueError("No common sentence_ids across df/MB/IDF bundles")
 
     def _subset(ids: np.ndarray, emb: np.ndarray, common_ids: np.ndarray) -> np.ndarray:
         pos = {int(s): i for i, s in enumerate(ids.tolist())}
@@ -1039,14 +1443,18 @@ def align_by_common_sentence_ids(
 
     emb_mb = _subset(s_mb, mb["emb"], common)
     emb_idf = _subset(s_idf, idf["emb"], common)
-    emb_k = _subset(s_k, kahm["emb"], common)
 
-    df2 = df.set_index("sentence_id", drop=False)
-    sub = df2.loc[common]
-    law = sub["law_type"].astype(str).to_numpy()
+    # df is already unique by sentence_id (validated in load_corpus_parquet)
+    pos_df = {int(s): i for i, s in enumerate(s_df.tolist())}
+    df_idx = np.asarray([pos_df[int(s)] for s in common.tolist()], dtype=np.int64)
+    law = df.iloc[df_idx]["law_type"].astype(str).to_numpy()
 
-    return {"sentence_ids": common, "law": law, "emb_mb": emb_mb, "emb_idf": emb_idf, "emb_kahm": emb_k}
-
+    return {
+        "sentence_ids": common,
+        "law": law,
+        "emb_mb": emb_mb,
+        "emb_idf": emb_idf,
+    }
 
 def load_query_set(module_attr: str) -> List[Dict[str, Any]]:
     if "." not in module_attr:
@@ -1980,7 +2388,6 @@ def main() -> None:
     p.add_argument("--corpus_parquet", default="ris_sentences.parquet")
     p.add_argument("--semantic_npz", default="embedding_index.npz", help="Mixedbread corpus embeddings")
     p.add_argument("--idf_svd_npz", default="embedding_index_idf_svd.npz")
-    p.add_argument("--kahm_corpus_npz", default="embedding_index_kahm_mixedbread_approx.npz")
     p.add_argument("--idf_svd_model", default="idf_svd_model.joblib")
 
     p.add_argument(
@@ -2006,9 +2413,49 @@ def main() -> None:
     p.add_argument("--kahm_mode", default="soft")
     p.add_argument("--kahm_batch", type=int, default=1024)
     p.add_argument("--query_set", default="query_set.TEST_QUERY_SET")
+
+
+    # Evaluation hygiene
+    if hasattr(argparse, "BooleanOptionalAction"):
+        p.add_argument(
+            "--drop_empty_queries",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Drop queries with empty text or empty consensus labels (recommended for scientific comparability).",
+        )
+        p.add_argument(
+            "--mb_force_online",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Force on-the-fly Mixedbread query encoding (enables timing a true transformer query path).",
+        )
+    else:
+        p.add_argument(
+            "--drop_empty_queries",
+            type=_str2bool,
+            default=True,
+            help="Drop queries with empty text or empty consensus labels (recommended for scientific comparability).",
+        )
+        p.add_argument(
+            "--mb_force_online",
+            type=_str2bool,
+            default=True,
+            help="Force on-the-fly Mixedbread query encoding (enables timing a true transformer query path).",
+        )
+
     p.add_argument(
-        "--kahm_query_embeddings_npz",
-        default="test_queries_kahm_embeddings.npz",
+        "--results_json_path",
+        default="",
+        help="Optional: write a machine-readable JSON with metrics, CIs, deltas, and timing info.",
+    )
+    p.add_argument(
+        "--topk_dump_path",
+        default="",
+        help="Optional: write per-query top-k law predictions (CSV) for error analysis.",
+    )
+    p.add_argument(
+    "--kahm_query_embeddings_npz",
+        default="",
         help=(
             "precomputed KAHM query embeddings (.npz) with key 'embeddings'. "
             "If provided, the script will skip KAHM query embedding extraction and load from this file."
@@ -2018,7 +2465,7 @@ def main() -> None:
 
 
     p.add_argument("--k", type=int, default=10)
-    p.add_argument("--ks", default="10,20,50,100", help="Comma-separated retrieval cutoffs to evaluate (overrides --k for report tables).")
+    p.add_argument("--ks", default="1,5,10,20", help="Comma-separated retrieval cutoffs to evaluate (overrides --k for report tables).")
     p.add_argument("--predominance_fraction", type=float, default=0.1)
     p.add_argument(
         "--majority_thresholds",
@@ -2037,7 +2484,7 @@ def main() -> None:
     )
 
     p.add_argument("--mixedbread_model", default="mixedbread-ai/deepset-mxbai-embed-de-large-v1")
-    p.add_argument("--device", type=str, default="auto", help="Device for Mixedbread embedding model (e.g., 'cpu', 'cuda').")
+    p.add_argument("--device", type=str, default="cpu", help="Device for Mixedbread embedding model (e.g., 'cpu', 'cuda').")
     p.add_argument("--query_prefix", default="query: ")
     p.add_argument("--mb_query_batch", type=int, default=1)
 
@@ -2117,10 +2564,29 @@ def main() -> None:
     qs = load_query_set(args.query_set)
     texts = extract_query_texts(qs)
     consensus = extract_consensus_laws(qs)
+    query_ids = extract_query_ids(qs)
     n_q = len(qs)
     n_empty_text = sum(1 for t in texts if not t)
     if n_empty_text:
         print(f"WARNING: {n_empty_text}/{n_q} queries have empty text (check query_set keys).", flush=True)
+
+    # Extract query_ids early so filtering stays consistent across methods.
+
+    if bool(getattr(args, 'drop_empty_queries', True)):
+        mask = []
+        for t, c in zip(texts, consensus):
+            tt = str(t).strip() if t is not None else ''
+            cc = str(c).strip() if c is not None else ''
+            mask.append(bool(tt) and bool(cc))
+        if not all(mask):
+            kept = int(sum(mask))
+            dropped = int(len(mask) - kept)
+            texts = [t for t, m in zip(texts, mask) if m]
+            consensus = [c for c, m in zip(consensus, mask) if m]
+            query_ids = [q for q, m in zip(query_ids, mask) if m]
+            n_q = len(texts)
+            print(f"Filtered queries: dropped {dropped}, kept {kept} (non-empty text + consensus).", flush=True)
+
 
     # Apply thread limits early (before importing torch/faiss) to avoid oversubscription
     # and reduce the probability of native-library crashes under high memory pressure.
@@ -2145,20 +2611,17 @@ def main() -> None:
     df = load_corpus_parquet(args.corpus_parquet)
     mb = load_npz_bundle(args.semantic_npz)
     idf = load_npz_bundle(args.idf_svd_npz)
-    kahm = load_npz_bundle(args.kahm_corpus_npz)
-    aligned = align_by_common_sentence_ids(df, mb, idf, kahm)
+    # Note: args.kahm_corpus_npz is deprecated/ignored in this script version (Full-KAHM disabled).
+    aligned = align_by_common_sentence_ids(df, mb, idf)
 
     law_arr = aligned["law"]
     emb_mb = aligned["emb_mb"]
     emb_idf = aligned["emb_idf"]
-    emb_k = aligned["emb_kahm"]
 
     print(f"Loaded query set: {args.query_set} (n={n_q})", flush=True)
     print(f"Aligned corpora: common sentence_ids={aligned['sentence_ids'].size}")
     print(f"  MB corpus:   {emb_mb.shape}")
     print(f"  IDF corpus:  {emb_idf.shape}")
-    print(f"  KAHM corpus: {emb_k.shape}")
-
 
     # Validate query labels against the aligned corpus to avoid silently meaningless metrics.
     cons_clean = [str(x).strip() for x in consensus]
@@ -2167,24 +2630,74 @@ def main() -> None:
         raise ValueError(f"{n_empty_cons}/{len(cons_clean)} queries have empty consensus law labels.")
 
     law_set = set(str(x) for x in law_arr.tolist())
-    missing = sorted({x for x in cons_clean if x} - law_set)
-    if missing:
+    present_mask = [c in law_set for c in cons_clean]
+    if not all(present_mask):
+        missing = sorted({c for c, ok in zip(cons_clean, present_mask) if (not ok) and c})
         preview = ", ".join(missing[:10])
         more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
-        raise ValueError(
-            "Some consensus law labels are not present in the aligned corpus law set. "
-            f"Missing={len(missing)}: {preview}{more}"
+        dropped = int(len(present_mask) - sum(present_mask))
+        print(
+            "WARNING: Dropping queries with consensus labels not present in the aligned corpus. "
+            f"dropped={dropped}; missing_labels={len(missing)}: {preview}{more}",
+            flush=True,
         )
+        texts = [t for t, ok in zip(texts, present_mask) if ok]
+        consensus = [c for c, ok in zip(consensus, present_mask) if ok]
+        query_ids = [q for q, ok in zip(query_ids, present_mask) if ok]
+        cons_clean = [c for c, ok in zip(cons_clean, present_mask) if ok]
+        n_q = len(texts)
+
+    # ---------------------------------------------------------------------
+    # Cutoffs: parse --ks and ensure --k is included so single-k storylines
+    # never reference a cutoff that was not retrieved.
+    def _parse_ks(s: str) -> List[int]:
+        parts = [p.strip() for p in str(s).split(",") if p.strip()]
+        out: List[int] = []
+        for p in parts:
+            try:
+                out.append(int(p))
+            except Exception:
+                raise ValueError(f"Invalid --ks entry: {p!r}. Expected comma-separated integers.")
+        return out
+
+    ks: List[int] = _parse_ks(getattr(args, "ks", ""))
+    if not ks:
+        ks = [int(getattr(args, "k", 10))]
+
+    k = int(getattr(args, "k", 10))
+    if k <= 0:
+        raise ValueError("--k must be positive.")
+    if k not in ks:
+        ks.append(k)
+
+    ks_report = sorted({int(x) for x in ks if int(x) > 0})
+    if not ks_report:
+        raise ValueError("No valid cutoffs in --ks / --k (must be positive integers).")
+    k_max = int(max(ks_report))
 
     # Embed queries (done BEFORE building FAISS indices to reduce peak memory and
-    # to initialize torch before faiss on macOS).
+    # to initialize torch before faiss on macOS\)\.
+
+    timing: Dict[str, Any] = {}
     print("\nEmbedding queries with IDF–SVD ...", flush=True)
+    # Separate one-time pipeline load (cold-start) from steady-state transform time.
+    _t0 = time.perf_counter()
     idf_pipe = load_idf_svd_model(args.idf_svd_model)
+    timing['idf_init_seconds_total'] = float(time.perf_counter() - _t0)
+    timing['idf_init_seconds_per_query'] = float(timing['idf_init_seconds_total'] / max(1, len(texts)))
+
+    _t0 = time.perf_counter()
     q_idf = embed_queries_idf_svd(idf_pipe, texts)
+    timing['idf_embed_seconds_total'] = float(time.perf_counter() - _t0)
+    timing['idf_embed_seconds_per_query'] = float(timing['idf_embed_seconds_total'] / max(1, len(texts)))
+
+    timing['idf_total_seconds_total'] = float(timing['idf_init_seconds_total'] + timing['idf_embed_seconds_total'])
+    timing['idf_total_seconds_per_query'] = float(timing['idf_total_seconds_total'] / max(1, len(texts)))
 
     # --- Query embeddings in MB space ---
     # Fast path: load exact precomputed KAHM query embeddings.
-    if getattr(args, "kahm_query_embeddings_npz", None):
+    if str(getattr(args, 'kahm_query_embeddings_npz', '')).strip():
+        _t0 = time.perf_counter()
         npz_path = str(args.kahm_query_embeddings_npz)
         if not os.path.exists(npz_path):
             raise FileNotFoundError(f"--kahm_query_embeddings_npz not found: {npz_path}")
@@ -2196,120 +2709,296 @@ def main() -> None:
             raise ValueError(f"Precomputed embeddings shape mismatch: got {q_kahm.shape}, expected (N,D) with N={len(texts)}")
         q_kahm = l2_normalize_rows(q_kahm)
         print(f"Loaded precomputed KAHM query embeddings from {npz_path}", flush=True)
+
+        timing['kahm_query_load_seconds_total'] = float(time.perf_counter() - _t0)
+        timing['kahm_query_load_seconds_per_query'] = float(timing['kahm_query_load_seconds_total'] / max(1, len(texts)))
+
+        # For NPZ sources, there is no meaningful online embedding measurement in this run.
+        timing['kahm_query_init_seconds_total'] = float('nan')
+        timing['kahm_query_init_seconds_per_query'] = float('nan')
+        timing['kahm_query_warmup_seconds_total'] = float('nan')
+        timing['kahm_query_embed_seconds_total'] = float('nan')
+        timing['kahm_query_embed_seconds_per_query'] = float('nan')
+        timing['kahm_query_total_seconds_total'] = float('nan')
+        timing['kahm_query_total_seconds_per_query'] = float('nan')
+
+        # Backward-compatible keys used elsewhere in the script.
+        timing['kahm_query_seconds_total'] = float('nan')
+        timing['kahm_query_seconds_per_query'] = float('nan')
+        timing['kahm_query_source'] = 'npz'
     else:
-        print("Embedding queries with KAHM (IDF→MB space) ...", flush=True)
+        print("Embedding queries with KAHM (text→MB space) ...", flush=True)
 
-        # NOTE: Restricted to query_model only.
-        kahm_strategy = "query_model"
         q_path = str(getattr(args, "kahm_query_model", "")).strip()
-
         if not q_path:
-            raise ValueError("--kahm_query_model is required (kahm_query_strategy is restricted to 'query_model').")
-
+            raise ValueError("--kahm_query_model is required.")
         if not _kahm_model_path_exists(q_path):
             raise FileNotFoundError(f"--kahm_query_model not found: {q_path}")
 
-        # Directory path => distance-gated combination of multiple query regressors
-        if os.path.isdir(q_path):
-            q_models = load_kahm_models_from_dir(q_path)
+        # Warm-up size (excluded from measured embed time).
+        n_warm = int(min(len(texts), max(1, min(8, int(getattr(args, 'kahm_batch', 2048))))))
 
-            # Optional: warm caches for inference speed if using the fast module
+        # Directory path => distance-gated combination of multiple query regressors.
+        if os.path.isdir(q_path):
+            # Use the same inference path as production (kahm_inference_embedder.py) for 1:1 timing.
             try:
-                from combine_kahm_regressors_generalized_fast import prepare_kahm_model_for_inference
-                for _m in q_models.values():
-                    prepare_kahm_model_for_inference(_m, materialize_classifier=True, cache_cluster_centers=True, show_progress=False)
+                from kahm_inference_embedder import KahmQueryEmbedder  # type: ignore
+            except Exception:
+                # Robust fallback: load sibling kahm_inference_embedder.py via file path.
+                import importlib.util
+                _p = os.path.join(os.path.dirname(__file__), "kahm_inference_embedder.py")
+                spec = importlib.util.spec_from_file_location("kahm_inference_embedder", _p)
+                if spec is None or spec.loader is None:
+                    raise ImportError("Could not import KahmQueryEmbedder (kahm_inference_embedder.py).")
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+                KahmQueryEmbedder = getattr(mod, "KahmQueryEmbedder")
+
+            _t_init = time.perf_counter()
+            kahm_embedder = KahmQueryEmbedder(
+                idf_svd_model_path=str(args.idf_svd_model),
+                kahm_query_model_dir=str(q_path),
+                kahm_mode=str(args.kahm_mode),
+                batch_size=int(args.kahm_batch),
+                materialize_classifier=True,
+                cache_cluster_centers=True,
+                tie_break="first",
+                show_progress=bool(args.kahm_show_progress),
+            )
+            timing['kahm_query_init_seconds_total'] = float(time.perf_counter() - _t_init)
+            timing['kahm_query_init_seconds_per_query'] = float(timing['kahm_query_init_seconds_total'] / max(1, len(texts)))
+
+            # Warm-up (excluded from measured embed time).
+            try:
+                _t_w = time.perf_counter()
+                _ = kahm_embedder.embed(texts[:n_warm])
+                timing['kahm_query_warmup_seconds_total'] = float(time.perf_counter() - _t_w)
+            except Exception:
+                timing['kahm_query_warmup_seconds_total'] = float('nan')
+
+            # Measured embedding (steady-state proxy).
+            _t_embed = time.perf_counter()
+            q_kahm, q_chosen, _q_score, q_names = kahm_embedder.embed(texts)
+            timing['kahm_query_embed_seconds_total'] = float(time.perf_counter() - _t_embed)
+            timing['kahm_query_embed_seconds_per_query'] = float(timing['kahm_query_embed_seconds_total'] / max(1, len(texts)))
+
+            # Diagnostics: show most frequently chosen query sub-models (top 8)
+            try:
+                c = Counter(np.asarray(q_chosen, dtype=np.int64).tolist())
+                top_items = sorted(c.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                top = ", ".join([f"{q_names[i]}:{n}" for i, n in top_items])
+                more = "" if len(c) <= 8 else f" (+{len(c)-8} more)"
+                print(f"  Query-model group (KahmQueryEmbedder): used {len(q_names)} models (mix: {top}{more})", flush=True)
             except Exception:
                 pass
 
-            q_kahm, q_chosen, _q_score, q_names = kahm_regress_distance_gated_multi_models(
-                q_idf,
-                models=q_models,
-                mode=args.kahm_mode,
-                batch_size=args.kahm_batch,
-                show_progress=bool(args.kahm_show_progress),
-            )
-            q_kahm = l2_normalize_rows(np.asarray(q_kahm, dtype=np.float32))
-
-            # Diagnostics: show most frequently chosen query sub-models (top 8)
-            c = Counter(np.asarray(q_chosen, dtype=np.int64).tolist())
-            top_items = sorted(c.items(), key=lambda kv: kv[1], reverse=True)[:8]
-            top = ", ".join([f"{q_names[i]}:{n}" for i, n in top_items])
-            more = "" if len(c) <= 8 else f" (+{len(c)-8} more)"
-            print(f"  Query-model group (distance-gated): used {len(q_names)} models (mix: {top}{more})", flush=True)
         else:
+            # Single regressor: keep the original implementation, but time the full text→MB path.
+            _t_init = time.perf_counter()
             kahm_q_model = load_kahm_model(q_path)
+
+            # Optional: warm caches for inference speed if using the fast module.
+            try:
+                from combine_kahm_regressors_generalized_fast import prepare_kahm_model_for_inference
+                prepare_kahm_model_for_inference(
+                    kahm_q_model,
+                    materialize_classifier=True,
+                    cache_cluster_centers=True,
+                    show_progress=False,
+                )
+            except Exception:
+                pass
+
+            timing['kahm_query_init_seconds_total'] = float(time.perf_counter() - _t_init)
+            timing['kahm_query_init_seconds_per_query'] = float(timing['kahm_query_init_seconds_total'] / max(1, len(texts)))
+
+            # Warm-up (excluded)
+            try:
+                _t_w = time.perf_counter()
+                _Xw = embed_queries_idf_svd(idf_pipe, texts[:n_warm])
+                _ = kahm_regress_batched_normalized(
+                    kahm_q_model,
+                    _Xw,
+                    mode=args.kahm_mode,
+                    batch_size=int(min(int(args.kahm_batch), n_warm)),
+                    show_progress=False,
+                )
+                timing['kahm_query_warmup_seconds_total'] = float(time.perf_counter() - _t_w)
+            except Exception:
+                timing['kahm_query_warmup_seconds_total'] = float('nan')
+
+            _t_embed = time.perf_counter()
+            X_k = embed_queries_idf_svd(idf_pipe, texts)
             q_kahm = kahm_regress_batched_normalized(
                 kahm_q_model,
-                q_idf,
+                X_k,
                 mode=args.kahm_mode,
                 batch_size=args.kahm_batch,
                 show_progress=bool(args.kahm_show_progress),
             )
+            timing['kahm_query_embed_seconds_total'] = float(time.perf_counter() - _t_embed)
+            timing['kahm_query_embed_seconds_per_query'] = float(timing['kahm_query_embed_seconds_total'] / max(1, len(texts)))
+
+        timing['kahm_query_total_seconds_total'] = float(timing['kahm_query_init_seconds_total'] + timing['kahm_query_embed_seconds_total'])
+        timing['kahm_query_total_seconds_per_query'] = float(timing['kahm_query_total_seconds_total'] / max(1, len(texts)))
+
+        # Backward-compatible keys used elsewhere in the script.
+        timing['kahm_query_seconds_total'] = float(timing['kahm_query_embed_seconds_total'])
+        timing['kahm_query_seconds_per_query'] = float(timing['kahm_query_embed_seconds_per_query'])
+        timing['kahm_query_source'] = 'model'
+
     print("Embedding queries with Mixedbread ...", flush=True)
-    query_ids = extract_query_ids(qs)
     # Prefer precomputed NPZ embeddings (train/test split) to keep evaluation transformer-free.
+    _t0 = time.perf_counter()
     npz_candidates: List[str] = []
     if str(getattr(args, "mb_query_npz", "")).strip():
         npz_candidates.append(str(args.mb_query_npz))
     # Heuristic: use both train+test NPZ; loader will pick those that contain required IDs.
     npz_candidates.extend([str(args.mb_query_npz_test), str(args.mb_query_npz_train)])
 
-    q_mb = load_mb_query_embeddings_for_ids(query_ids=query_ids, npz_paths=npz_candidates)
+    q_mb: Optional[np.ndarray] = None
+    if not bool(getattr(args, "mb_force_online", False)):
+        for pth in npz_candidates:
+            if not pth or not os.path.exists(pth):
+                continue
+            try:
+                q_mb = load_query_embeddings_from_npz(pth, ids=list(query_ids))
+                if q_mb is not None:
+                    print(f"Loaded Mixedbread query embeddings from {pth}", flush=True)
+                    break
+            except Exception:
+                continue
 
     if q_mb is not None:
-        print(f"  Loaded Mixedbread query embeddings from NPZ (paths tried: {', '.join([p for p in npz_candidates if p and os.path.exists(p)])})", flush=True)
+        q_mb = l2_normalize_rows(np.asarray(q_mb, dtype=np.float32))
+        timing['mb_query_load_seconds_total'] = float(time.perf_counter() - _t0)
+        timing['mb_query_load_seconds_per_query'] = float(timing['mb_query_load_seconds_total'] / max(1, len(texts)))
+
+        timing['mb_query_init_seconds_total'] = float('nan')
+        timing['mb_query_init_seconds_per_query'] = float('nan')
+        timing['mb_query_warmup_seconds_total'] = float('nan')
+        timing['mb_query_embed_seconds_total'] = float('nan')
+        timing['mb_query_embed_seconds_per_query'] = float('nan')
+        timing['mb_query_total_seconds_total'] = float('nan')
+        timing['mb_query_total_seconds_per_query'] = float('nan')
+
+        # Backward-compatible keys used elsewhere in the script.
+        timing['mb_query_seconds_total'] = float('nan')
+        timing['mb_query_seconds_per_query'] = float('nan')
+        timing['mb_query_source'] = 'npz'
     else:
-        if bool(getattr(args, "mb_query_npz_required", False)):
+        if bool(getattr(args, "mb_query_npz_required", False)) and not bool(getattr(args, "mb_force_online", False)):
             raise RuntimeError(
-                "mb_query_npz_required was set, but Mixedbread query embeddings could not be loaded "
-                "for all query_ids from the provided NPZ files."
+                "No Mixedbread query NPZ found for required IDs. Either provide --mb_query_npz/--mb_query_npz_{train,test}, "
+                "or enable --mb_force_online to compute embeddings on the fly."
             )
-        print("  NPZ not available or missing query_ids; falling back to on-the-fly Mixedbread encoding.", flush=True)
-        q_mb = embed_queries_mixedbread(
-            model_name=args.mixedbread_model,
-            device=choose_device(args.device),
-            dim=int(emb_mb.shape[1]),
-            query_prefix=args.query_prefix,
-            texts=texts,
+
+        # Online path: instantiate transformer ONCE, warm-up once, then time only encode+postproc.
+        from sentence_transformers import SentenceTransformer
+
+        mb_device = choose_device(args.device)
+        dim = int(emb_mb.shape[1])
+        q_texts = [str(args.query_prefix) + t for t in texts]
+
+        _t_init = time.perf_counter()
+        mb_model = SentenceTransformer(str(args.mixedbread_model), device=mb_device, truncate_dim=int(dim))
+        timing['mb_query_init_seconds_total'] = float(time.perf_counter() - _t_init)
+        timing['mb_query_init_seconds_per_query'] = float(timing['mb_query_init_seconds_total'] / max(1, len(texts)))
+
+        # Warm-up (excluded)
+        n_warm = int(min(len(q_texts), max(1, min(8, int(getattr(args, 'mb_query_batch', 64))))))
+        try:
+            _t_w = time.perf_counter()
+            _ = mb_model.encode(
+                q_texts[:n_warm],
+                batch_size=int(min(int(args.mb_query_batch), n_warm)),
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+            )
+            timing['mb_query_warmup_seconds_total'] = float(time.perf_counter() - _t_w)
+        except Exception:
+            timing['mb_query_warmup_seconds_total'] = float('nan')
+
+        _t_embed = time.perf_counter()
+        Y = mb_model.encode(
+            q_texts,
             batch_size=int(args.mb_query_batch),
             show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
         )
+        timing['mb_query_embed_seconds_total'] = float(time.perf_counter() - _t_embed)
+        timing['mb_query_embed_seconds_per_query'] = float(timing['mb_query_embed_seconds_total'] / max(1, len(texts)))
 
-    # Build/search FAISS indices sequentially to reduce peak RSS.
-    # Parse retrieval cutoffs for the report (multi-k evaluation).
-    _ks_raw = str(getattr(args, "ks", "")).strip()
-    ks = [int(x.strip()) for x in _ks_raw.split(",") if x.strip()] if _ks_raw else []
-    if not ks:
-        ks = [int(args.k)]
-    ks = sorted({int(x) for x in ks if int(x) > 0})
-    if not ks:
-        raise ValueError("At least one positive k is required")
-    k_max = int(max(ks))
-    # Keep `k` for downstream diagnostics (legacy code paths).
-    k = int(k_max)
+        # Cleanup transformer to reduce peak memory.
+        del mb_model
+        gc.collect()
+
+        Y = np.asarray(Y, dtype=np.float32)
+        if Y.ndim != 2:
+            raise ValueError(f"Mixedbread encode output must be 2D; got {Y.shape}")
+        if Y.shape[1] != int(dim):
+            if Y.shape[1] > int(dim):
+                Y = Y[:, : int(dim)]
+            else:
+                raise ValueError(f"Mixedbread embedding dim mismatch: got {Y.shape[1]}, expected {dim}")
+        q_mb = l2_normalize_rows(Y)
+
+        timing['mb_query_total_seconds_total'] = float(timing['mb_query_init_seconds_total'] + timing['mb_query_embed_seconds_total'])
+        timing['mb_query_total_seconds_per_query'] = float(timing['mb_query_total_seconds_total'] / max(1, len(texts)))
+
+        # Backward-compatible keys used elsewhere in the script.
+        timing['mb_query_seconds_total'] = float(timing['mb_query_embed_seconds_total'])
+        timing['mb_query_seconds_per_query'] = float(timing['mb_query_embed_seconds_per_query'])
+        timing['mb_query_source'] = 'online'
+
     print("\nBuilding FAISS indices and searching ...", flush=True)
-
     # IDF retrieval
+    _t0 = time.perf_counter()
     index_idf = build_faiss_index(emb_idf, n_threads=(int(args.threads) if int(args.threads) > 0 else None))
+    timing['faiss_idf_build_seconds'] = float(time.perf_counter() - _t0)
+    _t0 = time.perf_counter()
     _, idf_idx = faiss_search(index_idf, q_idf, k_max)
+    timing['faiss_idf_search_seconds_total'] = float(time.perf_counter() - _t0)
+    timing['faiss_idf_search_seconds_per_query'] = float(timing['faiss_idf_search_seconds_total'] / max(1, len(texts)))
     del index_idf
     gc.collect()
     # IDF corpus embeddings no longer needed beyond this point
+    timing['corpus_idf_bytes'] = int(getattr(emb_idf, 'nbytes', 0))
     del emb_idf
     gc.collect()
-
     # MB retrieval + KAHM(query→MB) retrieval share the same MB corpus
+    _t0 = time.perf_counter()
     index_mb = build_faiss_index(emb_mb, n_threads=(int(args.threads) if int(args.threads) > 0 else None))
+    timing['faiss_mb_build_seconds'] = float(time.perf_counter() - _t0)
+
+    _t0 = time.perf_counter()
     _, mb_idx = faiss_search(index_mb, q_mb, k_max)
+    timing['faiss_mb_search_seconds_total'] = float(time.perf_counter() - _t0)
+    timing['faiss_mb_search_seconds_per_query'] = float(timing['faiss_mb_search_seconds_total'] / max(1, len(texts)))
+
+    _t0 = time.perf_counter()
     _, kahm_qmb_idx = faiss_search(index_mb, q_kahm, k_max)
+    timing['faiss_kahm_qmb_search_seconds_total'] = float(time.perf_counter() - _t0)
+    timing['faiss_kahm_qmb_search_seconds_per_query'] = float(timing['faiss_kahm_qmb_search_seconds_total'] / max(1, len(texts)))
     del index_mb
     gc.collect()
 
-    # Full-KAHM retrieval (search KAHM corpus)
-    index_k = build_faiss_index(emb_k, n_threads=(int(args.threads) if int(args.threads) > 0 else None))
-    _, kahm_full_idx = faiss_search(index_k, q_kahm, k_max)
-    del index_k
-    gc.collect()
+    # Derived online timing proxies (per query)
+    timing['online_idf_seconds_per_query'] = float(timing.get('idf_embed_seconds_per_query', float('nan')) + timing.get('faiss_idf_search_seconds_per_query', float('nan')))
+    timing['online_kahm_seconds_per_query'] = float('nan')
+    if str(timing.get('kahm_query_source', '')) == 'model':
+        timing['online_kahm_seconds_per_query'] = float(
+            timing.get('kahm_query_seconds_per_query', float('nan'))
+            + timing.get('faiss_kahm_qmb_search_seconds_per_query', float('nan'))
+        )
+    if str(timing.get('mb_query_source', '')) == 'online':
+        timing['online_mb_seconds_per_query'] = float(timing.get('mb_query_seconds_per_query', float('nan')) + timing.get('faiss_mb_search_seconds_per_query', float('nan')))
+    else:
+        timing['online_mb_seconds_per_query'] = float('nan')
+
+    timing['corpus_mb_bytes'] = int(getattr(emb_mb, 'nbytes', 0))
 
     pred_frac = float(args.predominance_fraction)
     n_boot = int(args.bootstrap_samples)
@@ -2318,14 +3007,18 @@ def main() -> None:
     mb_pq = compute_per_query_metrics(idx=mb_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
     idf_pq = compute_per_query_metrics(idx=idf_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
     kahm_qmb_pq = compute_per_query_metrics(idx=kahm_qmb_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
-    kahm_full_pq = compute_per_query_metrics(idx=kahm_full_idx, law_arr=law_arr, consensus_laws=consensus, k=k, predominance_fraction=pred_frac)
 
     # -------------------------------------------------------------------------
     # Multi-k summaries for the *focused* report (MRR@k over unique laws + Top-1).
-    ks_report = sorted({int(x) for x in ks})
+    # ks_report already computed earlier from --ks/--k
     summaries_by_k: Dict[int, Dict[str, Dict[str, Tuple[float, Tuple[float, float]]]]] = {}
     deltas_vs_idf_by_k: Dict[int, Dict[str, Dict[str, Any]]] = {}
     deltas_vs_mb_by_k: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
+    # Macro (per-law) robustness: resample laws, not queries
+    macro_summaries_by_k: Dict[int, Dict[str, Dict[str, Tuple[float, Tuple[float, float]]]]] = {}
+    macro_deltas_vs_idf_by_k: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    macro_deltas_vs_mb_by_k: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
     def _summ_key(pq: PerQuery, *, base_seed: int) -> Dict[str, Tuple[float, Tuple[float, float]]]:
         return {
@@ -2350,7 +3043,47 @@ def main() -> None:
             "KAHM(query→MB corpus)": _summ_key(kahm_qmb_pq_kk, base_seed=base + 30),
         }
 
-                # Paired deltas: KAHM adapter vs baselines.
+        # Macro (per-law) summaries for robustness
+        def _macro_key(pq: PerQuery, *, base_seed: int) -> Dict[str, Tuple[float, Tuple[float, float]]]:
+            return {
+                "hit": _bootstrap_macro_mean_ci(pq.hit, consensus, n_boot=n_boot, seed=base_seed + 1),
+                "mrr_ul": _bootstrap_macro_mean_ci(pq.mrr_ul, consensus, n_boot=n_boot, seed=base_seed + 2),
+                "top1": _bootstrap_macro_mean_ci(pq.top1, consensus, n_boot=n_boot, seed=base_seed + 3),
+                "majority": _bootstrap_macro_mean_ci(pq.majority, consensus, n_boot=n_boot, seed=base_seed + 4),
+                "cons_frac": _bootstrap_macro_mean_ci(pq.cons_frac, consensus, n_boot=n_boot, seed=base_seed + 5),
+                "lift": _bootstrap_macro_mean_ci(pq.lift, consensus, n_boot=n_boot, seed=base_seed + 6),
+            }
+
+        macro_summaries_by_k[int(kk)] = {
+            "Mixedbread (true)": _macro_key(mb_pq_kk, base_seed=base + 110),
+            "IDF–SVD": _macro_key(idf_pq_kk, base_seed=base + 120),
+            "KAHM(query→MB corpus)": _macro_key(kahm_qmb_pq_kk, base_seed=base + 130),
+        }
+
+        # Macro paired deltas (KAHM vs baselines)
+        def _macro_delta(a: np.ndarray, b: np.ndarray, *, s: int) -> Dict[str, Any]:
+            pt, ci = _bootstrap_macro_paired_delta_ci(a, b, consensus, n_boot=n_boot, seed=s)
+            return {"pt": float(pt), "ci": (float(ci[0]), float(ci[1]))}
+
+        macro_deltas_vs_idf_by_k[int(kk)] = {
+            "hit": _macro_delta(kahm_qmb_pq_kk.hit, idf_pq_kk.hit, s=base + 5101),
+            "mrr_ul": _macro_delta(kahm_qmb_pq_kk.mrr_ul, idf_pq_kk.mrr_ul, s=base + 5102),
+            "top1": _macro_delta(kahm_qmb_pq_kk.top1, idf_pq_kk.top1, s=base + 5103),
+            "majority": _macro_delta(kahm_qmb_pq_kk.majority, idf_pq_kk.majority, s=base + 5104),
+            "cons_frac": _macro_delta(kahm_qmb_pq_kk.cons_frac, idf_pq_kk.cons_frac, s=base + 5105),
+            "lift": _macro_delta(kahm_qmb_pq_kk.lift, idf_pq_kk.lift, s=base + 5106),
+        }
+
+        macro_deltas_vs_mb_by_k[int(kk)] = {
+            "hit": _macro_delta(kahm_qmb_pq_kk.hit, mb_pq_kk.hit, s=base + 5201),
+            "mrr_ul": _macro_delta(kahm_qmb_pq_kk.mrr_ul, mb_pq_kk.mrr_ul, s=base + 5202),
+            "top1": _macro_delta(kahm_qmb_pq_kk.top1, mb_pq_kk.top1, s=base + 5203),
+            "majority": _macro_delta(kahm_qmb_pq_kk.majority, mb_pq_kk.majority, s=base + 5204),
+            "cons_frac": _macro_delta(kahm_qmb_pq_kk.cons_frac, mb_pq_kk.cons_frac, s=base + 5205),
+            "lift": _macro_delta(kahm_qmb_pq_kk.lift, mb_pq_kk.lift, s=base + 5206),
+        }
+
+        # Paired deltas: KAHM adapter vs baselines.
         dhit_pt, dhit_ci = _bootstrap_paired_delta_ci(kahm_qmb_pq_kk.hit, idf_pq_kk.hit, n_boot=n_boot, seed=base + 101)
         dmrr_pt, dmrr_ci = _bootstrap_paired_delta_ci(kahm_qmb_pq_kk.mrr_ul, idf_pq_kk.mrr_ul, n_boot=n_boot, seed=base + 102)
         dtop_pt, dtop_ci = _bootstrap_paired_delta_ci(kahm_qmb_pq_kk.top1, idf_pq_kk.top1, n_boot=n_boot, seed=base + 103)
@@ -2396,25 +3129,21 @@ def main() -> None:
     mb_mv = compute_majority_vote(idx=mb_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
     idf_mv = compute_majority_vote(idx=idf_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
     kahm_qmb_mv = compute_majority_vote(idx=kahm_qmb_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
-    kahm_full_mv = compute_majority_vote(idx=kahm_full_idx, law_arr=law_arr, consensus_laws=consensus, k=k)
 
     mb_sum = summarize(mb_pq, n_boot=n_boot, seed=seed + 10)
     idf_sum = summarize(idf_pq, n_boot=n_boot, seed=seed + 20)
     kahm_qmb_sum = summarize(kahm_qmb_pq, n_boot=n_boot, seed=seed + 30)
-    kahm_full_sum = summarize(kahm_full_pq, n_boot=n_boot, seed=seed + 40)
 
     method_summaries = {
         "Mixedbread (true)": mb_sum,
         "IDF–SVD": idf_sum,
         "KAHM(query→MB corpus)": kahm_qmb_sum,
-        "Full-KAHM (query→KAHM corpus)": kahm_full_sum,
     }
 
     # Headline blocks
     print_method("Mixedbread (true)", mb_sum, k=k)
     print_method("IDF–SVD", idf_sum, k=k)
     print_method("KAHM(query→MB corpus)", kahm_qmb_sum, k=k)
-    print_method("Full-KAHM (query→KAHM corpus)", kahm_full_sum, k=k)
 
     # Majority-vote behavior (highlighted block)
     print("\nMajority-vote behavior: law-purity and vote-based routing diagnostics")
@@ -2422,7 +3151,6 @@ def main() -> None:
     majority_profiles["Mixedbread (true)"] = print_majority_vote_profile("Mixedbread (true)", mb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 500)
     majority_profiles["IDF–SVD"] = print_majority_vote_profile("IDF–SVD", idf_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 600)
     majority_profiles["KAHM(query→MB corpus)"] = print_majority_vote_profile("KAHM(query→MB corpus)", kahm_qmb_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 700)
-    majority_profiles["Full-KAHM (query→KAHM corpus)"] = print_majority_vote_profile("Full-KAHM (query→KAHM corpus)", kahm_full_mv, k=k, thresholds=maj_thresholds, n_boot=n_boot, seed=seed + 800)
 
     # Paired deltas that make the "majority-vote" story explicit (especially for Storyline B).
     print("\nMajority-vote deltas vs Mixedbread (paired, top-k law voting)")
@@ -2486,7 +3214,6 @@ def main() -> None:
     for nm, mv in [
         ("Mixedbread (true)", mb_mv),
         ("KAHM(query→MB corpus)", kahm_qmb_mv),
-        ("Full-KAHM (query→KAHM corpus)", kahm_full_mv),
         ("IDF–SVD", idf_mv),
     ]:
         tau_star, cov_star, acc_star, prec_star = recommend_routing_threshold(
@@ -2508,7 +3235,6 @@ def main() -> None:
     for nm, mv in [
         ("Mixedbread (true)", mb_mv),
         ("KAHM(query→MB corpus)", kahm_qmb_mv),
-        ("Full-KAHM (query→KAHM corpus)", kahm_full_mv),
         ("IDF–SVD", idf_mv),
     ]:
         tau_star, cov_star, acc_star, prec_star = recommend_routing_threshold_max_majacc(
@@ -2547,57 +3273,13 @@ def main() -> None:
         seed=seed + 200,
     )
 
-    # Storyline C: alignment evidence
-    print("\nStoryline C: Full-KAHM embeddings are aligned with MB (geometry + neighborhood overlap)")
-    print("  Part C1: Embedding-space cosine alignment")
-
-    cos_corpus = cosine_rowwise(emb_k, emb_mb)
-    cos_query = cosine_rowwise(q_kahm, q_mb)
-    pt_c, ci_c = _bootstrap_mean_ci(cos_corpus, n_boot=n_boot, seed=seed + 300)
-    pt_q, ci_q = _bootstrap_mean_ci(cos_query, n_boot=n_boot, seed=seed + 301)
-    print(f"    corpus cosine(KAHM, MB): {_fmt_ci(pt_c, ci_c, digits=4)}")
-    print(f"    query  cosine(KAHM, MB): {_fmt_ci(pt_q, ci_q, digits=4)}")
-
-    print("  Part C2: Retrieval-neighborhood overlap vs MB")
-    sent_j_full = jaccard_topk_rows(kahm_full_idx, mb_idx, k=k)
-    sent_f_full = overlap_frac_topk_rows(kahm_full_idx, mb_idx, k=k)
-    law_j_full = law_jaccard_topk_rows(kahm_full_idx, mb_idx, law_arr, k=k)
-
-    pt_sj, ci_sj = _bootstrap_mean_ci(sent_j_full, n_boot=n_boot, seed=seed + 310)
-    pt_sf, ci_sf = _bootstrap_mean_ci(sent_f_full, n_boot=n_boot, seed=seed + 311)
-    pt_lj, ci_lj = _bootstrap_mean_ci(law_j_full, n_boot=n_boot, seed=seed + 312)
-
-    print(f"    sentence Jaccard@{k} (Full-KAHM vs MB): {_fmt_ci(pt_sj, ci_sj)}")
-    print(f"    sentence overlap frac@{k}            : {_fmt_ci(pt_sf, ci_sf)}")
-    print(f"    law-set Jaccard@{k} (Full-KAHM vs MB): {_fmt_ci(pt_lj, ci_lj)}")
-
-    # Context: show Full-KAHM is *more* aligned to MB than IDF is.
-    sent_j_idf = jaccard_topk_rows(idf_idx, mb_idx, k=k)
-    law_j_idf = law_jaccard_topk_rows(idf_idx, mb_idx, law_arr, k=k)
-    d_sj_pt, d_sj_ci = _bootstrap_paired_delta_ci(sent_j_full, sent_j_idf, n_boot=n_boot, seed=seed + 320)
-    d_lj_pt, d_lj_ci = _bootstrap_paired_delta_ci(law_j_full, law_j_idf, n_boot=n_boot, seed=seed + 321)
-
-    alignment: Dict[str, Any] = {
-        "cosine_corpus": {"pt": float(pt_c), "ci": (float(ci_c[0]), float(ci_c[1]))},
-        "cosine_query": {"pt": float(pt_q), "ci": (float(ci_q[0]), float(ci_q[1]))},
-        "sentence_jaccard": {"pt": float(pt_sj), "ci": (float(ci_sj[0]), float(ci_sj[1]))},
-        "sentence_overlap_frac": {"pt": float(pt_sf), "ci": (float(ci_sf[0]), float(ci_sf[1]))},
-        "lawset_jaccard": {"pt": float(pt_lj), "ci": (float(ci_lj[0]), float(ci_lj[1]))},
-        "delta_sentence_jaccard_full_minus_idf": {"pt": float(d_sj_pt), "ci": (float(d_sj_ci[0]), float(d_sj_ci[1]))},
-        "delta_lawset_jaccard_full_minus_idf": {"pt": float(d_lj_pt), "ci": (float(d_lj_ci[0]), float(d_lj_ci[1]))},
-    }
-    ok_sj = bool(np.isfinite(d_sj_ci[0]) and d_sj_ci[0] > 0)
-    ok_lj = bool(np.isfinite(d_lj_ci[0]) and d_lj_ci[0] > 0)
-    print("  Part C3: Alignment gain vs IDF–SVD (paired deltas)")
-    print(f"    sentence Jaccard delta: (Full-KAHM−IDF) = {_fmt_delta(d_sj_pt, d_sj_ci)}  -> {'PASS' if ok_sj else 'FAIL'}")
-    print(f"    law-set Jaccard delta : (Full-KAHM−IDF) = {_fmt_delta(d_lj_pt, d_lj_ci)}  -> {'PASS' if ok_lj else 'FAIL'}")
-    print("    Interpretation: PASS means Full-KAHM neighborhoods are *statistically* closer to MB than IDF neighborhoods.")
+    # Note: Full-KAHM (query→KAHM corpus) and alignment/geometry storylines are disabled in this script version.
 
 
     # Optional: write a single publication-ready report (Markdown)
     if str(getattr(args, "report_path", "")).strip():
-        report_md = build_publication_report_md(
-            report_title=str(getattr(args, "report_title", "KAHM embeddings: retrieval evaluation")),
+        report_md = build_scientific_report_md(
+            report_title=str(getattr(args, 'report_title', 'KAHM(query→MB corpus): scientific retrieval evaluation')),
             args=args,
             n_queries=int(len(consensus)),
             n_corpus=int(law_arr.size),
@@ -2606,19 +3288,83 @@ def main() -> None:
             summaries_by_k=summaries_by_k,
             deltas_vs_idf_by_k=deltas_vs_idf_by_k,
             deltas_vs_mb_by_k=deltas_vs_mb_by_k,
-            storyline_k=int(k),
-            storyline_a=storyline_a,
-            storyline_b=storyline_b,
-            alignment=alignment,
-            alignment_k=int(k),
-            majority_profiles=majority_profiles,
-            majority_deltas_vs_mb=majority_deltas_vs_mb,
-            routing_decomp_point_rows=decomp_point_rows,
-            routing_decomp_ci_rows=decomp_ci_rows,
+            macro_summaries_by_k=macro_summaries_by_k,
+            macro_deltas_vs_idf_by_k=macro_deltas_vs_idf_by_k,
+            macro_deltas_vs_mb_by_k=macro_deltas_vs_mb_by_k,
+            timing=timing,
             threshold_suggestions=threshold_suggestions,
         )
         _write_text(str(args.report_path), report_md, overwrite=bool(getattr(args, "report_overwrite", False)))
         print(f"\nSaved publication report to: {os.path.abspath(str(args.report_path))}")
+
+
+
+    # Optional: dump machine-readable results JSON
+    if str(getattr(args, "results_json_path", "")).strip():
+        meta = {
+            "script": os.path.basename(__file__),
+            "script_version": SCRIPT_VERSION,
+            "generated_at": datetime.datetime.now().isoformat(),
+            "n_queries": int(len(consensus)),
+            "n_corpus": int(law_arr.size),
+            "embedding_dim": int(emb_mb.shape[1]),
+            "ks": [int(x) for x in ks_report],
+            "python": sys.version,
+        }
+        try:
+            import numpy as _np
+            import pandas as _pd
+            meta["numpy_version"] = getattr(_np, "__version__", "")
+            meta["pandas_version"] = getattr(_pd, "__version__", "")
+        except Exception:
+            pass
+
+        payload = {
+            "meta": meta,
+            "args": vars(args),
+            "timing": timing,
+            "micro": summaries_by_k,
+            "micro_deltas_vs_idf": deltas_vs_idf_by_k,
+            "micro_deltas_vs_mb": deltas_vs_mb_by_k,
+            "macro": macro_summaries_by_k,
+            "macro_deltas_vs_idf": macro_deltas_vs_idf_by_k,
+            "macro_deltas_vs_mb": macro_deltas_vs_mb_by_k,
+            "threshold_suggestions": threshold_suggestions,
+        }
+        outp = str(args.results_json_path)
+        with open(outp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+        print(f"Saved results JSON to: {os.path.abspath(outp)}")
+
+    # Optional: dump per-query top-k predictions (law-level) for error analysis
+    if str(getattr(args, "topk_dump_path", "")).strip():
+        def _topk_unique_laws(idx_row: np.ndarray, k: int) -> List[str]:
+            out: List[str] = []
+            seen = set()
+            for j in idx_row[:k].tolist():
+                law = str(law_arr[int(j)])
+                if law not in seen:
+                    seen.add(law)
+                    out.append(law)
+            return out
+
+        k_dump = int(k_max)
+        mb_list = ["|".join(_topk_unique_laws(row, k_dump)) for row in mb_idx]
+        kahm_list = ["|".join(_topk_unique_laws(row, k_dump)) for row in kahm_qmb_idx]
+        idf_list = ["|".join(_topk_unique_laws(row, k_dump)) for row in idf_idx]
+
+        df_dump = pd.DataFrame(
+            {
+                "query_id": query_ids,
+                "consensus_law": consensus,
+                f"mb_top{ k_dump }_laws": mb_list,
+                f"kahm_top{ k_dump }_laws": kahm_list,
+                f"idf_top{ k_dump }_laws": idf_list,
+            }
+        )
+        outp = str(args.topk_dump_path)
+        df_dump.to_csv(outp, index=False)
+        print(f"Saved top-k dump CSV to: {os.path.abspath(outp)}")
 
     print("\nPipeline finished successfully.")
 
