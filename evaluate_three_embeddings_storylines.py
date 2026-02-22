@@ -2465,7 +2465,7 @@ def main() -> None:
 
 
     p.add_argument("--k", type=int, default=10)
-    p.add_argument("--ks", default="1,5,10,20", help="Comma-separated retrieval cutoffs to evaluate (overrides --k for report tables).")
+    p.add_argument("--ks", default="3,5,10,15,20", help="Comma-separated retrieval cutoffs to evaluate (overrides --k for report tables).")
     p.add_argument("--predominance_fraction", type=float, default=0.1)
     p.add_argument(
         "--majority_thresholds",

@@ -1,6 +1,6 @@
 # KAHM embeddings: retrieval evaluation on Austrian laws
 
-Generated: 2026-02-19 22:53:26 | script=evaluate_three_embeddings_storylines.py | version=2026-02-19-scientific-q2mb-v2
+Generated: 2026-02-22 14:19:09 | script=evaluate_three_embeddings_storylines.py | version=2026-02-19-scientific-q2mb-v2
 
 ## Experimental design
 
@@ -17,23 +17,23 @@ This report evaluates Austrian law retrieval with a fixed sentence corpus. KAHM 
 - Queries: 5000
 - Aligned corpus sentences: 10762
 - Mixedbread embedding dim: 1024
-- Cutoffs k: 1, 5, 10, 20
+- Cutoffs k: 3, 5, 10, 15, 20
 - Bootstrap: paired nonparametric, n=5000, seed=0
 
 ## Retrieval quality
 
-### Micro-average (per query) at k=1
+### Micro-average (per query) at k=3
 | Method | hit@k | MRR@k (unique laws) | top1 | majority-acc | consensus frac | lift (prior) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Mixedbread (true) | 0.378 [0.364, 0.391] | 0.378 [0.365, 0.392] | 0.378 [0.365, 0.391] | 0.378 [0.364, 0.391] | 0.378 [0.365, 0.391] | 69.335 [64.417, 74.750] |
-| KAHM(query→MB corpus) | 0.403 [0.390, 0.417] | 0.403 [0.389, 0.417] | 0.403 [0.390, 0.417] | 0.403 [0.390, 0.417] | 0.403 [0.389, 0.417] | 72.448 [67.642, 77.466] |
-| IDF–SVD | 0.287 [0.274, 0.300] | 0.287 [0.274, 0.299] | 0.287 [0.274, 0.299] | 0.287 [0.274, 0.300] | 0.287 [0.275, 0.299] | 45.492 [41.112, 50.412] |
+| Mixedbread (true) | 0.503 [0.488, 0.516] | 0.436 [0.423, 0.449] | 0.378 [0.365, 0.392] | 0.379 [0.366, 0.393] | 0.345 [0.334, 0.356] | 60.549 [56.883, 64.307] |
+| KAHM(query→MB corpus) | 0.525 [0.511, 0.538] | 0.460 [0.447, 0.472] | 0.403 [0.390, 0.417] | 0.414 [0.400, 0.427] | 0.374 [0.362, 0.385] | 65.820 [62.222, 69.582] |
+| IDF–SVD | 0.389 [0.375, 0.402] | 0.334 [0.322, 0.347] | 0.287 [0.274, 0.299] | 0.298 [0.286, 0.311] | 0.279 [0.268, 0.290] | 42.062 [39.219, 45.081] |
 
-Δ at k=1 (paired bootstrap, mean differences)
+Δ at k=3 (paired bootstrap, mean differences)
 | Comparison | Δhit | ΔMRR_ul | Δtop1 | Δmajority | Δcons_frac | Δlift |
 | --- | --- | --- | --- | --- | --- | --- |
-| KAHM − IDF | +0.116 [+0.103, +0.130] | +0.116 [+0.103, +0.130] | +0.116 [+0.102, +0.130] | +0.116 [+0.103, +0.130] | +0.116 [+0.103, +0.129] | +26.957 [+20.910, +33.171] |
-| KAHM − MB | +0.025 [+0.014, +0.036] | +0.025 [+0.015, +0.036] | +0.025 [+0.014, +0.036] | +0.025 [+0.014, +0.036] | +0.025 [+0.014, +0.036] | +3.113 [-1.177, +7.379] |
+| KAHM − IDF | +0.136 [+0.123, +0.151] | +0.125 [+0.113, +0.137] | +0.116 [+0.103, +0.130] | +0.115 [+0.102, +0.129] | +0.095 [+0.085, +0.105] | +23.758 [+19.900, +27.636] |
+| KAHM − MB | +0.022 [+0.011, +0.033] | +0.024 [+0.015, +0.033] | +0.025 [+0.014, +0.036] | +0.034 [+0.023, +0.045] | +0.029 [+0.022, +0.036] | +5.271 [+2.654, +7.915] |
 
 ### Micro-average (per query) at k=5
 | Method | hit@k | MRR@k (unique laws) | top1 | majority-acc | consensus frac | lift (prior) |
@@ -60,6 +60,19 @@ This report evaluates Austrian law retrieval with a fixed sentence corpus. KAHM 
 | --- | --- | --- | --- | --- | --- | --- |
 | KAHM − IDF | +0.137 [+0.123, +0.151] | +0.125 [+0.114, +0.136] | +0.116 [+0.102, +0.130] | +0.123 [+0.110, +0.136] | +0.076 [+0.068, +0.084] | +18.994 [+16.648, +21.412] |
 | KAHM − MB | +0.009 [-0.002, +0.019] | +0.021 [+0.013, +0.029] | +0.025 [+0.014, +0.036] | +0.026 [+0.015, +0.036] | +0.029 [+0.024, +0.035] | +5.698 [+4.076, +7.182] |
+
+### Micro-average (per query) at k=15
+| Method | hit@k | MRR@k (unique laws) | top1 | majority-acc | consensus frac | lift (prior) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Mixedbread (true) | 0.662 [0.649, 0.676] | 0.474 [0.462, 0.486] | 0.378 [0.365, 0.392] | 0.400 [0.387, 0.414] | 0.285 [0.277, 0.294] | 44.308 [42.225, 46.400] |
+| KAHM(query→MB corpus) | 0.672 [0.658, 0.684] | 0.495 [0.483, 0.507] | 0.403 [0.390, 0.417] | 0.423 [0.409, 0.437] | 0.315 [0.306, 0.324] | 49.923 [47.704, 52.133] |
+| IDF–SVD | 0.539 [0.525, 0.553] | 0.371 [0.359, 0.383] | 0.287 [0.274, 0.299] | 0.311 [0.298, 0.324] | 0.247 [0.238, 0.256] | 33.889 [32.142, 35.688] |
+
+Δ at k=15 (paired bootstrap, mean differences)
+| Comparison | Δhit | ΔMRR_ul | Δtop1 | Δmajority | Δcons_frac | Δlift |
+| --- | --- | --- | --- | --- | --- | --- |
+| KAHM − IDF | +0.133 [+0.120, +0.147] | +0.124 [+0.113, +0.135] | +0.116 [+0.103, +0.130] | +0.112 [+0.099, +0.125] | +0.068 [+0.061, +0.075] | +16.034 [+14.027, +18.055] |
+| KAHM − MB | +0.009 [+0.000, +0.019] | +0.021 [+0.013, +0.029] | +0.025 [+0.014, +0.036] | +0.023 [+0.013, +0.034] | +0.030 [+0.025, +0.034] | +5.615 [+4.364, +6.853] |
 
 ### Micro-average (per query) at k=20
 | Method | hit@k | MRR@k (unique laws) | top1 | majority-acc | consensus frac | lift (prior) |
@@ -97,17 +110,17 @@ Per-query numbers below are steady-state proxies (one-time initialization and wa
 
 | Component | Wall time |
 | --- | --- |
-| IDF–SVD pipeline load | 2512.777 ms |
-| KAHM init (models + caches) | 6996.325 ms |
-| KAHM warm-up | 7328.049 ms |
-| Mixedbread model load | 7702.626 ms |
-| Mixedbread warm-up encode | 2034.939 ms |
+| IDF–SVD pipeline load | 2647.971 ms |
+| KAHM init (models + caches) | 7336.818 ms |
+| KAHM warm-up | 9048.263 ms |
+| Mixedbread model load | 8324.818 ms |
+| Mixedbread warm-up encode | 1868.295 ms |
 
 | Path | Query source | Query embed / q | FAISS search / q | Total online / q |
 | --- | --- | --- | --- | --- |
-| IDF–SVD | model | 0.832 ms | 0.303 ms | 1.136 ms |
-| KAHM(q→MB) | model | 140.102 ms | 0.580 ms | 140.682 ms |
-| Mixedbread (true) | online | 799.383 ms | 0.580 ms | 799.963 ms |
+| IDF–SVD | model | 0.871 ms | 0.310 ms | 1.181 ms |
+| KAHM(q→MB) | model | 147.153 ms | 0.608 ms | 147.762 ms |
+| Mixedbread (true) | online | 827.346 ms | 0.605 ms | 827.951 ms |
 
 ### Memory footprint proxies
 
@@ -144,7 +157,7 @@ Command-line arguments:
   "kahm_query_model": "kahm_query_regressors_by_law",
   "kahm_query_strategy": "query_model",
   "kahm_show_progress": true,
-  "ks": "1,5,10,20",
+  "ks": "3,5,10,15,20",
   "majority_thresholds": "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8",
   "mb_force_online": true,
   "mb_query_batch": 1,
