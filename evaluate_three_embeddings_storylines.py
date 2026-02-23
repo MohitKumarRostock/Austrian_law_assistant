@@ -18,8 +18,7 @@ We compare exactly three systems:
   2) **Mixedbread (true)** (transformer query encoder): MB queries → MB corpus
   3) **KAHM(query→MB corpus)** (gradient-free query adapter): KAHM queries → MB corpus
 
-Full-KAHM retrieval (query→KAHM corpus) and corpus-alignment/geometry storylines are
-intentionally **not** evaluated here.
+
 
 Statistical protocol
 --------------------
@@ -36,6 +35,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.metadata
+import hashlib
+import platform
 import re
 import os
 import sys
@@ -52,7 +54,7 @@ import numpy as np
 import pandas as pd
 
 
-SCRIPT_VERSION = "2026-02-19-scientific-q2mb-v2"
+SCRIPT_VERSION = "2026-02-23-scientific-pubreport-v1"
 
 
 def _safe_ratio(num: float, denom: float) -> float:
@@ -797,14 +799,32 @@ def build_scientific_report_md(
     macro_deltas_vs_mb_by_k: Dict[int, Dict[str, Dict[str, Any]]],
     timing: Dict[str, Any],
     threshold_suggestions: Dict[str, Any],
+    data_provenance: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Generate a publication-ready Markdown report for the focused comparison."""
+    """Generate a publication-ready Markdown report for the focused 3-system comparison.
+
+    The report is intentionally self-contained: it documents (i) data provenance and split hygiene
+    (including synthetic query-generation parameters when available), (ii) retrieval protocol,
+    (iii) metric definitions, and (iv) paired-bootstrap uncertainty and deltas.
+    """
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ks_sorted = sorted({int(k) for k in ks})
+    k_star = int(getattr(args, "k", ks_sorted[0] if ks_sorted else 10))
+
+    show_transformer_context = bool(getattr(args, "report_show_transformer_context", True))
+    show_transformer_deltas = bool(getattr(args, "report_show_transformer_deltas", True))
+
+    method_kahm = "KAHM(query→MB corpus)"
+    method_idf = "IDF–SVD"
+    method_mb = "Mixedbread (true)"
 
     def _cell(method: str, k: int, metric: str, digits: int = 3) -> str:
         pt, ci = summaries_by_k[int(k)][method][metric]
+        return _fmt_ci(pt, ci, digits=digits)
+
+    def _mcell(method: str, k: int, metric: str, digits: int = 3) -> str:
+        pt, ci = macro_summaries_by_k[int(k)][method][metric]
         return _fmt_ci(pt, ci, digits=digits)
 
     def _dcell(d: Dict[str, Any], digits: int = 3) -> str:
@@ -821,226 +841,446 @@ def build_scientific_report_md(
         except Exception:
             return "n/a"
 
+    dp = data_provenance or {}
+    qmeta = dp.get("query_meta", None) if isinstance(dp, dict) else None
+
     lines: List[str] = []
     lines.append(f"# {report_title}")
     lines.append("")
+    lines.append(f"Generated: {now} | script={os.path.basename(__file__)} | version={SCRIPT_VERSION}")
+    lines.append("")
+
+    # -------------------- Summary --------------------
+    lines.append("## Summary")
+    lines.append("")
     lines.append(
-        f"Generated: {now} | script={os.path.basename(__file__)} | version={SCRIPT_VERSION}"
+        "This evaluation compares three retrieval pipelines for mapping natural-language queries to Austrian-law labels "
+        "via sentence-level retrieval on a fixed corpus:"
+    )
+    lines.append("")
+    lines.append(f"- **{method_idf}:** IDF–SVD query embeddings → IDF–SVD corpus embeddings.")
+    lines.append(f"- **{method_mb} (reference):** transformer query embeddings → transformer corpus embeddings.")
+    lines.append(
+        f"- **{method_kahm}:** gradient-free query adapter (IDF–SVD features mapped into the transformer embedding space) → "
+        "frozen transformer corpus embeddings."
+    )
+    lines.append("")
+    lines.append(
+        "Uncertainty is quantified with a paired nonparametric bootstrap across queries "
+        f"({int(getattr(args, 'bootstrap_samples', 5000))} resamples; seed={int(getattr(args, 'bootstrap_seed', 0))})."
     )
     lines.append("")
 
-    lines.append("## Experimental design")
+    # -------------------- Data & provenance --------------------
+    lines.append("## Data and provenance")
     lines.append("")
-    lines.append(
-        "This report evaluates Austrian law retrieval with a fixed sentence corpus. "
-        "KAHM is evaluated strictly as a *query adapter* into a frozen transformer corpus space (Mixedbread)."
-    )
+    lines.append("### Corpus")
     lines.append("")
-    lines.append("### Systems compared")
+    lines.append(f"- Corpus file: `{str(getattr(args, 'corpus_parquet', ''))}`")
+    lines.append(f"- Aligned sentences (intersection of embedding indices): **{int(n_corpus)}**")
+    lines.append(f"- Embedding space dimension (transformer index): **{int(embedding_dim)}**")
+    if isinstance(dp.get("corpus_counts_by_law"), dict):
+        cc = dp["corpus_counts_by_law"]
+        n_laws = len(cc)
+        lines.append(f"- Label universe size (laws present in aligned corpus): **{int(n_laws)}**")
+        # Show a small preview of priors
+        items = list(cc.items())
+        total = float(sum(int(v) for _, v in items)) if items else 0.0
+        if total > 0 and items:
+            top = items[:10]
+            rows = []
+            for law, cnt in top:
+                rows.append([str(law), str(int(cnt)), f"{(float(cnt)/total):.3f}"])
+            lines.append("")
+            lines.append("Top-10 corpus law priors (count and prior probability):")
+            lines.append("")
+            lines.append(_md_table(["Law", "Count", "Prior"], rows))
+            lines.append("")
+
+    lines.append("### Queries")
     lines.append("")
-    lines.append("- **IDF–SVD**: IDF–SVD query encoder → IDF–SVD corpus index (low-cost baseline).")
-    lines.append("- **Mixedbread (true)**: transformer query encoder → Mixedbread corpus index (upper baseline).")
-    lines.append("- **KAHM(query→MB corpus)**: IDF–SVD features → KAHM adapter → Mixedbread corpus index (no transformer on query path).")
+    lines.append(f"- Evaluated query set: `{str(getattr(args, 'query_set', ''))}`")
+    if str(getattr(args, "train_query_set", "")).strip():
+        lines.append(f"- TRAIN query set (diagnostics only): `{str(getattr(args, 'train_query_set', ''))}`")
+    lines.append(f"- Evaluated queries after filtering: **{int(n_queries)}**")
+    lines.append(f"- Evaluated cutoffs: **k = {', '.join(str(k) for k in ks_sorted)}**")
     lines.append("")
 
-    lines.append("### Protocol")
-    lines.append("")
-    lines.append(f"- Queries: {n_queries}")
-    lines.append(f"- Aligned corpus sentences: {n_corpus}")
-    lines.append(f"- Mixedbread embedding dim: {embedding_dim}")
-    lines.append(f"- Cutoffs k: {', '.join(str(k) for k in ks_sorted)}")
-    lines.append(
-        f"- Bootstrap: paired nonparametric, n={int(getattr(args, 'bootstrap_samples', 0))}, seed={int(getattr(args, 'bootstrap_seed', 0))}"
-    )
-    lines.append("")
-
-    lines.append("## Retrieval quality")
-    lines.append("")
-
-    for k in ks_sorted:
-        lines.append(f"### Micro-average (per query) at k={k}")
-        headers = [
-            "Method",
-            "hit@k",
-            "MRR@k (unique laws)",
-            "top1",
-            "majority-acc",
-            "consensus frac",
-            "lift (prior)",
-        ]
-        rows = []
-        for method in ["Mixedbread (true)", "KAHM(query→MB corpus)", "IDF–SVD"]:
-            rows.append(
-                [
-                    method,
-                    _cell(method, k, "hit"),
-                    _cell(method, k, "mrr_ul"),
-                    _cell(method, k, "top1"),
-                    _cell(method, k, "majority"),
-                    _cell(method, k, "cons_frac"),
-                    _cell(method, k, "lift"),
-                ]
-            )
-        lines.append(_md_table(headers, rows))
+    if isinstance(dp.get("query_summary_test"), dict):
+        qsumm = dp["query_summary_test"]
+        try:
+            n_total = int(qsumm.get("n", n_queries))
+        except Exception:
+            n_total = int(n_queries)
+        lines.append("Test query-set composition (after filtering):")
+        lines.append("")
+        if "n_unique_topics" in qsumm:
+            lines.append(f"- Unique topic IDs: **{int(qsumm.get('n_unique_topics', 0))}**")
+        if "n_unique_text" in qsumm:
+            lines.append(f"- Unique query texts: **{int(qsumm.get('n_unique_text', 0))}** (duplicates={int(qsumm.get('n_duplicate_text', 0))})")
+        sc = qsumm.get("style_counts", {})
+        if isinstance(sc, dict) and sc:
+            rows = []
+            for style, cnt in list(sc.items()):
+                try:
+                    c = int(cnt)
+                except Exception:
+                    continue
+                rows.append([str(style) if style else "(missing)", str(c), f"{(c/max(1,n_total)):.3f}"])
+            lines.append("")
+            lines.append(_md_table(["Style", "Count", "Frac"], rows))
         lines.append("")
 
-        lines.append(f"Δ at k={k} (paired bootstrap, mean differences)")
-        headers = ["Comparison", "Δhit", "ΔMRR_ul", "Δtop1", "Δmajority", "Δcons_frac", "Δlift"]
-        d_idf = deltas_vs_idf_by_k[int(k)]
-        d_mb = deltas_vs_mb_by_k[int(k)]
-        rows = [
-            [
-                "KAHM − IDF",
-                _dcell(d_idf["hit"]),
-                _dcell(d_idf["mrr_ul"]),
-                _dcell(d_idf["top1"]),
-                _dcell(d_idf["majority"]),
-                _dcell(d_idf["cons_frac"]),
-                _dcell(d_idf["lift"]),
-            ],
-            [
-                "KAHM − MB",
-                _dcell(d_mb["hit"]),
-                _dcell(d_mb["mrr_ul"]),
-                _dcell(d_mb["top1"]),
-                _dcell(d_mb["majority"]),
-                _dcell(d_mb["cons_frac"]),
-                _dcell(d_mb["lift"]),
-            ],
-        ]
-        lines.append(_md_table(headers, rows))
+    # Query generation meta (if available)
+    if isinstance(qmeta, dict):
+        lines.append("### Synthetic query generation (metadata)")
         lines.append("")
-
-    # Macro robustness (default k=10 if present)
-    k_macro = 10 if 10 in ks_sorted else ks_sorted[-1]
-    if int(k_macro) in macro_summaries_by_k:
-        lines.append("## Robustness: macro-average (per law)")
+        src = str(dp.get("query_meta_source", "unavailable"))
+        lines.append(f"- Metadata source: `{src}`")
+        # Key knobs defined by generate_query_set_austrian_law.py
+        for key in (
+            "seed",
+            "split_mode",
+            "train_n",
+            "test_n",
+            "n_laws",
+            "variants_per_style",
+            "queries_per_topic",
+            "candidate_oversupply",
+            "law_mention_prob",
+            "keyword_law_mention_prob",
+            "surface_noise_prob",
+            "law_context_prob",
+            "topic_term_prob",
+            "issue_term_prob",
+            "keyword_term_prob",
+        ):
+            if key in qmeta:
+                lines.append(f"- {key}: **{qmeta[key]}**")
+        # Split semantics
+        if "test_topics_subset_of_train" in qmeta:
+            lines.append(f"- test_topics_subset_of_train: **{qmeta['test_topics_subset_of_train']}**")
         lines.append("")
         lines.append(
-            "Macro averages resample laws (labels) rather than queries; this reduces sensitivity to label imbalance. "
-            f"Reported at k={k_macro}."
+            "Split semantics (from the generator):\n"
+            "- `iid` (default): TRAIN/TEST are stratified; TEST draws only from topics seen in TRAIN (per-law).\n"
+            "- `iid_unrestricted`: TRAIN/TEST are stratified partitions of a shared topic pool (topics may be unseen in TRAIN).\n"
+            "- `topic_disjoint`: no topic appears in both splits (hardest generalization)."
         )
         lines.append("")
-        headers = ["Method", "hit@k", "MRR_ul@k", "top1", "majority-acc"]
-        rows = []
-        for method in ["Mixedbread (true)", "KAHM(query→MB corpus)", "IDF–SVD"]:
-            m = macro_summaries_by_k[int(k_macro)][method]
-            rows.append(
+
+    # Train/test hygiene checks (if train set available)
+    if isinstance(dp.get("split_diagnostics"), dict):
+        sd = dp["split_diagnostics"]
+        lines.append("### Split hygiene diagnostics")
+        lines.append("")
+        if not sd.get("train_available", False):
+            lines.append("- TRAIN query set not available; overlap diagnostics were skipped.")
+        else:
+            lines.append(f"- Exact-text overlap (TRAIN ∩ TEST): **{int(sd.get('text_overlap_n', 0))}** queries")
+            lines.append(f"- Topic overlap (TRAIN ∩ TEST): **{int(sd.get('topic_overlap_n', 0))}** topics")
+            if "topic_overlap_frac_of_test" in sd:
+                lines.append(f"- Topic overlap fraction of TEST: **{float(sd.get('topic_overlap_frac_of_test', 0.0)):.3f}**")
+        lines.append("")
+
+    # Label leakage checks (important for synthetic data)
+    if isinstance(dp.get("label_leakage_test"), dict):
+        ll = dp["label_leakage_test"]
+        lines.append("### Label-leakage diagnostics (test)")
+        lines.append("")
+        lines.append(
+            f"Boundary match rule: `{ll.get('match_rule', '')}`. "
+            "These diagnostics estimate how often law abbreviations appear verbatim in query text."
+        )
+        lines.append("")
+        lines.append(f"- P(any law label mentioned): **{float(ll.get('p_any_label', float('nan'))):.3f}**")
+        lines.append(f"- P(gold law label mentioned): **{float(ll.get('p_gold_label', float('nan'))):.3f}**")
+        lines.append(f"- P(other (non-gold) label mentioned): **{float(ll.get('p_other_label', float('nan'))):.3f}**")
+        lines.append("")
+
+    # -------------------- Retrieval protocol --------------------
+    lines.append("## Retrieval protocol")
+    lines.append("")
+    lines.append(
+        "All embeddings are L2-normalized and indexed with FAISS `IndexFlatIP` (inner product on normalized vectors, i.e., cosine similarity). "
+        "For each query, we retrieve the top-*k* sentences and aggregate their law labels to compute metrics."
+    )
+    lines.append("")
+    pred_frac = float(getattr(args, "predominance_fraction", 0.1))
+    lines.append(f"Majority-vote predominance threshold for majority-accuracy: **τ = {pred_frac:0.2f}**.")
+    lines.append("")
+
+    # -------------------- Metrics --------------------
+    lines.append("## Metrics")
+    lines.append("")
+    lines.append(
+        "All metrics are computed **per query** at cutoff *k* and then averaged across queries. "
+        "We report 95% confidence intervals via paired bootstrap."
+    )
+    lines.append("")
+    lines.append("- **Hit@k:** 1 if at least one retrieved sentence is labeled with the gold law, else 0.")
+    lines.append(
+        "- **MRR@k (unique laws):** reciprocal rank of the first occurrence of the gold law when the top-*k* list is collapsed to unique laws."
+    )
+    lines.append("- **Top-1 accuracy:** 1 if the top-ranked sentence law equals the gold law, else 0.")
+    lines.append(
+        f"- **Majority-accuracy:** 1 if the plurality law in top-*k* equals gold **and** its fraction ≥ τ; otherwise 0 (abstentions count as 0)."
+    )
+    lines.append("- **Mean consensus fraction:** fraction of the top-*k* sentences that belong to the gold law.")
+    lines.append(
+        "- **Mean lift (prior):** consensus fraction divided by the corpus prior of the gold law (enrichment over chance)."
+    )
+    lines.append("")
+
+    # -------------------- Results (micro) --------------------
+    lines.append("## Results")
+    lines.append("")
+    lines.append("### Micro-averaged quality (mean ± 95% CI)")
+    lines.append("")
+    headers = ["k", method_idf, method_kahm] + ([method_mb] if show_transformer_context else [])
+    def _row(metric: str, k: int) -> List[str]:
+        r = [str(k), _cell(method_idf, k, metric), _cell(method_kahm, k, metric)]
+        if show_transformer_context:
+            r.append(_cell(method_mb, k, metric))
+        return r
+
+    # MRR
+    lines.append("**MRR@k (unique laws)**")
+    lines.append("")
+    lines.append(_md_table(headers, [_row("mrr_ul", k) for k in ks_sorted]))
+    lines.append("")
+    # Hit@k
+    lines.append("**Hit@k**")
+    lines.append("")
+    lines.append(_md_table(headers, [_row("hit", k) for k in ks_sorted]))
+    lines.append("")
+    # Top-1
+    lines.append("**Top-1 accuracy**")
+    lines.append("")
+    lines.append(_md_table(headers, [_row("top1", k) for k in ks_sorted]))
+    lines.append("")
+    # Majority
+    lines.append(f"**Majority-accuracy** (τ={pred_frac:0.2f})")
+    lines.append("")
+    lines.append(_md_table(headers, [_row("majority", k) for k in ks_sorted]))
+    lines.append("")
+    # Consensus fraction
+    lines.append("**Mean consensus fraction**")
+    lines.append("")
+    lines.append(_md_table(headers, [_row("cons_frac", k) for k in ks_sorted]))
+    lines.append("")
+    # Lift
+    lines.append("**Mean lift (prior)**")
+    lines.append("")
+    lines.append(_md_table(headers, [_row("lift", k) for k in ks_sorted]))
+    lines.append("")
+
+    # Deltas vs IDF
+    lines.append("### Paired deltas (KAHM − IDF–SVD)")
+    lines.append("")
+    headers_d = ["k", "Δhit@k", "ΔMRR@k", "ΔTop-1", "ΔMajority-acc", "ΔMean cons frac", "ΔMean lift"]
+    rows_d = []
+    for k in ks_sorted:
+        d = deltas_vs_idf_by_k[int(k)]
+        rows_d.append(
+            [
+                str(k),
+                _dcell(d["hit"]),
+                _dcell(d["mrr_ul"]),
+                _dcell(d["top1"]),
+                _dcell(d["majority"]),
+                _dcell(d["cons_frac"]),
+                _dcell(d["lift"]),
+            ]
+        )
+    lines.append(_md_table(headers_d, rows_d))
+    lines.append("")
+
+    # Optional deltas vs transformer baseline (context)
+    if show_transformer_context and show_transformer_deltas:
+        lines.append("### Paired deltas vs transformer-query baseline (context; KAHM − Mixedbread)")
+        lines.append("")
+        rows_b = []
+        for k in ks_sorted:
+            d = deltas_vs_mb_by_k[int(k)]
+            rows_b.append(
                 [
-                    method,
-                    _fmt_ci(m["hit"][0], m["hit"][1], digits=3),
-                    _fmt_ci(m["mrr_ul"][0], m["mrr_ul"][1], digits=3),
-                    _fmt_ci(m["top1"][0], m["top1"][1], digits=3),
-                    _fmt_ci(m["majority"][0], m["majority"][1], digits=3),
+                    str(k),
+                    _dcell(d["hit"]),
+                    _dcell(d["mrr_ul"]),
+                    _dcell(d["top1"]),
+                    _dcell(d["majority"]),
+                    _dcell(d["cons_frac"]),
+                    _dcell(d["lift"]),
                 ]
             )
-        lines.append(_md_table(headers, rows))
+        lines.append(_md_table(headers_d, rows_b))
         lines.append("")
 
-        md_idf = macro_deltas_vs_idf_by_k[int(k_macro)]
-        md_mb = macro_deltas_vs_mb_by_k[int(k_macro)]
-        headers = ["Comparison", "Δhit", "ΔMRR_ul", "Δtop1", "Δmajority"]
-        rows = [
-            ["KAHM − IDF", _dcell(md_idf["hit"]), _dcell(md_idf["mrr_ul"]), _dcell(md_idf["top1"]), _dcell(md_idf["majority"])],
-            ["KAHM − MB", _dcell(md_mb["hit"]), _dcell(md_mb["mrr_ul"]), _dcell(md_mb["top1"]), _dcell(md_mb["majority"])],
-        ]
-        lines.append(_md_table(headers, rows))
+    # -------------------- Macro --------------------
+    lines.append("### Macro-averaged quality (per-law average; robustness)")
+    lines.append("")
+    lines.append(
+        "Macro-averaging computes metrics per law and then averages across laws (each law has equal weight). "
+        "This is a robustness check against label-frequency skew."
+    )
+    lines.append("")
+    headers_m = ["k", method_idf, method_kahm] + ([method_mb] if show_transformer_context else [])
+    def _mrow(metric: str, k: int) -> List[str]:
+        r = [str(k), _mcell(method_idf, k, metric), _mcell(method_kahm, k, metric)]
+        if show_transformer_context:
+            r.append(_mcell(method_mb, k, metric))
+        return r
+
+    lines.append("**Macro MRR@k (unique laws)**")
+    lines.append("")
+    lines.append(_md_table(headers_m, [_mrow("mrr_ul", k) for k in ks_sorted]))
+    lines.append("")
+
+    lines.append("**Macro Hit@k**")
+    lines.append("")
+    lines.append(_md_table(headers_m, [_mrow("hit", k) for k in ks_sorted]))
+    lines.append("")
+
+    lines.append("**Macro Top-1 accuracy**")
+    lines.append("")
+    lines.append(_md_table(headers_m, [_mrow("top1", k) for k in ks_sorted]))
+    lines.append("")
+
+    lines.append(f"**Macro Majority-accuracy** (τ={pred_frac:0.2f})")
+    lines.append("")
+    lines.append(_md_table(headers_m, [_mrow("majority", k) for k in ks_sorted]))
+    lines.append("")
+
+    lines.append("### Macro paired deltas (KAHM − IDF–SVD)")
+    lines.append("")
+    rows_md = []
+    for k in ks_sorted:
+        d = macro_deltas_vs_idf_by_k[int(k)]
+        rows_md.append(
+            [
+                str(k),
+                _dcell(d["hit"]),
+                _dcell(d["mrr_ul"]),
+                _dcell(d["top1"]),
+                _dcell(d["majority"]),
+                _dcell(d["cons_frac"]),
+                _dcell(d["lift"]),
+            ]
+        )
+    lines.append(_md_table(headers_d, rows_md))
+    lines.append("")
+
+    if show_transformer_context and show_transformer_deltas:
+        lines.append("### Macro paired deltas vs transformer-query baseline (context; KAHM − Mixedbread)")
         lines.append("")
-
-    lines.append("## Compute profile (measured wall-time proxies)")
-    lines.append("")
-    lines.append("Per-query numbers below are steady-state proxies (one-time initialization and warm-up are reported separately).")
-    lines.append("")
-
-    lines.append("### One-time initialization and warm-up (cold-start)")
-    lines.append("")
-    headers = ["Component", "Wall time"]
-    rows = [
-        ["IDF–SVD pipeline load", _ms(timing.get("idf_init_seconds_total"))],
-        ["KAHM init (models + caches)", _ms(timing.get("kahm_query_init_seconds_total"))],
-        ["KAHM warm-up", _ms(timing.get("kahm_query_warmup_seconds_total"))],
-        ["Mixedbread model load", _ms(timing.get("mb_query_init_seconds_total"))],
-        ["Mixedbread warm-up encode", _ms(timing.get("mb_query_warmup_seconds_total"))],
-    ]
-    lines.append(_md_table(headers, rows))
-    lines.append("")
-
-
-    headers = ["Path", "Query source", "Query embed / q", "FAISS search / q", "Total online / q"]
-    rows = [
-        [
-            "IDF–SVD",
-            "model",
-            _ms(timing.get("idf_embed_seconds_per_query")),
-            _ms(timing.get("faiss_idf_search_seconds_per_query")),
-            _ms(timing.get("online_idf_seconds_per_query")),
-        ],
-        [
-            "KAHM(q→MB)",
-            str(timing.get("kahm_query_source", "model")),
-            _ms(timing.get("kahm_query_seconds_per_query")),
-            _ms(timing.get("faiss_kahm_qmb_search_seconds_per_query")),
-            _ms(timing.get("online_kahm_seconds_per_query")),
-        ],
-        [
-            "Mixedbread (true)",
-            str(timing.get("mb_query_source", "npz")),
-            _ms(timing.get("mb_query_seconds_per_query")),
-            _ms(timing.get("faiss_mb_search_seconds_per_query")),
-            _ms(timing.get("online_mb_seconds_per_query")),
-        ],
-    ]
-    lines.append(_md_table(headers, rows))
-    lines.append("")
-
-    lines.append("### Memory footprint proxies")
-    lines.append("")
-    mb_bytes = int(timing.get("corpus_mb_bytes", 0))
-    idf_bytes = int(timing.get("corpus_idf_bytes", 0))
-    lines.append(f"- MB corpus embeddings: {mb_bytes/1e6:0.1f} MB")
-    lines.append(f"- IDF corpus embeddings: {idf_bytes/1e6:0.1f} MB")
-    lines.append("")
-
-    lines.append("## Majority-vote routing (tau recommendation)")
-    lines.append("")
-    min_cov = float(threshold_suggestions.get("coverage_constraint", float("nan")))
-    lines.append(f"Coverage constraint: coverage ≥ {min_cov:0.2f}")
-    lines.append("")
-
-    rec = threshold_suggestions.get("maximize_precision_subject_to_coverage", {})
-    headers = ["Method", "tau*", "coverage", "acc|covered", "majority-acc"]
-    rows = []
-    for method in ["Mixedbread (true)", "KAHM(query→MB corpus)", "IDF–SVD"]:
-        if method in rec:
-            r = rec[method]
-            rows.append(
+        rows_mb = []
+        for k in ks_sorted:
+            d = macro_deltas_vs_mb_by_k[int(k)]
+            rows_mb.append(
                 [
-                    method,
-                    f"{float(r['tau']):0.2f}",
-                    f"{float(r['coverage']):0.3f}",
-                    f"{float(r['acc_given_covered']):0.3f}",
-                    f"{float(r['majority_acc']):0.3f}",
+                    str(k),
+                    _dcell(d["hit"]),
+                    _dcell(d["mrr_ul"]),
+                    _dcell(d["top1"]),
+                    _dcell(d["majority"]),
+                    _dcell(d["cons_frac"]),
+                    _dcell(d["lift"]),
                 ]
             )
-    if rows:
-        lines.append(_md_table(headers, rows))
+        lines.append(_md_table(headers_d, rows_mb))
         lines.append("")
 
+    # -------------------- Routing --------------------
+    lines.append("## Majority-vote routing (coverage/precision)")
+    lines.append("")
+    lines.append(
+        "We report a coverage–precision sweep over routing thresholds τ′ (distinct from the predominance threshold used in the majority metric). "
+        "Coverage is the fraction of queries that meet τ′; precision is accuracy conditioned on being covered."
+    )
+    lines.append("")
+    if isinstance(threshold_suggestions, dict) and threshold_suggestions:
+        cov_min = float(getattr(args, "min_routing_coverage", 0.50))
+        lines.append(f"Recommended τ′ maximizes precision subject to coverage ≥ **{cov_min:0.2f}**.")
+        lines.append("")
+        headers_r = ["Method", "τ′", "Coverage", "Majority-acc", "Precision (acc|covered)"]
+        rows_r = []
+        rec = threshold_suggestions.get("maximize_precision_subject_to_coverage", threshold_suggestions)
+        for name in (method_idf, method_mb, method_kahm):
+            if name in rec:
+                r = rec[name]
+                prec = r.get('precision', r.get('acc_given_covered', float('nan')))
+                rows_r.append(
+                    [
+                        name,
+                        f"{float(r.get('tau', float('nan'))):0.2f}",
+                        f"{float(r.get('coverage', float('nan'))):0.3f}",
+                        f"{float(r.get('majority_acc', float('nan'))):0.3f}",
+                        f"{float(prec):0.3f}",
+                    ]
+                )
+        if rows_r:
+            lines.append(_md_table(headers_r, rows_r))
+            lines.append("")
+
+    # -------------------- Reproducibility --------------------
     lines.append("## Reproducibility")
     lines.append("")
-    lines.append("Command-line arguments:")
+    lines.append(f"- Bootstrap: B={int(getattr(args, 'bootstrap_samples', 5000))}, seed={int(getattr(args, 'bootstrap_seed', 0))}")
+    lines.append(f"- Thread cap: {int(getattr(args, 'threads', 0))} (0 means no override)")
     lines.append("")
-    try:
-        args_dict = vars(args)
-    except Exception:
-        args_dict = {}
-    lines.append("```json")
-    lines.append(json.dumps(args_dict, indent=2, sort_keys=True, ensure_ascii=False))
-    lines.append("```")
+    lines.append("### Software / environment")
+    lines.append("")
+    lines.append(f"- Python: `{sys.version.split()[0]}`")
+    lines.append(f"- Platform: `{platform.platform()}`")
+    for dist in ("numpy", "pandas", "faiss-cpu", "faiss-gpu", "torch", "sentence-transformers", "scikit-learn", "joblib"):
+        v = _safe_pkg_version(dist)
+        if v:
+            lines.append(f"- {dist}: `{v}`")
+    lines.append("")
+
+    lines.append("### Artifacts")
+    lines.append("")
+    # Always include paths; include hashes only if available in dp.
+    artifact_rows = []
+    for key, path in (
+        ("corpus_parquet", str(getattr(args, "corpus_parquet", ""))),
+        ("semantic_npz", str(getattr(args, "semantic_npz", ""))),
+        ("idf_svd_npz", str(getattr(args, "idf_svd_npz", ""))),
+        ("idf_svd_model", str(getattr(args, "idf_svd_model", ""))),
+        ("kahm_query_model", str(getattr(args, "kahm_query_model", ""))),
+        ("mb_query_npz_test", str(getattr(args, "mb_query_npz_test", ""))),
+        ("mb_query_npz_train", str(getattr(args, "mb_query_npz_train", ""))),
+    ):
+        if not path:
+            continue
+        ap = os.path.abspath(path)
+        exists = os.path.exists(path)
+        size = os.path.getsize(path) if exists and os.path.isfile(path) else 0
+        artifact_rows.append([key, ap, "yes" if exists else "no", str(int(size))])
+    if artifact_rows:
+        lines.append(_md_table(["Artifact", "Path", "Exists", "Bytes"], artifact_rows))
+        lines.append("")
+
+    if str(dp.get("generator_script_path", "")).strip() or str(dp.get("generator_script_sha256", "")).strip():
+        lines.append("### Query generator fingerprint")
+        lines.append("")
+        lines.append(f"- generator_script_path: `{dp.get('generator_script_path', '')}`")
+        if dp.get("generator_script_sha256"):
+            lines.append(f"- generator_script_sha256: `{dp.get('generator_script_sha256')}`")
+        lines.append("")
+
+    lines.append("## Notes and limitations")
+    lines.append("")
+    lines.append(
+        "- Query sets appear to follow the synthetic schema (`query_text`, `consensus_law`, `topic_id`, `style`) when such fields are present; "
+        "interpretation of results should consider the split mode (topic overlap vs disjoint topics).\n"
+        "- This report focuses on retrieval quality and does not benchmark end-to-end latency or energy use.\n"
+        "- The transformer-query baseline is reported as a reference; KAHM may outperform it if the adapter is supervised/tuned for this label set."
+    )
     lines.append("")
 
     return "\n".join(lines)
-
 
 def l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     X = np.asarray(X, dtype=np.float32)
@@ -1541,6 +1781,218 @@ def extract_consensus_laws(qs: List[Any]) -> List[str]:
 
 
 # ----------------------------- FAISS -----------------------------
+def extract_styles(qs: List[Any]) -> List[str]:
+    keys = ["style", "query_style", "format"]
+    out: List[str] = []
+    for q in qs:
+        v = _pick_from_mapping(q, keys)
+        if not v:
+            v = _pick_from_object_attrs(q, keys)
+        out.append(str(v).strip())
+    return out
+
+
+def extract_topic_ids(qs: List[Any]) -> List[str]:
+    keys = ["topic_id", "topic", "topicid"]
+    out: List[str] = []
+    for q in qs:
+        v = _pick_from_mapping(q, keys)
+        if not v:
+            v = _pick_from_object_attrs(q, keys)
+        out.append(str(v).strip())
+    return out
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _safe_pkg_version(dist_name: str) -> str:
+    try:
+        return importlib.metadata.version(dist_name)
+    except Exception:
+        return ""
+
+
+def _try_load_json(path: str) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def load_query_generation_meta(
+    *,
+    query_set_module: str,
+    explicit_meta_path: str = "",
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Best-effort load of query-generation metadata.
+
+    Priority:
+      1) --query_meta_path (explicit_meta_path)
+      2) module attributes: QUERY_SET_META / META / meta
+      3) meta.json in the query_set module directory (or one directory above)
+
+    Returns: (meta_dict_or_None, provenance_string)
+    """
+    if explicit_meta_path:
+        meta = _try_load_json(explicit_meta_path)
+        if isinstance(meta, dict):
+            return meta, f"file:{os.path.abspath(explicit_meta_path)}"
+
+    try:
+        mod = importlib.import_module(query_set_module)
+    except Exception:
+        return None, "unavailable"
+
+    for attr in ("QUERY_SET_META", "META", "meta"):
+        if hasattr(mod, attr):
+            v = getattr(mod, attr)
+            if isinstance(v, dict):
+                return v, f"module:{query_set_module}.{attr}"
+            if isinstance(v, str):
+                try:
+                    vv = json.loads(v)
+                    if isinstance(vv, dict):
+                        return vv, f"module:{query_set_module}.{attr}"
+                except Exception:
+                    pass
+
+    mod_file = getattr(mod, "__file__", "") or ""
+    if mod_file and os.path.exists(mod_file):
+        d = os.path.dirname(os.path.abspath(mod_file))
+        for cand in (os.path.join(d, "meta.json"), os.path.join(os.path.dirname(d), "meta.json")):
+            meta = _try_load_json(cand)
+            if isinstance(meta, dict):
+                return meta, f"file:{os.path.abspath(cand)}"
+
+    return None, "unavailable"
+
+
+def summarize_query_set(
+    qs: List[Any],
+    *,
+    name: str,
+) -> Dict[str, Any]:
+    """Compute basic descriptive statistics for a query set."""
+    texts = extract_query_texts(qs)
+    laws = extract_consensus_laws(qs)
+    styles = extract_styles(qs)
+    topics = extract_topic_ids(qs)
+
+    n = len(qs)
+    uniq_texts = len({t for t in texts if t})
+    dup_texts = n - uniq_texts
+
+    def _count(vals: List[str]) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for v in vals:
+            vv = str(v).strip()
+            out[vv] = out.get(vv, 0) + 1
+        return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    return {
+        "name": name,
+        "n": int(n),
+        "n_unique_text": int(uniq_texts),
+        "n_duplicate_text": int(dup_texts),
+        "law_counts": _count(laws),
+        "style_counts": _count(styles),
+        "topic_counts": _count([t for t in topics if t]),
+        "n_unique_topics": int(len({t for t in topics if t})),
+    }
+
+
+def split_diagnostics(
+    train_qs: Optional[List[Any]],
+    test_qs: List[Any],
+) -> Dict[str, Any]:
+    """Check train/test disjointness and topic overlap when train_qs is available."""
+    out: Dict[str, Any] = {}
+
+    test_texts = set(t for t in extract_query_texts(test_qs) if t)
+    test_topics = set(t for t in extract_topic_ids(test_qs) if t)
+
+    out["test_unique_text"] = int(len(test_texts))
+    out["test_unique_topics"] = int(len(test_topics))
+
+    if not train_qs:
+        out["train_available"] = False
+        return out
+
+    train_texts = set(t for t in extract_query_texts(train_qs) if t)
+    train_topics = set(t for t in extract_topic_ids(train_qs) if t)
+
+    out["train_available"] = True
+    out["train_unique_text"] = int(len(train_texts))
+    out["train_unique_topics"] = int(len(train_topics))
+
+    out["text_overlap_n"] = int(len(train_texts & test_texts))
+    out["topic_overlap_n"] = int(len(train_topics & test_topics))
+    out["topic_overlap_frac_of_test"] = float(len(train_topics & test_topics) / max(1, len(test_topics)))
+
+    return out
+
+
+def label_leakage_diagnostics(
+    qs: List[Any],
+    *,
+    label_universe: Sequence[str],
+) -> Dict[str, Any]:
+    """Estimate label leakage: how often law abbreviations appear in query text.
+
+    Uses a conservative boundary match: (?<!\\w)LABEL(?!\\w), case-insensitive.
+    """
+    labels = [str(x).strip() for x in label_universe if str(x).strip()]
+    if not labels:
+        return {"n": int(len(qs))}
+
+    pats = {lab: re.compile(rf"(?<!\w){re.escape(lab)}(?!\w)", re.IGNORECASE) for lab in labels}
+
+    texts = extract_query_texts(qs)
+    gold = extract_consensus_laws(qs)
+
+    n = len(texts)
+    any_label = 0
+    gold_label = 0
+    other_label = 0
+
+    for t, g in zip(texts, gold):
+        s = str(t)
+        found = [lab for lab, pat in pats.items() if pat.search(s) is not None]
+        if found:
+            any_label += 1
+        gg = str(g).strip()
+        if gg and gg in pats and pats[gg].search(s) is not None:
+            gold_label += 1
+            # count as "other" if it contains also another label
+            if any(lab != gg for lab in found):
+                other_label += 1
+        else:
+            if gg and found:
+                # contains at least one label, but not the gold label
+                other_label += 1
+
+    return {
+        "n": int(n),
+        "p_any_label": float(any_label / max(1, n)),
+        "p_gold_label": float(gold_label / max(1, n)),
+        "p_other_label": float(other_label / max(1, n)),
+        "any_label_n": int(any_label),
+        "gold_label_n": int(gold_label),
+        "other_label_n": int(other_label),
+        "match_rule": "(?<!\\w)LABEL(?!\\w) (case-insensitive)",
+    }
+
 def build_faiss_index(emb: np.ndarray, *, n_threads: int | None = None):
     """Build a FlatIP index. If n_threads is set, cap FAISS OpenMP threads."""
     import faiss  # type: ignore
@@ -2230,12 +2682,12 @@ def recommend_routing_threshold(
     # Feasible set: coverage >= min_coverage
     feas = [r for r in rows if np.isfinite(r[1]) and r[1] >= min_coverage]
     if feas:
-        # Max majority-acc (more correct decisions), tie-break by precision (acc|covered), then lower tau (more permissive).
-        tau, cov, acc, prec = sorted(feas, key=lambda r: (r[2], r[3], -r[0]), reverse=True)[0]
+        # Max precision (acc|covered), tie-break by majority-acc (P(correct ∧ covered)), then lower tau (more permissive).
+        tau, cov, acc, prec = sorted(feas, key=lambda r: (r[3], r[2], -r[0]), reverse=True)[0]
         return float(tau), float(cov), float(acc), float(prec)
 
-    # If nothing meets the coverage constraint, pick tau with max majority-acc.
-    tau, cov, acc, prec = sorted(rows, key=lambda r: (r[2], r[3], -r[0]), reverse=True)[0]
+    # If nothing meets the coverage constraint, pick tau with max precision (then majority-acc).
+    tau, cov, acc, prec = sorted(rows, key=lambda r: (r[3], r[2], -r[0]), reverse=True)[0]
     return float(tau), float(cov), float(acc), float(prec)
 
 
@@ -2413,6 +2865,25 @@ def main() -> None:
     p.add_argument("--kahm_mode", default="soft")
     p.add_argument("--kahm_batch", type=int, default=1024)
     p.add_argument("--query_set", default="query_set.TEST_QUERY_SET")
+    p.add_argument(
+        "--train_query_set",
+        default="query_set.TRAIN_QUERY_SET",
+        help=(
+            "Optional: module.attr for the TRAIN query set (used only for split diagnostics in the report). "
+            "Set to an empty string to skip loading training queries."
+        ),
+    )
+    p.add_argument(
+        "--query_meta_path",
+        default="",
+        help=("Optional: path to meta.json produced by generate_query_set_austrian_law.py (dataset provenance)."),
+    )
+    p.add_argument(
+        "--query_generator_script_path",
+        default="",
+        help=("Optional: path to generate_query_set_austrian_law.py (included as a hash in the report for reproducibility)."),
+    )
+
 
 
     # Evaluation hygiene
@@ -2584,9 +3055,50 @@ def main() -> None:
             texts = [t for t, m in zip(texts, mask) if m]
             consensus = [c for c, m in zip(consensus, mask) if m]
             query_ids = [q for q, m in zip(query_ids, mask) if m]
+            qs = [q for q, m in zip(qs, mask) if m]
             n_q = len(texts)
             print(f"Filtered queries: dropped {dropped}, kept {kept} (non-empty text + consensus).", flush=True)
 
+
+    # Optional: load TRAIN query set for split diagnostics (report only).
+    train_qs: Optional[List[Any]] = None
+    if str(getattr(args, "train_query_set", "")).strip():
+        try:
+            train_qs = load_query_set(str(args.train_query_set))
+        except Exception as e:
+            print(f"WARNING: could not load train_query_set={args.train_query_set!r}: {e}", flush=True)
+            train_qs = None
+
+    # Apply the same empty-filtering to TRAIN for comparability (report only).
+    if train_qs is not None and bool(getattr(args, "drop_empty_queries", True)):
+        tr_texts = extract_query_texts(train_qs)
+        tr_cons = extract_consensus_laws(train_qs)
+        tr_mask = []
+        for t, c in zip(tr_texts, tr_cons):
+            tt = str(t).strip() if t is not None else ""
+            cc = str(c).strip() if c is not None else ""
+            tr_mask.append(bool(tt) and bool(cc))
+        if not all(tr_mask):
+            train_qs = [q for q, m in zip(train_qs, tr_mask) if m]
+
+    # Query-generation metadata (best effort; used only in the report).
+    qmod_name = str(args.query_set).rsplit(".", 1)[0] if "." in str(args.query_set) else str(args.query_set)
+    query_meta, query_meta_src = load_query_generation_meta(
+        query_set_module=qmod_name,
+        explicit_meta_path=str(getattr(args, "query_meta_path", "")),
+    )
+
+    q_summary_test = summarize_query_set(qs, name="TEST")
+    q_summary_train = summarize_query_set(train_qs, name="TRAIN") if train_qs is not None else None
+    q_split_diag = split_diagnostics(train_qs, qs)
+
+    gen_script_path = str(getattr(args, "query_generator_script_path", "")).strip()
+    gen_script_sha256 = ""
+    if gen_script_path and os.path.exists(gen_script_path):
+        try:
+            gen_script_sha256 = _sha256_file(gen_script_path)
+        except Exception:
+            gen_script_sha256 = ""
 
     # Apply thread limits early (before importing torch/faiss) to avoid oversubscription
     # and reduce the probability of native-library crashes under high memory pressure.
@@ -2644,8 +3156,39 @@ def main() -> None:
         texts = [t for t, ok in zip(texts, present_mask) if ok]
         consensus = [c for c, ok in zip(consensus, present_mask) if ok]
         query_ids = [q for q, ok in zip(query_ids, present_mask) if ok]
+        qs = [q for q, ok in zip(qs, present_mask) if ok]
         cons_clean = [c for c, ok in zip(cons_clean, present_mask) if ok]
         n_q = len(texts)
+
+    # Recompute query summaries after corpus-label filtering (report uses the *evaluated* query set).
+    q_summary_test = summarize_query_set(qs, name="TEST")
+    if train_qs is not None:
+        q_summary_train = summarize_query_set(train_qs, name="TRAIN")
+        q_split_diag = split_diagnostics(train_qs, qs)
+
+    label_universe = sorted(law_set)
+    leak_test = label_leakage_diagnostics(qs, label_universe=label_universe)
+    leak_train = label_leakage_diagnostics(train_qs, label_universe=label_universe) if train_qs is not None else None
+
+    corpus_counts = dict(
+        sorted(
+            Counter(str(x) for x in law_arr.tolist()).items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+    )
+    data_provenance: Dict[str, Any] = {
+        "query_meta": query_meta,
+        "query_meta_source": query_meta_src,
+        "query_summary_test": q_summary_test,
+        "query_summary_train": q_summary_train,
+        "split_diagnostics": q_split_diag,
+        "label_leakage_test": leak_test,
+        "label_leakage_train": leak_train,
+        "corpus_counts_by_law": corpus_counts,
+        "generator_script_path": gen_script_path,
+        "generator_script_sha256": gen_script_sha256,
+    }
+
 
     # ---------------------------------------------------------------------
     # Cutoffs: parse --ks and ensure --k is included so single-k storylines
@@ -3227,6 +3770,7 @@ def main() -> None:
             "coverage": float(cov_star),
             "majority_acc": float(acc_star),
             "acc_given_covered": float(prec_star),
+            "precision": float(prec_star),
         }
     print(
         "\nAlternative majority-vote routing thresholds (maximize majority-acc subject to coverage constraint)"
@@ -3248,6 +3792,7 @@ def main() -> None:
             "coverage": float(cov_star),
             "majority_acc": float(acc_star),
             "acc_given_covered": float(prec_star),
+            "precision": float(prec_star),
         }
 
 
@@ -3293,6 +3838,7 @@ def main() -> None:
             macro_deltas_vs_mb_by_k=macro_deltas_vs_mb_by_k,
             timing=timing,
             threshold_suggestions=threshold_suggestions,
+            data_provenance=data_provenance,
         )
         _write_text(str(args.report_path), report_md, overwrite=bool(getattr(args, "report_overwrite", False)))
         print(f"\nSaved publication report to: {os.path.abspath(str(args.report_path))}")
@@ -3326,6 +3872,7 @@ def main() -> None:
             "micro": summaries_by_k,
             "micro_deltas_vs_idf": deltas_vs_idf_by_k,
             "micro_deltas_vs_mb": deltas_vs_mb_by_k,
+            "data_provenance": data_provenance,
             "macro": macro_summaries_by_k,
             "macro_deltas_vs_idf": macro_deltas_vs_idf_by_k,
             "macro_deltas_vs_mb": macro_deltas_vs_mb_by_k,
