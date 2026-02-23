@@ -800,6 +800,7 @@ def build_scientific_report_md(
     timing: Dict[str, Any],
     threshold_suggestions: Dict[str, Any],
     data_provenance: Optional[Dict[str, Any]] = None,
+    machine_profile: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Generate a publication-ready Markdown report for the focused 3-system comparison.
 
@@ -1223,6 +1224,202 @@ def build_scientific_report_md(
             lines.append(_md_table(headers_r, rows_r))
             lines.append("")
 
+
+    # -------------------- Computational profile --------------------
+    lines.append("## Computational profile")
+    lines.append("")
+    lines.append(
+        "This section reports query-time computational profiles for the three retrieval paths. "
+        "The primary comparison target is **online per-query time** (query embedding + FAISS search). "
+        "If a query embedding source was loaded from a precomputed NPZ in this run, the corresponding online embedding time is reported as `n/a` and the load time is reported separately."
+    )
+    lines.append("")
+
+    # Compact per-path comparison (dashboard-friendly)
+    compute_path_rows: List[List[str]] = []
+
+    def _path_row(name: str, source: str, q_embed_s_per_q: Any, faiss_s_per_q: Any, total_online_s_per_q: Any, notes: str = "") -> List[str]:
+        qv = _safe_float(q_embed_s_per_q)
+        sv = _safe_float(faiss_s_per_q)
+        tv = _safe_float(total_online_s_per_q)
+        observed_total = (qv if np.isfinite(qv) else 0.0) + (sv if np.isfinite(sv) else 0.0)
+        return [
+            name,
+            str(source),
+            _ms(q_embed_s_per_q),
+            _ms(faiss_s_per_q),
+            _ms(total_online_s_per_q),
+            _ms(observed_total) if (np.isfinite(qv) or np.isfinite(sv)) else "n/a",
+            notes,
+        ]
+
+    kahm_src = str(timing.get("kahm_query_source", "model"))
+    mb_src = str(timing.get("mb_query_source", "online"))
+    compute_path_rows.append(
+        _path_row(
+            method_idf,
+            "model",
+            timing.get("idf_embed_seconds_per_query"),
+            timing.get("faiss_idf_search_seconds_per_query"),
+            timing.get("online_idf_seconds_per_query"),
+            "IDF–SVD model load shown in component table (cold-start).",
+        )
+    )
+    compute_path_rows.append(
+        _path_row(
+            method_kahm,
+            kahm_src,
+            timing.get("kahm_query_embed_seconds_per_query"),
+            timing.get("faiss_kahm_qmb_search_seconds_per_query"),
+            timing.get("online_kahm_seconds_per_query"),
+            "Online total only available when KAHM queries were embedded in this run (not precomputed NPZ).",
+        )
+    )
+    compute_path_rows.append(
+        _path_row(
+            method_mb,
+            mb_src,
+            timing.get("mb_query_embed_seconds_per_query"),
+            timing.get("faiss_mb_search_seconds_per_query"),
+            timing.get("online_mb_seconds_per_query"),
+            "Online total only available when Mixedbread queries were encoded on the fly (not precomputed NPZ).",
+        )
+    )
+
+    lines.append("### Per-query online path comparison")
+    lines.append("")
+    lines.append(
+        _md_table(
+            ["Path", "Query source", "Query embed / q", "FAISS search / q", "Total online / q", "Observed step sum / q", "Notes"],
+            compute_path_rows,
+        )
+    )
+    lines.append("")
+
+    # Detailed measured components (batch totals and per-query proxies)
+    lines.append("### Measured components (wall-clock)")
+    lines.append("")
+    comp_rows: List[List[str]] = []
+
+    def _comp(name: str, total_key: str, per_q_key: Optional[str] = None, notes: str = "") -> None:
+        total_v = timing.get(total_key, float("nan"))
+        per_v = timing.get(per_q_key, float("nan")) if per_q_key else float("nan")
+        comp_rows.append([
+            name,
+            _fmt_seconds_or_na(total_v),
+            _ms(per_v),
+            notes,
+        ])
+
+    # Query-side components
+    _comp("IDF–SVD query pipeline init (cold-start)", "idf_init_seconds_total", "idf_init_seconds_per_query", "One-time pipeline/materialization cost.")
+    _comp("IDF–SVD query embedding (batch)", "idf_embed_seconds_total", "idf_embed_seconds_per_query")
+    _comp("KAHM query load (precomputed NPZ)", "kahm_query_load_seconds_total", "kahm_query_load_seconds_per_query", "Only present when --kahm_query_embeddings_npz is used.")
+    _comp("KAHM query model init (cold-start)", "kahm_query_init_seconds_total", "kahm_query_init_seconds_per_query", "Only present for online KAHM embedding.")
+    _comp("KAHM query warm-up (excluded from online total)", "kahm_query_warmup_seconds_total", None)
+    _comp("KAHM query embedding (batch)", "kahm_query_embed_seconds_total", "kahm_query_embed_seconds_per_query")
+    _comp("Mixedbread query load (precomputed NPZ)", "mb_query_load_seconds_total", "mb_query_load_seconds_per_query", "Only present when precomputed Mixedbread query embeddings are used.")
+    _comp("Mixedbread model init (cold-start)", "mb_query_init_seconds_total", "mb_query_init_seconds_per_query", "Only present for online transformer query encoding.")
+    _comp("Mixedbread query warm-up (excluded from online total)", "mb_query_warmup_seconds_total", None)
+    _comp("Mixedbread query embedding (batch)", "mb_query_embed_seconds_total", "mb_query_embed_seconds_per_query")
+
+    # Retrieval / index components
+    _comp("FAISS build (IDF corpus index)", "faiss_idf_build_seconds", None)
+    _comp("FAISS search (IDF path)", "faiss_idf_search_seconds_total", "faiss_idf_search_seconds_per_query")
+    _comp("FAISS build (MB corpus index)", "faiss_mb_build_seconds", None, "Shared by Mixedbread and KAHM(query→MB) paths.")
+    _comp("FAISS search (Mixedbread path)", "faiss_mb_search_seconds_total", "faiss_mb_search_seconds_per_query")
+    _comp("FAISS search (KAHM→MB path)", "faiss_kahm_qmb_search_seconds_total", "faiss_kahm_qmb_search_seconds_per_query")
+
+    # Memory footprint proxies
+    comp_rows.append([
+        "Corpus embedding memory (IDF matrix)",
+        f"{int(timing.get('corpus_idf_bytes', 0)):,} bytes" if timing.get("corpus_idf_bytes", None) is not None else "n/a",
+        "n/a",
+        "NumPy array nbytes (aligned corpus embeddings used in this run).",
+    ])
+    comp_rows.append([
+        "Corpus embedding memory (MB matrix)",
+        f"{int(timing.get('corpus_mb_bytes', 0)):,} bytes" if timing.get("corpus_mb_bytes", None) is not None else "n/a",
+        "n/a",
+        "NumPy array nbytes (aligned corpus embeddings used in this run).",
+    ])
+
+    lines.append(_md_table(["Component", "Wall time", "Per query", "Notes"], comp_rows))
+    lines.append("")
+
+    # Derived speedups (only where online totals are available)
+    lines.append("### Derived online speedups (per-query)")
+    lines.append("")
+    speed_rows: List[List[str]] = []
+    idf_online = _safe_float(timing.get("online_idf_seconds_per_query"))
+    kahm_online = _safe_float(timing.get("online_kahm_seconds_per_query"))
+    mb_online = _safe_float(timing.get("online_mb_seconds_per_query"))
+
+    def _speedup(numer: float, denom: float) -> str:
+        if np.isfinite(numer) and np.isfinite(denom) and numer > 0 and denom > 0:
+            return f"{numer/denom:.2f}×"
+        return "n/a"
+
+    speed_rows.append([f"{method_idf} vs {method_kahm}", _speedup(idf_online, kahm_online), "IDF online / KAHM online"])
+    speed_rows.append([f"{method_mb} vs {method_kahm}", _speedup(mb_online, kahm_online), "MB online / KAHM online"])
+    speed_rows.append([f"{method_mb} vs {method_idf}", _speedup(mb_online, idf_online), "MB online / IDF online"])
+    lines.append(_md_table(["Comparison", "Speedup", "Definition"], speed_rows))
+    lines.append("")
+
+    # Machine profile (best effort)
+    mp = machine_profile if isinstance(machine_profile, dict) else {}
+    lines.append("### Machine profile (auto-detected; best effort)")
+    lines.append("")
+    if mp:
+        machine_rows: List[List[str]] = []
+        def _add_mp(label: str, key: str, fmt=lambda x: str(x)) -> None:
+            if key not in mp:
+                return
+            v = mp.get(key)
+            if v is None or v == "":
+                return
+            try:
+                sval = fmt(v)
+            except Exception:
+                sval = str(v)
+            if sval == "":
+                return
+            machine_rows.append([label, sval])
+
+        _add_mp("Hostname", "hostname")
+        _add_mp("Platform", "platform")
+        _add_mp("System", "system")
+        _add_mp("Machine / arch", "machine")
+        _add_mp("Processor", "processor")
+        _add_mp("CPU logical cores", "cpu_count_logical")
+        _add_mp("CPU physical cores", "cpu_count_physical")
+        _add_mp("RAM total", "memory_total_gib", lambda v: f"{float(v):.2f} GiB")
+        _add_mp("Python", "python_version")
+        _add_mp("Torch runtime", "torch_version_runtime")
+        _add_mp("Accelerator type", "accelerator_type")
+        _add_mp("Accelerator name", "accelerator_name")
+        _add_mp("CUDA available", "torch_cuda_available")
+        _add_mp("MPS available", "torch_mps_available")
+        _add_mp("Requested device arg", "device_arg")
+        _add_mp("Auto-resolved device", "device_auto_resolved")
+        _add_mp("Thread cap arg", "threads_cap_arg")
+        _add_mp("KAHM query source", "kahm_query_source")
+        _add_mp("Mixedbread query source", "mb_query_source")
+        _add_mp("n_queries", "n_queries")
+        _add_mp("n_corpus", "n_corpus")
+        _add_mp("embedding_dim", "embedding_dim")
+        _add_mp("retrieval_k_max", "retrieval_k_max")
+
+        if machine_rows:
+            lines.append(_md_table(["Field", "Value"], machine_rows))
+            lines.append("")
+        else:
+            lines.append("- No machine metadata could be collected on this runtime.")
+            lines.append("")
+    else:
+        lines.append("- No machine metadata could be collected on this runtime.")
+        lines.append("")
+
     # -------------------- Reproducibility --------------------
     lines.append("## Reproducibility")
     lines.append("")
@@ -1275,7 +1472,7 @@ def build_scientific_report_md(
     lines.append(
         "- Query sets appear to follow the synthetic schema (`query_text`, `consensus_law`, `topic_id`, `style`) when such fields are present; "
         "interpretation of results should consider the split mode (topic overlap vs disjoint topics).\n"
-        "- This report focuses on retrieval quality and does not benchmark end-to-end latency or energy use.\n"
+        "- This report focuses on retrieval quality, with added wall-clock query-time profiling; it does not benchmark end-to-end serving latency under concurrency or energy use.\n"
         "- The transformer-query baseline is reported as a reference; KAHM may outperform it if the adapter is supervised/tuned for this label set."
     )
     lines.append("")
@@ -1818,6 +2015,210 @@ def _safe_pkg_version(dist_name: str) -> str:
         return ""
 
 
+
+def _safe_float(v: Any) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float("nan")
+
+
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+def _bytes_to_gib(n_bytes: Any) -> Optional[float]:
+    try:
+        n = float(n_bytes)
+        if not np.isfinite(n) or n < 0:
+            return None
+        return float(n / (1024.0 ** 3))
+    except Exception:
+        return None
+
+
+def _detect_total_ram_bytes() -> Optional[int]:
+    # Best-effort, cross-platform.
+    try:
+        import psutil  # type: ignore
+        vm = psutil.virtual_memory()
+        return int(getattr(vm, "total", 0) or 0)
+    except Exception:
+        pass
+
+    # POSIX fallback
+    try:
+        if hasattr(os, "sysconf"):
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
+                return int(pages) * int(page_size)
+    except Exception:
+        pass
+    return None
+
+
+def collect_machine_profile(
+    *,
+    args: Optional[argparse.Namespace] = None,
+    timing: Optional[Dict[str, Any]] = None,
+    n_queries: Optional[int] = None,
+    n_corpus: Optional[int] = None,
+    embedding_dim: Optional[int] = None,
+    k_max: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Best-effort machine/runtime profile for timing context.
+
+    The goal is pragmatic reproducibility: capture enough hardware/runtime metadata to
+    interpret computational timing without making strong assumptions about optional libs.
+    """
+    prof: Dict[str, Any] = {}
+
+    # OS / host / Python
+    try:
+        prof["hostname"] = platform.node() or ""
+    except Exception:
+        prof["hostname"] = ""
+    try:
+        prof["platform"] = platform.platform()
+    except Exception:
+        prof["platform"] = ""
+    try:
+        prof["system"] = platform.system()
+        prof["release"] = platform.release()
+        prof["version"] = platform.version()
+        prof["machine"] = platform.machine()
+        prof["processor"] = platform.processor()
+    except Exception:
+        pass
+
+    prof["python_version"] = sys.version.split()[0]
+    prof["python_implementation"] = getattr(platform, "python_implementation", lambda: "")()
+
+    # CPU / memory
+    try:
+        prof["cpu_count_logical"] = int(os.cpu_count() or 0)
+    except Exception:
+        prof["cpu_count_logical"] = None
+    prof["cpu_count_physical"] = None
+    try:
+        import psutil  # type: ignore
+        prof["cpu_count_physical"] = psutil.cpu_count(logical=False)
+        if hasattr(psutil, "cpu_freq") and psutil.cpu_freq():
+            f = psutil.cpu_freq()
+            if f is not None:
+                prof["cpu_freq_mhz_max"] = getattr(f, "max", None)
+                prof["cpu_freq_mhz_current"] = getattr(f, "current", None)
+    except Exception:
+        pass
+
+    ram_bytes = _detect_total_ram_bytes()
+    prof["memory_total_bytes"] = ram_bytes
+    prof["memory_total_gib"] = _bytes_to_gib(ram_bytes)
+
+    # Runtime / eval context
+    if args is not None:
+        prof["threads_cap_arg"] = int(getattr(args, "threads", 0))
+        prof["device_arg"] = str(getattr(args, "device", "auto"))
+        prof["mb_force_online"] = bool(getattr(args, "mb_force_online", False))
+        prof["mb_query_batch"] = _safe_int(getattr(args, "mb_query_batch", None))
+        prof["kahm_batch"] = _safe_int(getattr(args, "kahm_batch", None))
+        prof["query_prefix"] = str(getattr(args, "query_prefix", ""))
+    if n_queries is not None:
+        prof["n_queries"] = int(n_queries)
+    if n_corpus is not None:
+        prof["n_corpus"] = int(n_corpus)
+    if embedding_dim is not None:
+        prof["embedding_dim"] = int(embedding_dim)
+    if k_max is not None:
+        prof["retrieval_k_max"] = int(k_max)
+
+    # Torch / accelerator (best-effort)
+    try:
+        import torch  # type: ignore
+        prof["torch_version_runtime"] = getattr(torch, "__version__", "")
+        prof["torch_cuda_available"] = bool(torch.cuda.is_available())
+        prof["torch_mps_available"] = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+        try:
+            prof["torch_num_threads"] = int(torch.get_num_threads())
+        except Exception:
+            pass
+        try:
+            prof["torch_num_interop_threads"] = int(torch.get_num_interop_threads())
+        except Exception:
+            pass
+
+        if torch.cuda.is_available():
+            try:
+                dc = int(torch.cuda.device_count())
+                prof["cuda_device_count"] = dc
+                devs = []
+                for i in range(dc):
+                    try:
+                        props = torch.cuda.get_device_properties(i)
+                        devs.append({
+                            "index": int(i),
+                            "name": str(getattr(props, "name", "")),
+                            "total_memory_gib": _bytes_to_gib(getattr(props, "total_memory", None)),
+                            "major": int(getattr(props, "major", -1)),
+                            "minor": int(getattr(props, "minor", -1)),
+                        })
+                    except Exception:
+                        devs.append({"index": int(i)})
+                prof["cuda_devices"] = devs
+                if devs:
+                    prof["accelerator_name"] = devs[0].get("name", "")
+                    prof["accelerator_type"] = "cuda"
+            except Exception:
+                prof["accelerator_type"] = "cuda"
+        elif bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+            prof["accelerator_type"] = "mps"
+            prof["accelerator_name"] = "Apple Metal (MPS)"
+        else:
+            prof["accelerator_type"] = "cpu"
+            prof["accelerator_name"] = "CPU"
+    except Exception:
+        # No torch installed / import failed
+        prof.setdefault("accelerator_type", "unknown")
+
+    # Resolved device candidate for MB online encoding path
+    try:
+        prof["device_auto_resolved"] = choose_device(str(getattr(args, "device", "auto")) if args is not None else "auto")
+    except Exception:
+        pass
+
+    # Timing source indicators (useful for interpreting "n/a" totals)
+    if isinstance(timing, dict):
+        prof["kahm_query_source"] = str(timing.get("kahm_query_source", ""))
+        prof["mb_query_source"] = str(timing.get("mb_query_source", ""))
+        prof["idf_query_source"] = "model"
+
+    return prof
+
+
+def _fmt_seconds_or_na(v: Any, digits: int = 3) -> str:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return "n/a"
+        return f"{x:.{digits}f} s"
+    except Exception:
+        return "n/a"
+
+
+def _fmt_ms_or_na_from_seconds(v: Any, digits: int = 3) -> str:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return "n/a"
+        return f"{x * 1000.0:.{digits}f} ms"
+    except Exception:
+        return "n/a"
 def _try_load_json(path: str) -> Optional[Dict[str, Any]]:
     if not path:
         return None
@@ -2955,7 +3356,7 @@ def main() -> None:
     )
 
     p.add_argument("--mixedbread_model", default="mixedbread-ai/deepset-mxbai-embed-de-large-v1")
-    p.add_argument("--device", type=str, default="cpu", help="Device for Mixedbread embedding model (e.g., 'cpu', 'cuda').")
+    p.add_argument("--device", type=str, default="cpu", help="Device for Mixedbread embedding model (e.g., 'cpu', 'auto', 'cuda').")
     p.add_argument("--query_prefix", default="query: ")
     p.add_argument("--mb_query_batch", type=int, default=1)
 
@@ -3543,6 +3944,16 @@ def main() -> None:
 
     timing['corpus_mb_bytes'] = int(getattr(emb_mb, 'nbytes', 0))
 
+    # Best-effort machine/runtime profile to contextualize timing results.
+    machine_profile = collect_machine_profile(
+        args=args,
+        timing=timing,
+        n_queries=int(len(texts)),
+        n_corpus=int(law_arr.size),
+        embedding_dim=int(emb_mb.shape[1]),
+        k_max=int(k_max),
+    )
+
     pred_frac = float(args.predominance_fraction)
     n_boot = int(args.bootstrap_samples)
     seed = int(args.bootstrap_seed)
@@ -3839,6 +4250,7 @@ def main() -> None:
             timing=timing,
             threshold_suggestions=threshold_suggestions,
             data_provenance=data_provenance,
+            machine_profile=machine_profile,
         )
         _write_text(str(args.report_path), report_md, overwrite=bool(getattr(args, "report_overwrite", False)))
         print(f"\nSaved publication report to: {os.path.abspath(str(args.report_path))}")
@@ -3877,6 +4289,7 @@ def main() -> None:
             "macro_deltas_vs_idf": macro_deltas_vs_idf_by_k,
             "macro_deltas_vs_mb": macro_deltas_vs_mb_by_k,
             "threshold_suggestions": threshold_suggestions,
+            "machine_profile": machine_profile,
         }
         outp = str(args.results_json_path)
         with open(outp, "w", encoding="utf-8") as f:

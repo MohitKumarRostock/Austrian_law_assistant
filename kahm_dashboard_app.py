@@ -160,6 +160,7 @@ class ParsedReport:
     delta: Dict[int, pd.DataFrame]
     compute_init: Optional[pd.DataFrame]
     compute_paths: Optional[pd.DataFrame]
+    compute_machine: Optional[pd.DataFrame]
     routing: Optional[pd.DataFrame]
 
 
@@ -189,8 +190,8 @@ def parse_report(md: str) -> ParsedReport:
 
     title = lines[0].lstrip("#").strip() if lines and lines[0].startswith("#") else ""
     generated = ""
-    for ln in lines[:40]:
-        if ln.startswith("Generated:"):
+    for ln in lines[:60]:
+        if ln.startswith("Generated:") or ln.startswith("**Generated (UTC):**"):
             generated = ln.strip()
             break
 
@@ -198,6 +199,7 @@ def parse_report(md: str) -> ParsedReport:
     delta: Dict[int, pd.DataFrame] = {}
     compute_init: Optional[pd.DataFrame] = None
     compute_paths: Optional[pd.DataFrame] = None
+    compute_machine: Optional[pd.DataFrame] = None
     routing: Optional[pd.DataFrame] = None
 
     # --------- Pass 1: old format (per-k micro + per-k delta) ---------
@@ -245,6 +247,15 @@ def parse_report(md: str) -> ParsedReport:
             compute_paths = df
             i = nxt
             continue
+
+        # Machine profile table (newer publication reports)
+        if ln.startswith("| Field | Value"):
+            window = "\n".join(lines[max(0, i-4): i+1])
+            if ("Machine profile" in window) or ("auto-detected" in window):
+                df, nxt = _parse_markdown_table(lines, i)
+                compute_machine = df
+                i = nxt
+                continue
 
         # Routing (older report)
         if ln.startswith("| Method | tau* | coverage"):
@@ -427,6 +438,7 @@ def parse_report(md: str) -> ParsedReport:
         delta=delta,
         compute_init=compute_init,
         compute_paths=compute_paths,
+        compute_machine=compute_machine,
         routing=routing,
     )
 
@@ -1120,17 +1132,77 @@ with tabs[0]:
                 if pr.compute_paths is None:
                     st.info("No per-query compute table found in this report file (some report variants omit compute profiling tables).")
                 else:
-                    df = pr.compute_paths.copy()
-                    # parse ms strings
-                    for col in ["Query embed / q", "FAISS search / q", "Total online / q"]:
-                        if col in df.columns:
-                            df[col] = df[col].astype(str).str.replace("ms", "").str.strip()
-                            df[col] = pd.to_numeric(df[col], errors="coerce")
-                    fig = px.bar(df, x="Path", y="Total online / q", text="Total online / q")
-                    fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
-                    st.plotly_chart(fig, width="stretch")
-                    st.dataframe(pr.compute_paths, width='stretch', hide_index=True)
+                    df_raw = pr.compute_paths.copy()
+                    df_plot = df_raw.copy()
+
+                    def _to_ms_num(s: object) -> float:
+                        txtv = str(s).strip().lower()
+                        if txtv in {"", "n/a", "na", "nan", "none", "—", "-"}:
+                            return float("nan")
+                        txtv = txtv.replace("milliseconds", "ms").replace("millisecond", "ms")
+                        m = re.search(r"([+-]?\d+(?:\.\d+)?)", txtv)
+                        if not m:
+                            return float("nan")
+                        val = float(m.group(1))
+                        if " s" in f" {txtv}" and "ms" not in txtv:
+                            return val * 1000.0
+                        return val
+
+                    candidate_cols = [
+                        "Total online / q",
+                        "Observed step sum / q",
+                        "Query embed / q",
+                        "FAISS search / q",
+                    ]
+                    numeric_cols: List[str] = []
+                    for col in candidate_cols:
+                        if col in df_plot.columns:
+                            df_plot[col] = df_plot[col].map(_to_ms_num)
+                            if pd.to_numeric(df_plot[col], errors="coerce").notna().any():
+                                numeric_cols.append(col)
+
+                    if numeric_cols and "Path" in df_plot.columns:
+                        metric_col = st.selectbox(
+                            "Compute metric (per query, ms)",
+                            options=numeric_cols,
+                            index=0,
+                            key="compute_metric_sel",
+                        )
+                        fig = px.bar(df_plot, x="Path", y=metric_col, text=metric_col, color="Query source" if "Query source" in df_plot.columns else None)
+                        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+                        st.plotly_chart(fig, width="stretch")
+                        if "Total online / q" in df_plot.columns and "Path" in df_plot.columns:
+                            online = df_plot[["Path", "Total online / q"]].dropna()
+                            if len(online) >= 2:
+                                online = online.sort_values("Total online / q", ascending=True).reset_index(drop=True)
+                                fastest = online.iloc[0]
+                                slowest = online.iloc[-1]
+                                if float(fastest["Total online / q"]) > 0:
+                                    speedup = float(slowest["Total online / q"]) / float(fastest["Total online / q"])
+                                    st.caption(f"Fastest reported online path in this run: {fastest['Path']} ({fastest['Total online / q']:.3f} ms/q). Slowest/fastest ratio: {speedup:.2f}×.")
+                    else:
+                        st.info("Per-query timing table found, but no numeric timing columns could be parsed.")
+
+                    st.markdown("##### Per-query timing table")
+                    st.dataframe(df_raw, width='stretch', hide_index=True)
+
+                    if pr.compute_init is not None:
+                        st.markdown("##### Measured components (wall-clock)")
+                        st.dataframe(pr.compute_init, width='stretch', hide_index=True)
+
             with c2:
+                if pr.compute_machine is not None:
+                    st.markdown("##### Machine profile")
+                    st.dataframe(pr.compute_machine, width='stretch', hide_index=True)
+                    if {"Field", "Value"}.issubset(set(pr.compute_machine.columns)):
+                        _mp = {str(r["Field"]): str(r["Value"]) for _, r in pr.compute_machine.iterrows()}
+                        accelerator = _mp.get("Accelerator name") or _mp.get("Accelerator type")
+                        cpu = _mp.get("CPU logical cores")
+                        ram = _mp.get("RAM total")
+                        pills = [p for p in [accelerator, (f"{cpu} logical cores" if cpu else None), ram] if p]
+                        if pills:
+                            st.caption(" | ".join(pills))
+
                 if pr.routing is None:
                     st.info("No routing table found.")
                 else:
