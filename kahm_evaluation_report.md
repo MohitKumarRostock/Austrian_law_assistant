@@ -1,6 +1,6 @@
 # KAHM embeddings: retrieval evaluation on Austrian laws
 
-Generated: 2026-02-23 19:56:37 | script=evaluate_three_embeddings_storylines.py | version=2026-02-23-scientific-pubreport-v1
+Generated: 2026-02-28 16:54:21 | script=evaluate_three_embeddings_storylines.py | version=2026-02-23-scientific-pubreport-v1
 
 ## Summary
 
@@ -282,29 +282,29 @@ This section reports query-time computational profiles for the three retrieval p
 
 | Path | Query source | Query embed / q | FAISS search / q | Total online / q | Observed step sum / q | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| IDF–SVD | model | 0.829 ms | 0.303 ms | 1.132 ms | 1.132 ms | IDF–SVD model load shown in component table (cold-start). |
-| KAHM(query→MB corpus) | model | 143.143 ms | 0.592 ms | 143.735 ms | 143.735 ms | Online total only available when KAHM queries were embedded in this run (not precomputed NPZ). |
-| Mixedbread (true) | online | 827.189 ms | 0.580 ms | 827.769 ms | 827.769 ms | Online total only available when Mixedbread queries were encoded on the fly (not precomputed NPZ). |
+| IDF–SVD | model | 1.058 ms | 0.319 ms | 1.377 ms | 1.377 ms | IDF–SVD model load shown in component table (cold-start). |
+| KAHM(query→MB corpus) | model | 143.670 ms | 0.606 ms | 144.275 ms | 144.275 ms | Online total only available when KAHM queries were embedded in this run (not precomputed NPZ). |
+| Mixedbread (true) | online | 829.677 ms | 0.610 ms | 830.287 ms | 830.287 ms | Online total only available when Mixedbread queries were encoded on the fly (not precomputed NPZ). |
 
 ### Measured components (wall-clock)
 
 | Component | Wall time | Per query | Notes |
 | --- | --- | --- | --- |
-| IDF–SVD query pipeline init (cold-start) | 2.698 s | 0.540 ms | One-time pipeline/materialization cost. |
-| IDF–SVD query embedding (batch) | 4.145 s | 0.829 ms |  |
+| IDF–SVD query pipeline init (cold-start) | 2.936 s | 0.587 ms | One-time pipeline/materialization cost. |
+| IDF–SVD query embedding (batch) | 5.291 s | 1.058 ms |  |
 | KAHM query load (precomputed NPZ) | n/a | n/a | Only present when --kahm_query_embeddings_npz is used. |
-| KAHM query model init (cold-start) | 7.030 s | 1.406 ms | Only present for online KAHM embedding. |
-| KAHM query warm-up (excluded from online total) | 7.470 s | n/a |  |
-| KAHM query embedding (batch) | 715.713 s | 143.143 ms |  |
+| KAHM query model init (cold-start) | 7.904 s | 1.581 ms | Only present for online KAHM embedding. |
+| KAHM query warm-up (excluded from online total) | 8.157 s | n/a |  |
+| KAHM query embedding (batch) | 718.349 s | 143.670 ms |  |
 | Mixedbread query load (precomputed NPZ) | n/a | n/a | Only present when precomputed Mixedbread query embeddings are used. |
-| Mixedbread model init (cold-start) | 7.338 s | 1.468 ms | Only present for online transformer query encoding. |
-| Mixedbread query warm-up (excluded from online total) | 1.895 s | n/a |  |
-| Mixedbread query embedding (batch) | 4135.944 s | 827.189 ms |  |
-| FAISS build (IDF corpus index) | 0.429 s | n/a |  |
-| FAISS search (IDF path) | 1.513 s | 0.303 ms |  |
-| FAISS build (MB corpus index) | 0.128 s | n/a | Shared by Mixedbread and KAHM(query→MB) paths. |
-| FAISS search (Mixedbread path) | 2.902 s | 0.580 ms |  |
-| FAISS search (KAHM→MB path) | 2.962 s | 0.592 ms |  |
+| Mixedbread model init (cold-start) | 7.374 s | 1.475 ms | Only present for online transformer query encoding. |
+| Mixedbread query warm-up (excluded from online total) | 1.885 s | n/a |  |
+| Mixedbread query embedding (batch) | 4148.383 s | 829.677 ms |  |
+| FAISS build (IDF corpus index) | 0.642 s | n/a |  |
+| FAISS search (IDF path) | 1.595 s | 0.319 ms |  |
+| FAISS build (MB corpus index) | 0.125 s | n/a | Shared by Mixedbread and KAHM(query→MB) paths. |
+| FAISS search (Mixedbread path) | 3.051 s | 0.610 ms |  |
+| FAISS search (KAHM→MB path) | 3.028 s | 0.606 ms |  |
 | Corpus embedding memory (IDF matrix) | 22,040,576 bytes | n/a | NumPy array nbytes (aligned corpus embeddings used in this run). |
 | Corpus embedding memory (MB matrix) | 44,081,152 bytes | n/a | NumPy array nbytes (aligned corpus embeddings used in this run). |
 
@@ -313,8 +313,8 @@ This section reports query-time computational profiles for the three retrieval p
 | Comparison | Speedup | Definition |
 | --- | --- | --- |
 | IDF–SVD vs KAHM(query→MB corpus) | 0.01× | IDF online / KAHM online |
-| Mixedbread (true) vs KAHM(query→MB corpus) | 5.76× | MB online / KAHM online |
-| Mixedbread (true) vs IDF–SVD | 731.44× | MB online / IDF online |
+| Mixedbread (true) vs KAHM(query→MB corpus) | 5.75× | MB online / KAHM online |
+| Mixedbread (true) vs IDF–SVD | 602.86× | MB online / IDF online |
 
 ### Machine profile (auto-detected; best effort)
 
