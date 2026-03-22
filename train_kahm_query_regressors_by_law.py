@@ -125,7 +125,7 @@ DEFAULT_QUERIES_NPZ_TRAIN = "queries_embedding_index_train.npz"
 DEFAULT_QUERIES_NPZ_TEST = "queries_embedding_index_test.npz"
 DEFAULT_OUT = "kahm_query_regressors_by_law"
 
-DEFAULT_N_CLUSTERS = 20000
+DEFAULT_N_CLUSTERS = 300
 DEFAULT_SUBSPACE_DIM = 20
 DEFAULT_NB = 100
 DEFAULT_RANDOM_STATE = 0

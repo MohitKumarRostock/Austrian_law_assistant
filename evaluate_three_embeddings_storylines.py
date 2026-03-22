@@ -1,4 +1,4 @@
-"""evaluate_kahm_query_adapter.py
+"""
 
 Purpose
 -------
