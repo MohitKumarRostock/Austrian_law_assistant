@@ -122,17 +122,17 @@ function plotQualityFigure(mrrTbl, hitTbl, top1Tbl, outDir)
 
     ax1 = nexttile(tl, 1); hold(ax1, 'on');
     plotMetricWithCI(ax1, mrrTbl, 'MRR@k (unique laws)');
-    xlabel(ax1, 'Retrieval cutoff k','FontSize',18); ylabel(ax1, 'Score','FontSize',18);
+    xlabel(ax1, 'Retrieval cutoff k','FontSize',18); ylabel(ax1, 'MRR@k (unique laws)','FontSize',18);
     title(ax1, 'Law-level ranking quality','FontSize',18); grid(ax1, 'on'); box(ax1, 'on');
 
     ax2 = nexttile(tl, 2); hold(ax2, 'on');
     plotMetricWithCI(ax2, hitTbl, 'Hit@k');
-    xlabel(ax2, 'Retrieval cutoff k','FontSize',18); ylabel(ax2, 'Score','FontSize',18);
+    xlabel(ax2, 'Retrieval cutoff k','FontSize',18); ylabel(ax2, 'Hit@k','FontSize',18);
     title(ax2, 'Recall within top-k','FontSize',18); grid(ax2, 'on'); box(ax2, 'on');
 
     ax3 = nexttile(tl, 3); hold(ax3, 'on');
     plotMetricWithCI(ax3, top1Tbl, 'Top-1 accuracy');
-    xlabel(ax3, 'Retrieval cutoff k','FontSize',18); ylabel(ax3, 'Score','FontSize',18);
+    xlabel(ax3, 'Retrieval cutoff k','FontSize',18); ylabel(ax3, 'Top-1 accuracy','FontSize',18);
     title(ax3, 'Strict rank-1 accuracy','FontSize',18); grid(ax3, 'on'); box(ax3, 'on');
 
     lgd = legend(ax3, 'Location', 'southoutside', 'Orientation', 'horizontal','FontSize',18);
