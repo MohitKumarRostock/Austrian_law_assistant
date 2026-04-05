@@ -4,9 +4,9 @@ function generate_kahm_result_figures_matlab(reportPath, outDir)
 %
 % This function reads the Markdown report produced by
 % evaluate_three_embeddings_storylines.py and generates four figures:
-%   1) quality_vs_k.pdf/png
-%   2) consensus_vs_k.pdf/png
-%   3) compute_quality_tradeoff.pdf/png
+%   1) quality_vs_k.eps
+%   2) consensus_vs_k.eps
+%   3) compute_quality_tradeoff.eps
 %   5) figures_matlab_latex.tex
 %
 % Usage:
@@ -169,7 +169,7 @@ function plotConsensusFigure(majTbl, consTbl, liftTbl, outDir)
 end
 
 function plotTradeoffFigure(mrrTbl, runtimeTbl, outDir)
-    fig = figure('Color', 'w', 'Position', [100 100 650 480]);
+    fig = figure('Color', 'w', 'Position', [100 100 1000 800]);
     ax = axes(fig); hold(ax, 'on');
 
     methods = {'idf_svd','kahm_query_mb_corpus','mixedbread_true'};
