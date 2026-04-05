@@ -1,0 +1,26 @@
+% ---------------------------------------------------------------
+% Suggested MATLAB-generated figure insertions for Section 4.5
+% Requires: \usepackage{graphicx}
+% ---------------------------------------------------------------
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.92\textwidth]{figures/quality_vs_k.pdf}
+    \caption{Main retrieval-quality metrics across cutoffs. The proposed KAHM (query$\rightarrow$MB corpus) encoder consistently dominates the lexical IDF--SVD baseline and remains above the direct transformer-query baseline on the principal rank-sensitive measures. Shaded regions indicate paired-bootstrap 95\% confidence intervals.}
+    \label{fig:quality-vs-k}
+\end{figure*}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.92\textwidth]{figures/consensus_vs_k.pdf}
+    \caption{Consensus- and routing-sensitive metrics across cutoffs. The KAHM-based encoder yields consistently purer retrieval neighborhoods around the gold law, as reflected in majority-accuracy, mean consensus fraction, and mean lift. Shaded regions indicate paired-bootstrap 95\% confidence intervals.}
+    \label{fig:consensus-vs-k}
+\end{figure*}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.72\textwidth]{figures/compute_quality_tradeoff.pdf}
+    \caption{Compute-quality trade-off based on online per-query time and MRR@20. The proposed KAHM-based encoder occupies the middle ground between the very fast lexical baseline and the expensive online transformer baseline, while attaining the strongest retrieval quality among the three methods in this run. Error bars show paired-bootstrap 95\% confidence intervals for MRR@20.}
+    \label{fig:compute-quality-tradeoff}
+\end{figure*}
+
