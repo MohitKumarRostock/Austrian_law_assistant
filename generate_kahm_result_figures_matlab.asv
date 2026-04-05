@@ -47,19 +47,19 @@ function generate_kahm_result_figures_matlab(reportPath, outDir)
     top1Tbl      = parseMetricTable(txt, '**Top-1 accuracy**');
     top1Tbl.idf_svd.label = "IDF--SVD";
     top1Tbl.kahm_query_mb_corpus.label = "KAHM";
-    top1Tbl.mixedbread_true.label = "Mixedbread";
+    top1Tbl.mixedbread_true.label = "Mixedbrea";
     majTbl       = parseMetricTable(txt, '**Majority-accuracy**');
     majTbl.idf_svd.label = "IDF--SVD";
-    majTbl.kahm_query_mb_corpus.label = "KAHM";
-    majTbl.mixedbread_true.label = "Mixedbread";
+    majTbl.kahm_query_mb_corpus.label = "Mixedbread";
+    majTbl.mixedbread_true.label = "KAHM";
     consTbl      = parseMetricTable(txt, '**Mean consensus fraction**');
     consTbl.idf_svd.label = "IDF--SVD";
-    consTbl.kahm_query_mb_corpus.label = "KAHM";
-    consTbl.mixedbread_true.label = "Mixedbread";
+    consTbl.kahm_query_mb_corpus.label = "Mixedbread";
+    consTbl.mixedbread_true.label = "KAHM";
     liftTbl      = parseMetricTable(txt, '**Mean lift (prior)**');
     liftTbl.idf_svd.label = "IDF--SVD";
-    liftTbl.kahm_query_mb_corpus.label = "KAHM";
-    liftTbl.mixedbread_true.label = "Mixedbread";
+    liftTbl.kahm_query_mb_corpus.label = "Mixedbread";
+    liftTbl.mixedbread_true.label = "KAHM";
     runtimeTbl   = parseRuntimeTable(txt);
 
     % Consistent plotting style.
