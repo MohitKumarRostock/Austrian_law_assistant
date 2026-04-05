@@ -1,0 +1,26 @@
+# Core numerical stack
+numpy>=1.26,<2
+pandas>=2.3,<2.4
+scipy>=1.13
+scikit-learn>=1.4
+joblib>=1.5
+tqdm>=4.66
+psutil>=5.9
+
+# Data / storage
+pyarrow>=15
+
+# Retrieval / modeling
+torch>=2.2
+sentence-transformers>=5.2
+transformers>=4.40
+faiss-cpu>=1.8
+sentencepiece>=0.2
+
+# Corpus acquisition / extraction
+requests>=2.31
+pymupdf>=1.24
+pdfplumber>=0.11
+
+# Plotting / reporting
+matplotlib>=3.8
