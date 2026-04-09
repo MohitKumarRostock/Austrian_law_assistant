@@ -1033,12 +1033,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--mlp_reg_hidden", default="512,256")
     p.add_argument("--mlp_reg_alpha", type=float, default=1e-4)
-    p.add_argument("--mlp_reg_max_iter", type=int, default=300)
+    p.add_argument("--mlp_reg_max_iter", type=int, default=500)
     p.add_argument("--mlp_reg_learning_rate_init", type=float, default=1e-3)
 
     p.add_argument("--mlp_proto_hidden", default="256")
     p.add_argument("--mlp_proto_alpha", type=float, default=1e-4)
-    p.add_argument("--mlp_proto_max_iter", type=int, default=300)
+    p.add_argument("--mlp_proto_max_iter", type=int, default=500)
     p.add_argument("--mlp_proto_learning_rate_init", type=float, default=1e-3)
 
     p.add_argument("--mlp_early_stopping", action="store_true")
